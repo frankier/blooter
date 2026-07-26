@@ -54,6 +54,7 @@ USERSITE="$(python3 -c 'import site; print(site.getusersitepackages())' 2>/dev/n
 GUEST_PYTHONPATH="${PYTHONPATH:-}"
 [[ -n "$USERSITE" ]] && GUEST_PYTHONPATH="$USERSITE${GUEST_PYTHONPATH:+:$GUEST_PYTHONPATH}"
 
-vng -r --user root \
+# -r takes $VNG_KERNEL (a version in /boot) when set, else the host kernel.
+vng -r ${VNG_KERNEL:+"$VNG_KERNEL"} --user root \
     -e "BLOOTER='$BLOOTER' FILTER='$FILTER' PATH='$PATH' \
         PYTHONPATH='$GUEST_PYTHONPATH' $HERE/guest/run-tests.sh"

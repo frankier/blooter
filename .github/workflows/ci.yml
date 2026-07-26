@@ -35,8 +35,10 @@ jobs:
 
   # Both integration suites need a VM: AF_BLUETOOTH only works in the initial
   # netns and the HID PSMs need CAP_NET_BIND_SERVICE in the initial userns
-  # (tests/README.md). virtme-ng boots the runner's own kernel, so the guest
-  # needs that kernel's bluetooth modules -- hence linux-modules-extra.
+  # (tests/README.md). The runner's own kernel (linux-azure) has no hci_vhci and
+  # no bluetooth modules at all, so both jobs install Ubuntu's generic kernel and
+  # point vng at it with $VNG_KERNEL; only its modules are used, the runner keeps
+  # running the kernel it booted.
   btvirt:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -52,16 +54,31 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            virtme-ng qemu-system-x86 "linux-modules-extra-$(uname -r)" \
+            virtme-ng qemu-system-x86 linux-image-generic \
             bluez dbus-daemon \
             libglib2.0-dev libdbus-1-dev libudev-dev pkg-config
-          # vng -r boots the running host kernel, so it has to be readable.
-          sudo chmod 0644 "/boot/vmlinuz-$(uname -r)"
+          # linux-image-generic pulls the matching linux-modules-extra, which is
+          # where hci_vhci and the rest of the bluetooth stack live.
+          KVER=$(ls -1 /lib/modules | grep -- -generic | sort -V | tail -1)
+          sudo chmod 0644 "/boot/vmlinuz-$KVER"   # vng has to read the image
+          echo "VNG_KERNEL=$KVER" >> "$GITHUB_ENV"
       - name: Preflight
         run: |
-          uname -r; ls -l /dev/kvm
-          modinfo hci_vhci || { echo "MISSING: no hci_vhci for this kernel"; exit 1; }
-          vng -r --user root -e 'modprobe hci_vhci && ls -l /dev/vhci && echo VHCI-OK'
+          ls -l /dev/kvm; echo "guest kernel: $VNG_KERNEL"
+          modinfo -k "$VNG_KERNEL" hci_vhci >/dev/null \
+            || { echo "MISSING: no hci_vhci for $VNG_KERNEL"; exit 1; }
+          # A script rather than an inline command: vng -e goes through the
+          # guest's /bin/sh, where quoting a snippet is a minefield.
+          cat > "$RUNNER_TEMP/probe.sh" <<'EOF'
+          #!/bin/sh
+          set -e
+          uname -r
+          modprobe hci_vhci
+          ls -l /dev/vhci
+          echo VHCI-OK
+          EOF
+          chmod +x "$RUNNER_TEMP/probe.sh"
+          vng -r "$VNG_KERNEL" --user root -e "$RUNNER_TEMP/probe.sh"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # build-btvirt.sh short-circuits once emulator/btvirt exists, so a hit
@@ -88,14 +105,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            virtme-ng qemu-system-x86 "linux-modules-extra-$(uname -r)" \
+            virtme-ng qemu-system-x86 linux-image-generic \
             dbus-daemon python3-dbus python3-dbusmock \
             libfontconfig1-dev libdbus-1-dev libudev-dev pkg-config
-          sudo chmod 0644 "/boot/vmlinuz-$(uname -r)"
+          KVER=$(ls -1 /lib/modules | grep -- -generic | sort -V | tail -1)
+          sudo chmod 0644 "/boot/vmlinuz-$KVER"
+          echo "VNG_KERNEL=$KVER" >> "$GITHUB_ENV"
       - name: Preflight
         run: |
-          uname -r; ls -l /dev/kvm
-          vng -r --user root -e 'python3 -c "import dbusmock; print(\"DBUSMOCK-OK\")"'
+          ls -l /dev/kvm; echo "guest kernel: $VNG_KERNEL"
+          python3 -c "import dbusmock; print('dbusmock', dbusmock.__file__)"
+          vng -r "$VNG_KERNEL" --user root -e /bin/uname
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # termwright is a slow from-source build (font-kit/fontconfig); cache the

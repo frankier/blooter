@@ -44,7 +44,8 @@ echo "##### 2/3  building btvirt #####"
 
 echo
 echo "##### 3/3  running tests in VM #####"
-# -r          boot the running host kernel
+# -r          boot the running host kernel, or $VNG_KERNEL if set (a version in
+#             /boot, for hosts whose own kernel lacks hci_vhci -- see CI)
 # --user root guest commands run as root, so /dev/vhci opens and the low PSMs bind
-vng -r --user root \
+vng -r ${VNG_KERNEL:+"$VNG_KERNEL"} --user root \
     -e "BTVIRT='$BTVIRT' BLOOTER='$BLOOTER' FILTER='$FILTER' $HERE/guest/run-tests.sh"

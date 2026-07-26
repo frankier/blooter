@@ -39,7 +39,9 @@ unprivileged: `/dev/kvm` is world-writable and the host kernel is world-readable
 
 `.github/workflows/ci.yml` is the same thing for Ubuntu — it runs all three
 suites on a GitHub-hosted runner, so it doubles as the worked `apt` equivalent
-of the `dnf` line above.
+of the `dnf` line above. Both suites boot the host kernel by default; set
+`VNG_KERNEL=<version in /boot>` to boot another one, which is how CI works
+around the runner kernel having no `hci_vhci`.
 
 ## Why both suites need a VM
 
