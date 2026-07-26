@@ -70,11 +70,17 @@ Roughly in order of how much risk they carry.
   a scenario does hit its limits, Android's RootCanal has a far more complete
   controller model built for multi-device emulation. It speaks HCI over TCP, so
   it would still need the VM to bridge into `/dev/vhci`.
-- **Running the suites in CI.** Both need KVM and a VM. `tests/btvirt` also
-  builds btvirt from bluez source. Neither is impossible on a self-hosted runner
-  with `/dev/kvm`, but nothing has been tried.
-
 ## Done since (kept here for history)
+
+- **Running the suites in CI** — done: `.github/workflows/ci.yml` runs unit,
+  fmt/clippy, `btvirt` and `termdbus` on GitHub-hosted `ubuntu-24.04`. KVM is
+  available on the standard runners once a udev rule makes `/dev/kvm`
+  world-writable, and Ubuntu packages everything else at the paths the
+  harnesses hardcode. Caveat: `vng -r` boots the runner's own (Azure) kernel,
+  so the guest depends on `linux-modules-extra-$(uname -r)` supplying
+  `hci_vhci`; the `btvirt` job preflights that explicitly. If it ever stops
+  being true, install `linux-image-generic` and teach the two `run.sh` scripts
+  a `VNG_KERNEL` override (`vng -r <version>`).
 
 - **Pairing / agent handling** — implemented: a shared BlueZ agent is registered
   for both transports, auto-accepting ("Just Works") or prompting on the TTY per

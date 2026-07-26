@@ -37,6 +37,10 @@ Only the `dnf` line needs root, and only once:
 Everything else installs into your home directory, and the VMs themselves run
 unprivileged: `/dev/kvm` is world-writable and the host kernel is world-readable.
 
+`.github/workflows/ci.yml` is the same thing for Ubuntu — it runs all three
+suites on a GitHub-hosted runner, so it doubles as the worked `apt` equivalent
+of the `dnf` line above.
+
 ## Why both suites need a VM
 
 Two kernel facts, both confirmed on this machine:
