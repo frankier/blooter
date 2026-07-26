@@ -22,12 +22,15 @@ real `bluetoothd` over a real system bus, on emulated controllers.
 Prerequisites (one command, the only step needing root):
 
 ```sh
-sudo dnf install glib2-devel virtme-ng
+sudo dnf install glib2-devel readline-devel virtme-ng
 ```
 
-`glib2-devel` is needed to build `btvirt` (not packaged on Fedora — Debian has
-it in `bluez-test-tools`), `virtme-ng` to run the VM. Everything else is
-unprivileged:
+`glib2-devel` and `readline-devel` are needed to build `btvirt` and `btmgmt`
+from bluez source (`build-btvirt.sh`), `virtme-ng` to run the VM. `btvirt` is
+not packaged on Fedora at all (Debian has it in `bluez-test-tools`); `btmgmt` is
+packaged everywhere but the harness drives it non-interactively, and versions
+before ~5.8 never exit when driven that way — so both come from one pinned
+source tree rather than from the distro. Everything else is unprivileged:
 the build runs as you, the VM runs as you via KVM, and only *inside* the guest
 are we root.
 

@@ -4,6 +4,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BTVIRT="${BTVIRT:?BTVIRT not set}"
+export BTMGMT="${BTMGMT:?BTMGMT not set}"
 BLOOTER="${BLOOTER:?BLOOTER not set}"
 FILTER="${FILTER:-}"
 
@@ -16,6 +17,7 @@ fi
 # CAP_NET_BIND_SERVICE; as guest root we have it.
 echo "kernel : $(uname -r)"
 echo "btvirt : $BTVIRT"
+echo "btmgmt : $BTMGMT"
 echo "blooter: $BLOOTER"
 
 # A writable /tmp for the run directory, FIFO and component logs. The host

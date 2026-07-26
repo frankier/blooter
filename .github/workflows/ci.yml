@@ -56,7 +56,7 @@ jobs:
           sudo apt-get install -y \
             virtme-ng qemu-system-x86 linux-image-generic \
             bluez dbus-daemon \
-            libglib2.0-dev libdbus-1-dev libudev-dev pkg-config
+            libglib2.0-dev libdbus-1-dev libreadline-dev libudev-dev pkg-config
           # linux-image-generic pulls the matching linux-modules-extra, which is
           # where hci_vhci and the rest of the bluetooth stack live.
           KVER=$(ls -1 /lib/modules | grep -- -generic | sort -V | tail -1)

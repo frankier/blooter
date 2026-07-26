@@ -58,7 +58,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
 RUNDIR = "/tmp/blooter-btvirt"
 
 BLUETOOTHD = "/usr/libexec/bluetooth/bluetoothd"
-BTMGMT = "/usr/bin/btmgmt"
+# Built alongside btvirt: see ../build-btvirt.sh for why the packaged one is
+# not good enough.
+BTMGMT = os.environ.get("BTMGMT", "/usr/bin/btmgmt")
 DBUS_DAEMON = "/usr/bin/dbus-daemon"
 
 
@@ -83,6 +85,9 @@ def btmgmt(index, *args, timeout=30.0):
                                 stdin=subprocess.DEVNULL, timeout=timeout,
                                 check=False)
     except subprocess.TimeoutExpired:
+        # Silence here once cost an afternoon: every call timing out looks like
+        # an empty reply, three levels down.
+        log(f"btmgmt {' '.join(argv[3:])} timed out after {timeout}s")
         return ""
     return result.stdout + result.stderr
 

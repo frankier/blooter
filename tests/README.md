@@ -22,7 +22,7 @@ Together they cover both halves of design/CONNECTION.md.
 ## Prerequisites
 
 ```sh
-sudo dnf install virtme-ng fontconfig-devel glib2-devel
+sudo dnf install virtme-ng fontconfig-devel glib2-devel readline-devel
 pip install --user python-dbusmock
 cargo install termwright
 ```
@@ -30,7 +30,8 @@ cargo install termwright
 Only the `dnf` line needs root, and only once:
 
 - `virtme-ng` — runs both integration suites in a VM.
-- `glib2-devel` — builds `btvirt` (not packaged on Fedora).
+- `glib2-devel`, `readline-devel` — build `btvirt` (not packaged on Fedora) and
+  `btmgmt` (packaged, but older ones hang when driven non-interactively).
 - `fontconfig-devel` — builds `termwright` (for a screenshot feature the tests
   do not use).
 
