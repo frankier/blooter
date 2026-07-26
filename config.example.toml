@@ -1,0 +1,93 @@
+# blooter configuration file.
+#
+# Search order: the -c <file> command-line option, then
+# $XDG_CONFIG_HOME/blooter/config.toml (falling back to
+# ~/.config/blooter/config.toml), then /etc/blooter/config.toml.
+#
+# Each hotkey is a chord: zero or more modifier names followed by one trigger
+# key, joined with '+'. The chord fires when the trigger key is *released*
+# while all listed modifiers are held. Trigger keys are consumed locally and
+# never forwarded to the host. When several chords share a trigger, the most
+# specific match (most modifiers) wins.
+#
+# Key names follow keyd (https://github.com/rvaiya/keyd), e.g. "scrolllock",
+# "pause", "f12", "kpenter", "leftcontrol", "rightmeta". The side-agnostic
+# modifier aliases "control"/"ctrl", "shift", "alt" and "meta"/"super" match
+# whichever side is held. Set a hotkey to "" to disable it.
+#
+# The values below are the built-in defaults, shown commented out.
+
+[hotkeys]
+
+# Drop the current host connection and return to accepting new ones.
+#drop_connection = "scrolllock"
+
+# Terminate blooter cleanly.
+#exit = "leftcontrol+leftalt+scrolllock"
+
+# Toggle input capture. While capture is off, events are not forwarded to the
+# host (an all-keys-up report is sent first), and devices grabbed exclusively
+# with -x are released so input reaches the local session again. Hotkeys stay
+# active while capture is off; a new host connection re-enables capture.
+#capture_toggle = "leftshift+scrolllock"
+
+# Separate capture on/off chords, if you prefer them over (or in addition to)
+# the toggle. Disabled by default.
+#capture_on = ""
+#capture_off = ""
+
+[gamepad]
+
+# How many gamepad controllers to advertise to the host. Each controller gets
+# its own HID report ID, so the host sees them as separate gamepads. The number
+# advertised is fixed when blooter registers and cannot change while running,
+# but the advertised slots can be filled and refilled at runtime (see hotplug).
+#
+#   "initial"  one controller per gamepad present at startup (the default)
+#   0          disable gamepad forwarding entirely
+#   N          advertise exactly N controllers (present gamepads fill slots in
+#              order; any extra slots stay idle, ready for hotplug)
+#
+# Changing this changes the HID report descriptor, which hosts cache for the
+# lifetime of their bond: an already-paired host keeps using the layout it
+# cached and will not see the change until it is re-paired. blooter warns about
+# such hosts at startup and can fix them ([f] in the connection menu; see
+# design/CONNECTION.md §7). A fixed count keeps the descriptor stable from run
+# to run, whereas "initial" re-derives it from whatever is plugged in at
+# startup — so prefer a fixed count if you pair with many hosts.
+#slots = "initial"
+
+# Whether to open gamepads plugged in after startup, filling free advertised
+# slots (and reusing slots freed when a controller is unplugged) via a udev
+# monitor. With an explicit -e selection, only listed event numbers are opened.
+#
+#   "auto"  on when slots is a fixed count > 0, off otherwise (the default)
+#   "on"    always monitor (no effect unless a slot is free)
+#   "off"   never monitor
+#hotplug = "auto"
+
+[connection]
+
+# Which Bluetooth transport to present the device over. The input pipeline is
+# identical either way; only how reports are delivered and how the device is
+# discovered differ (see design/ARCH.md §4).
+#
+#   "classic"  Bluetooth Classic (BR/EDR) HID (the default). Needs
+#              `bluetoothd -P input` and privilege to bind the HID L2CAP PSMs.
+#   "ble"      Bluetooth Low Energy (HID-over-GATT / HOGP). Registers a GATT
+#              server and LE advertisement instead; no `-P input` required.
+#protocol = "classic"
+
+# How the pairing agent answers bonding requests (see design/CONNECTION.md §5).
+# When unset it is inferred: "confirm" if stdin is a TTY, else "auto".
+#
+#   "auto"     accept every pairing request silently ("Just Works")
+#   "confirm"  prompt on the terminal before bonding
+#pairing = "auto"
+
+# Address of a host to initiate an outgoing HID connection to on startup
+# (reconnect-initiate, Classic only; see design/CONNECTION.md §3.2). When unset,
+# blooter only accepts incoming connections (in interactive mode the host menu
+# can pick a target at runtime instead). Once any link is up the target is
+# cleared, so blooter does not fight an intentional disconnect.
+#reconnect = "AA:BB:CC:DD:EE:FF"
