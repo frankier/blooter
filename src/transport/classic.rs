@@ -12,7 +12,7 @@ use log::{debug, error, info, warn};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until, timeout_at};
 
-use super::{Accept, DIAL_BACKOFF_MAX, DIAL_BACKOFF_START, Flow, Step, Transport, dispatch};
+use super::{Accept, DIAL_BACKOFF_MAX, DIAL_BACKOFF_START, Flow, Outbox, Step, Transport, step};
 use crate::report::{InputState, Outcome, RawEvent};
 use crate::{AppError, Ctx, Signals};
 
@@ -375,10 +375,13 @@ impl Transport for Classic {
         let mut unplugged = false;
         debug!("session started; forwarding reports on the interrupt channel");
 
+        // Allocated once for the connection (design/ARCH.md §7.2c).
+        let mut out = Outbox::new(ctx.buffer, ctx.batch, self.flush_interval(), ctx.overflow);
+
         let flow = loop {
             tokio::select! {
-                Some(ev) = rx.recv() => {
-                    if let Step::Return(f) = dispatch(self, ctx, state, ev).await {
+                inc = out.next(rx) => {
+                    if let Step::Return(f) = step(self, ctx, state, &mut out, inc).await {
                         break f;
                     }
                 }

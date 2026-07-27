@@ -76,6 +76,41 @@ Roughly in order of how much risk they carry.
   a scenario does hit its limits, Android's RootCanal has a far more complete
   controller model built for multi-device emulation. It speaks HCI over TCP, so
   it would still need the VM to bridge into `/dev/vhci`.
+
+## UI problems
+
+ - Pairing => "auto"/"accept"/"prompt"
+
+## To investigate (continued)
+
+- **`SYN_DROPPED` is invisible through the evdev crate's synced stream.** When
+  the kernel's evdev ring overflows it emits `SYN_DROPPED`, but
+  `Device::into_event_stream()` never surfaces it: `sync_events`
+  (evdev `sync_stream.rs`) discards the whole affected block and emits
+  compensatory state-diff events instead, `block_dropped` is private and
+  `EventStream` exposes no resync signal. Warning on a drop therefore needs
+  `RawDevice::into_event_stream()`, which yields it verbatim — every method
+  `input.rs` uses (`supported_keys`, `supported_events`, `get_absinfo`, `name`,
+  `input_id`, `grab`, `ungrab`, `send_events`) exists on `RawDevice`, and only
+  `get_absinfo`'s return shape differs. blooter tracks its own key state in
+  `InputState`, so evdev's state machine is not load-bearing. Doing this would
+  also fix a latent bug: after a resync the compensatory `ABS_X`/`ABS_Y` event
+  is differenced by `translate_abs` against a stale `last_abs`, producing a
+  clamped pointer jump where the reference should just be reseeded (§7.2b).
+  Batching (§7.2c) makes drops much less likely but no more visible.
+- **`Shared::notify` allocates and locks per report** (`transport/le.rs`). Each
+  notification takes an async mutex on the notifier map and does a
+  `payload.to_vec()` — on the hot path AGENTS.md calls out. Batching cuts how
+  often this runs, but the allocation should go: reuse a per-connection buffer
+  and copy into it, or hold the notifier without the map lookup.
+- **BLE has no "fix connection" for a descriptor change.** The GATT tree
+  (`hid_service`, `transport/le.rs`) declares no Service Changed characteristic
+  (`0x2A05`), and `Le` never touches `state::Hosts`. Hosts cache the Report Map
+  across a bond exactly as Classic hosts cache the SDP record, so changing
+  `[gamepad] slots` or `[pointer] axis_bits` leaves a bonded BLE host misreading
+  reports with no way to repair it short of re-pairing by hand. Since BLE is the
+  default transport this is the bigger of the two caching gaps.
+
 ## Done since (kept here for history)
 
 - **Running the suites in CI** — done: `.github/workflows/ci.yml` runs unit,
@@ -99,6 +134,13 @@ Roughly in order of how much risk they carry.
   `[connection] protocol` defaults to `"ble"`, and both transports run the same
   `menu.rs` (differing only in the discovery filter and whether `[f]` applies).
   Covered by `tests/termdbus` (the menu) and `tests/btvirt` (the link).
+- **Batching pointer events for slower connections** — implemented: pointer
+  motion accumulates per input frame and is flushed under a configurable policy
+  (`[pointer] batch`/`buffer`/`axis_bits`/`overflow`, design/ARCH.md §7.2c). This
+  also fixed `translate_rel`/`translate_abs` emitting one report *per axis*, and
+  added an optional 16-bit axis descriptor variant (§3.2) so merged motion never
+  saturates.
+
 - **Absolute-pointer / touchpad support** — implemented: touchpad `EV_ABS`
   positions are converted to relative mouse motion (design/ARCH.md §7.2b).
 - **Gamepads** — implemented: one or more USB gamepads are forwarded as HID game

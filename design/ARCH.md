@@ -16,11 +16,11 @@ configuration-file and adapter-setup support. The source is organized as:
 | `cli.rs` | Command-line parsing (§2). |
 | `sdp.rs` | HID report descriptor and SDP service-record XML (§3). |
 | `main.rs` | Runtime: config/session/input setup, transport selection, the shared accept/session loop, signals, shutdown (§4, §9). |
-| `transport/` | The transport seam (§4): the `Transport` trait plus the classic (BR/EDR L2CAP) and LE (HID-over-GATT) implementations. |
+| `transport/` | The transport seam (§4): the `Transport` trait, the outgoing report buffer (§7.2c), plus the classic (BR/EDR L2CAP) and LE (HID-over-GATT) implementations. |
 | `input.rs` | Input sources — evdev scan, FIFO, gamepad slots, udev hotplug, `-l` listing (§6, §8). |
-| `report.rs` | Session state and event → HID-report translation (§5, §7). |
+| `report.rs` | Session state and event → HID-report translation, including pointer accumulation (§5, §7). |
 | `keymap.rs` | Linux keycode ↔ HID usage tables and gamepad button/axis codes (§7.2, §7.4). |
-| `config.rs` | TOML configuration: hotkey chords and gamepad options (§10). |
+| `config.rs` | TOML configuration: hotkey chords, gamepad and pointer options (§10). |
 | `state.rs` | Per-host record of the descriptor each host bonded under (CONNECTION.md §7). |
 | `setup.rs` | Adapter class/name/SSP setup and the interactive host menu (§10). |
 
@@ -142,11 +142,14 @@ attributes (BlueZ record-XML syntax):
 
 ### 3.2 HID report descriptor
 
-The descriptor is assembled dynamically by `sdp::report_descriptor(n_gamepads)`:
-a fixed **98-byte base** (mouse + keyboard) followed by one **85-byte gamepad
-collection** per advertised controller.
+The descriptor is assembled dynamically by
+`sdp::report_descriptor(n_gamepads, axis_bits)`: a **mouse collection** in one of
+two axis widths, the fixed **44-byte keyboard collection**, then one **85-byte
+gamepad collection** per advertised controller. With 8-bit axes the mouse
+collection is 54 bytes, so the base is the original **98 bytes**; with 16-bit
+axes (§7.2c) it is 66 bytes, for a **110-byte** base.
 
-**Base (98 bytes):**
+**Base (98 bytes, `axis_bits = 8`):**
 
 ```
 05 01 09 02 A1 01 85 01 09 01 A1 00
@@ -167,6 +170,34 @@ C0 C0
     - Usage X, Y, Wheel: 3 × 8-bit input (Data,Var,**Rel**), logical −127…127.
       (Report Count is **3** here, matching the three wire axis bytes; the C
       original declared 2. This does not change the wire format in §5.)
+
+**Mouse collection with `axis_bits = 16` (66 bytes):** identical up to the
+5-bit button padding, then X and Y become one 16-bit Input item and the Wheel a
+separate 8-bit one:
+
+```
+09 30 09 31 16 01 80 26 FF 7F 75 10
+95 02 81 06
+09 38 15 81 25 7F 75 08 95 01 81 06
+```
+
+- Usage X, Y: 2 × 16-bit input (Data,Var,**Rel**), logical −32767…32767.
+- Usage Wheel: 1 × 8-bit input (Data,Var,**Rel**), logical −127…127.
+
+Two Input items are required because the fields differ in Report Size and
+logical range; Usage items are consumed by the Input item that follows them, so
+Usage Wheel is declared *after* the X/Y item (the same shape the gamepad
+collection uses for its sticks and triggers). Total input size is
+3 + 5 + 16 + 16 + 8 = 48 bits, so the 5-bit padding is what keeps the 16-bit
+fields byte-aligned. The Report Count quirk above does not arise here: each
+item's count equals its own usage count by construction.
+
+The axis width is part of the descriptor, so it feeds `descriptor_fingerprint`
+and a bonded Classic host holding the other width is flagged for
+`[f] Fix connection` (CONNECTION.md §7). **BLE has no equivalent repair** — the
+GATT tree declares no Service Changed characteristic, so a host bonded under the
+other width keeps its cached Report Map and misreads the reports until it is
+re-paired by hand.
 - **Usage Page Generic Desktop, Usage Keyboard, Collection Application**
   - Report ID **2**; Collection Physical
     - Modifier byte: usages Keyboard `0xE0`–`0xE7`, 8 × 1-bit (Data,Var,Abs)
@@ -317,7 +348,7 @@ device, one advertisement set per adapter suffices.
 Every report is prefixed with the HIDP header byte `0xA1` (HIDP `DATA`
 transaction, report type Input).
 
-**Mouse report — 6 bytes:**
+**Mouse report — 6 bytes (`axis_bits = 8`, the default):**
 
 | Byte | Meaning |
 |---|---|
@@ -327,6 +358,11 @@ transaction, report type Input).
 | 3 | X: relative motion, signed 8-bit (clamped to −127…127) |
 | 4 | Y: relative motion, signed 8-bit |
 | 5 | Wheel: relative scroll, signed 8-bit |
+
+**Mouse report — 8 bytes (`axis_bits = 16`):** as above, but X and Y are signed
+16-bit little-endian (clamped to −32767…32767) in bytes 3–4 and 5–6, with the
+signed 8-bit Wheel in byte 7. This is the width at which accumulated motion
+(§7.2c) never saturates.
 
 **Keyboard report — 11 bytes:**
 
@@ -396,6 +432,12 @@ transmission is gated on the connected state. Immediately before entering the
 connected state, the pending-event channel is drained so stale keystrokes are
 not delivered to the new host.
 
+Accumulated pointer motion and the outgoing report buffer (§7.2c) are discarded
+on the same principle: `InputState::reset` clears the accumulator on every new
+connection, and dropping the session, exiting, or pausing capture clears both
+*before* the all-keys-up/neutral reports are sent — those bypass the buffer, so
+a report left queued behind them would re-latch state on the host.
+
 ### 6.4 Gamepad slots and hotplug
 
 The number of advertised gamepad controllers is fixed when blooter registers
@@ -418,14 +460,17 @@ opens listed event numbers. Requires system **libudev**.
 
 Per-session state lives in `report::InputState` and is reset on every new
 connection: `mouse_buttons: u8`, `modifiers: u8`, `pressed_keys: [u8; 8]`, a
-`capture` flag, touchpad tracking state, and one `GamepadState` per advertised
-slot. Reports are only emitted while `capture` is true; state is tracked
-regardless, so hotkey chords keep working with capture off.
+`capture` flag, touchpad tracking state, the pending pointer accumulator and its
+encoding (§7.2c), and one `GamepadState` per advertised slot. Reports are only
+emitted while `capture` is true; state is tracked regardless, so hotkey chords
+keep working with capture off.
 
 ### 7.1 `EV_KEY`
 
 - **Mouse buttons** `BTN_LEFT`/`BTN_RIGHT`/`BTN_MIDDLE`: set/clear bit 0/1/2 of
-  `mouse_buttons`; emit a mouse report with the new buttons and zero axes.
+  `mouse_buttons` and mark the pointer frame dirty. Like motion, the report is
+  emitted at the frame boundary (§7.2c), so a click and the motion alongside it
+  become one report and neither can overtake the other.
 - **`BTN_TOUCH`**: update touchpad finger-down state and reset the motion
   reference (§7.2b); no report.
 - **Modifier keys** `KEY_LEFTCTRL`, `KEY_LEFTSHIFT`, `KEY_LEFTALT`,
@@ -443,13 +488,16 @@ regardless, so hotkey chords keep working with capture off.
 
 ### 7.2 `EV_REL`
 
-Relative motion, coalesced per event (no accumulation):
+Relative motion, accumulated into the pending pointer frame (§7.2c) and emitted
+at the next frame boundary — never per event, since a hardware frame carries one
+event per axis and emitting per event would cost two reports for a plain
+diagonal move:
 
-- `REL_X` (0) → mouse report with X = value, Y = 0, wheel = 0.
-- `REL_Y` (1) → Y = value.
-- `REL_WHEEL` (8) → wheel = value.
-- Values are clamped to −127…127. The button byte always reflects current
-  `mouse_buttons`.
+- `REL_X` (0) → add value to the pending X.
+- `REL_Y` (1) → add value to the pending Y.
+- `REL_WHEEL` (8) → add value to the pending wheel.
+- Accumulation is in `i32`; the clamp to the axis range happens only when a
+  report is built. The button byte always reflects current `mouse_buttons`.
 
 ### 7.2b `EV_ABS` (touchpad)
 
@@ -457,12 +505,73 @@ Touchpads report absolute finger positions; blooter derives relative motion:
 
 - Motion is ignored unless a finger is down (`BTN_TOUCH`).
 - The first `ABS_X`/`ABS_Y` position after touch-down only seeds the reference
-  (no jump on finger landing); subsequent positions emit a mouse report with
-  the per-axis delta (clamped to −127…127). Lifting the finger resets the
+  (no jump on finger landing); subsequent positions add the per-axis delta to
+  the pending pointer frame, exactly as §7.2 does. Lifting the finger resets the
   reference.
 
+Touchpads are the highest event rate blooter sees, so this path is the main
+beneficiary of §7.2c.
+
 Gamepad `EV_ABS` events (sticks, triggers, D-pad) are routed by slot to §7.5.
-All other event types (`EV_SYN`, `EV_MSC`, `EV_LED`, …) are ignored.
+
+### 7.2c Pointer batching
+
+Pointer devices generate events far faster than a Bluetooth link consumes them.
+The session loop sends serially — `Transport::send_report` is awaited inline —
+so on a slow link motion queues up in the 256-slot event channel and the pointer
+keeps gliding after the user stops. Batching replaces that queue with a bounded
+accumulator, so lag is capped by the flush interval however fast events arrive.
+Configured by the `[pointer]` table (§10.1).
+
+**Frame boundaries.** `EV_SYN`/`SYN_REPORT` is translated to `Outcome::Sync` and
+is the *only* point at which a pointer report is built. It is therefore
+**necessary** for a flush in every mode — a timer or a full buffer arms a flush
+rather than splitting a frame — and **sufficient** when `batch = "none"`. The
+check precedes the gamepad slot dispatch, because every device shares one event
+channel and a `SYN` from any of them is a valid boundary; a foreign `SYN` can
+only flush *early*, never merge across frames.
+
+**Accumulator.** `InputState` holds pending X/Y/wheel as `i32` plus a dirty flag
+for button changes. `take_mouse_frame` hands out at most one report's worth,
+clamped to the axis width and subtracted from the accumulator, returning `None`
+once empty. `[pointer] overflow` decides how far a frame is drained:
+
+- `"burst"` (default) — loop until empty: as many back-to-back reports as it
+  takes. Lossless, bounded by the buffer.
+- `"carry"` — one report; the remainder rides along on the next frame.
+- `"clamp"` — one report; the remainder is discarded.
+
+With `axis_bits = 16` (§3.2) the range is wide enough that this effectively
+never comes into play.
+
+**Outgoing buffer.** `transport::Outbox` is a fixed-capacity ring of built
+reports, allocated once per connection (`[pointer] buffer`, default 16). Pushing
+is a copy into a slot — no allocation, no spawned task, per the hot-path rule.
+A push first tries to **merge into the tail entry**, and only when that entry is
+a mouse report with an identical button byte and no axis would saturate. A
+keyboard or gamepad tail blocks the merge, as does a button change, so entries
+only ever fold backwards into their immediate predecessor and nothing can
+overtake anything else. A full ring is flushed rather than dropped from.
+
+**Flush drive** (`[pointer] batch`), evaluated at each frame boundary:
+
+- `"auto"` — a per-transport minimum spacing via `Transport::flush_interval`:
+  8 ms on Classic, 15 ms on BLE. The default, and the only mode that genuinely
+  throttles BLE, because a GATT notification is handed to `bluetoothd` over
+  D-Bus and returns long before the packet is on air.
+- `"adaptive"` — no timer; flush every frame. The coalescing comes for free:
+  while the previous send had the loop suspended, arriving events piled up in
+  the channel and merged into the ring on the way through. Genuinely
+  backpressure-driven on Classic, where the L2CAP socket buffer blocks;
+  opportunistic only on BLE, for the reason above.
+- `"none"` — flush every frame, with the accumulator still collapsing each frame
+  to one report.
+- `N` — an explicit millisecond spacing, overriding what `"auto"` would pick.
+
+When no deadline is armed the timer branch of the session loop is
+`future::pending()`, so an idle session runs no timer at all.
+
+All other event types (`EV_MSC`, `EV_LED`, …) are ignored.
 
 ### 7.3 Local hotkeys and input capture
 
@@ -586,6 +695,16 @@ default value commented out.
   `"AA:BB:CC:DD:EE:FF"` to initiate an outgoing connection to (CONNECTION.md
   §3.2 on Classic, §4 on BLE). Absent → accept-only unless the host menu
   supplies a target.
+- **`[pointer] batch`** — `"auto"` (default: 8 ms on Classic, 15 ms on BLE),
+  `"adaptive"`, `"none"`, or a millisecond count `N`. What drives a pointer
+  flush (§7.2c).
+- **`[pointer] buffer`** — outgoing report slots per connection, default `16`,
+  minimum `1` (§7.2c).
+- **`[pointer] axis_bits`** — `8` (default) or `16`: the width of the relative
+  X/Y fields in the report descriptor (§3.2, §5). Changing it changes the
+  descriptor, so bonded hosts must be fixed or re-paired (CONNECTION.md §7).
+- **`[pointer] overflow`** — `"burst"` (default), `"carry"` or `"clamp"`: what
+  happens when merged motion exceeds one report's range (§7.2c).
 
 Parse errors report the offending line and abort startup (exit 1).
 

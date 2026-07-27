@@ -27,7 +27,7 @@ use log::{error, info, warn};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{mpsc, watch};
 
-use config::Hotkeys;
+use config::{Batch, Hotkeys, Overflow};
 use report::{InputState, Outcome, RawEvent, translate};
 use transport::{Accept, AnyTransport, Classic, Flow, Le, Transport};
 
@@ -138,7 +138,7 @@ async fn run(args: cli::Args) -> Result<(), AppError> {
     // lifetime of their bond, so changing the descriptor — which is exactly what
     // changing the gamepad slot count does — has no effect on an already-bonded
     // host until it is re-paired (design/CONNECTION.md §7).
-    let descriptor_fp = sdp::descriptor_fingerprint(n_gamepads);
+    let descriptor_fp = sdp::descriptor_fingerprint(n_gamepads, cfg.axis_bits);
     let hosts = std::sync::Arc::new(std::sync::Mutex::new(state::Hosts::load()));
     let stale = hosts.lock().unwrap().stale(descriptor_fp);
     if !stale.is_empty() {
@@ -186,11 +186,14 @@ async fn run(args: cli::Args) -> Result<(), AppError> {
             .map_err(|e| AppError::new(1, format!("signal setup failed: {e}")))?,
     };
 
-    let mut state = InputState::with_gamepads(n_gamepads);
+    let mut state = InputState::with_gamepads(n_gamepads).with_pointer(cfg.axis_bits, cfg.overflow);
     let ctx = Ctx {
         hotkeys: &hotkeys,
         capture_tx: &capture_tx,
         connected: Cell::new(false),
+        batch: cfg.batch,
+        buffer: cfg.buffer,
+        overflow: cfg.overflow,
     };
 
     // --- Shared pairing agent (design/CONNECTION.md §5) ---
@@ -222,7 +225,7 @@ async fn run(args: cli::Args) -> Result<(), AppError> {
     let mut discoverable_reset: Option<bluer::Adapter> = None;
     let transport = match cfg.protocol {
         config::Protocol::Classic => {
-            profile_task = register_profile(&session, &args, n_gamepads).await?;
+            profile_task = register_profile(&session, &args, n_gamepads, cfg.axis_bits).await?;
             let adapter = if args.nosetup {
                 None
             } else {
@@ -297,6 +300,7 @@ async fn run(args: cli::Args) -> Result<(), AppError> {
                 Le::new(
                     adapter,
                     n_gamepads,
+                    cfg.axis_bits,
                     target,
                     interactive && !args.nosetup,
                     term_coord.clone(),
@@ -375,6 +379,7 @@ async fn register_profile(
     session: &Session,
     args: &cli::Args,
     n_gamepads: usize,
+    axis_bits: config::AxisBits,
 ) -> Result<Option<tokio::task::JoinHandle<()>>, AppError> {
     if args.skipsdp {
         return Ok(None);
@@ -386,7 +391,7 @@ async fn register_profile(
         role: Some(Role::Server),
         require_authentication: Some(false),
         require_authorization: Some(false),
-        service_record: Some(sdp::service_record_xml(n_gamepads)),
+        service_record: Some(sdp::service_record_xml(n_gamepads, axis_bits)),
         ..Default::default()
     };
     let mut handle = session.register_profile(profile).await.map_err(|e| {
@@ -454,6 +459,11 @@ pub struct Ctx<'a> {
     hotkeys: &'a Hotkeys,
     pub capture_tx: &'a watch::Sender<bool>,
     pub connected: Cell<bool>,
+    /// Pointer batching policy, applied to each session's `Outbox`
+    /// (design/ARCH.md §7.2c).
+    pub batch: Batch,
+    pub buffer: usize,
+    pub overflow: Overflow,
 }
 
 impl Ctx<'_> {

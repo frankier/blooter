@@ -29,7 +29,7 @@ fn uuid16(v: u16) -> Uuid {
     <Uuid as UuidExt>::from_u16(v)
 }
 
-use super::{Accept, DIAL_BACKOFF_MAX, DIAL_BACKOFF_START, Flow, Step, Transport, dispatch};
+use super::{Accept, DIAL_BACKOFF_MAX, DIAL_BACKOFF_START, Flow, Outbox, Step, Transport, step};
 use crate::report::{InputState, Outcome, RawEvent};
 use crate::sdp::{self, GAMEPAD_REPORT_ID_BASE};
 use crate::{AppError, Ctx, Signals};
@@ -131,6 +131,7 @@ impl Le {
     pub async fn new(
         adapter: Adapter,
         n_gamepads: usize,
+        axis_bits: crate::config::AxisBits,
         target: Option<Address>,
         interactive: bool,
         term_coord: crate::menu::TermCoord,
@@ -151,7 +152,7 @@ impl Le {
             services: vec![
                 device_info_service(),
                 battery_service(),
-                hid_service(&shared, n_gamepads),
+                hid_service(&shared, n_gamepads, axis_bits),
             ],
             ..Default::default()
         };
@@ -223,11 +224,20 @@ impl Transport for Le {
     async fn on_connected(&self, state: &InputState) {
         // Give the host initial state for every report it may have subscribed
         // to (design/ARCH.md §4.2). Unsubscribed reports no-op.
-        self.send_report(&state.mouse_report(0, 0, 0)).await;
-        self.send_report(&InputState::keys_up_report()).await;
+        self.send_report(state.mouse_report(0, 0, 0).as_slice())
+            .await;
+        self.send_report(InputState::keys_up_report().as_slice())
+            .await;
         for r in state.gamepad_neutral_reports() {
-            self.send_report(&r).await;
+            self.send_report(r.as_slice()).await;
         }
+    }
+
+    /// LE connection intervals are typically 7.5–30 ms, and a notify is queued
+    /// on D-Bus rather than paced by the radio, so batch a little harder than
+    /// Classic (design/ARCH.md §7.2c).
+    fn flush_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(15)
     }
 
     /// Wait for a host to subscribe to a Report characteristic's CCCD. While
@@ -343,6 +353,8 @@ impl Transport for Le {
         // Clone the watch receiver so the select can await it without borrowing
         // `self`, leaving `self` free for the shared per-event dispatch.
         let mut connected = self.connected_rx.clone();
+        // Allocated once for the connection (design/ARCH.md §7.2c).
+        let mut out = Outbox::new(ctx.buffer, ctx.batch, self.flush_interval(), ctx.overflow);
         loop {
             tokio::select! {
                 r = connected.changed() => {
@@ -350,8 +362,8 @@ impl Transport for Le {
                         return Flow::Continue; // host unsubscribed / disconnected
                     }
                 }
-                Some(ev) = rx.recv() => {
-                    if let Step::Return(f) = dispatch(self, ctx, state, ev).await {
+                inc = out.next(rx) => {
+                    if let Step::Return(f) = step(self, ctx, state, &mut out, inc).await {
                         return f;
                     }
                 }
@@ -365,13 +377,21 @@ impl Transport for Le {
 
 /// The HID service (0x1812): HID Information, Report Map, Protocol Mode, HID
 /// Control Point, and one Report characteristic per report id (design/ARCH.md §4.2).
-fn hid_service(shared: &Arc<Shared>, n_gamepads: usize) -> Service {
+fn hid_service(
+    shared: &Arc<Shared>,
+    n_gamepads: usize,
+    axis_bits: crate::config::AxisBits,
+) -> Service {
     let mut characteristics = vec![
         // HID Information: bcdHID 1.11, country 0, flags NormallyConnectable.
         read_char(HID_INFORMATION, vec![0x11, 0x01, 0x00, 0x02], true),
         // Report Map: the exact HID report descriptor (reused from the classic
         // SDP path, design/ARCH.md §4.2).
-        read_char(REPORT_MAP, sdp::report_descriptor(n_gamepads), true),
+        read_char(
+            REPORT_MAP,
+            sdp::report_descriptor(n_gamepads, axis_bits),
+            true,
+        ),
         protocol_mode_char(),
         hid_control_point_char(),
     ];

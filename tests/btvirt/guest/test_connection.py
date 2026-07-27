@@ -19,6 +19,7 @@ from harness import (
     REL_Y,
     Registry,
     assert_report,
+    describe,
     keyboard_report,
     le_payload,
     mouse_report,
@@ -124,6 +125,11 @@ def test_mouse_movement_and_buttons(t):
     blooter.rel(REL_Y, -5)
     assert_report(host.recv_report(), mouse_report(y=-5), "mouse moved -5 on Y")
 
+    # Both axes of one frame belong in a single report, not one per axis.
+    blooter.rel_frame((REL_X, 3), (REL_Y, -4))
+    assert_report(host.recv_report(), mouse_report(x=3, y=-4),
+                  "one frame with both axes is one report")
+
     blooter.key(BTN_LEFT, True)
     assert_report(host.recv_report(), mouse_report(buttons=0x01),
                   "left button pressed")
@@ -131,6 +137,39 @@ def test_mouse_movement_and_buttons(t):
     blooter.key(BTN_LEFT, False)
     assert_report(host.recv_report(), mouse_report(buttons=0x00),
                   "left button released")
+
+
+@tests.test
+def test_pointer_motion_is_batched(t):
+    """With batching on, many small frames arriving faster than the flush
+    interval collapse into one larger report rather than a queue of small ones
+    (design/ARCH.md §7.2c)."""
+    blooter = t.start_blooter(batch=50)
+    host = t.connected_host()
+    host.drain()
+
+    # Twenty frames of +2, written back to back and so well inside the 50 ms
+    # interval. Their sum fits in one report's signed 8-bit range.
+    for _ in range(20):
+        blooter.rel(REL_X, 2)
+
+    reports = host.drain(settle=1.0)
+    assert reports, "no mouse reports arrived"
+    for r in reports:
+        assert r[:3] == mouse_report()[:3], f"not a mouse report: {describe(r)}"
+
+    # Batching must not lose motion: the pointer travels exactly as far as it
+    # was moved, however the frames were grouped.
+    travelled = sum(int.from_bytes(r[3:4], "big", signed=True) for r in reports)
+    assert travelled == 40, (
+        f"expected 40 counts of travel, got {travelled} "
+        f"from {[describe(r) for r in reports]}")
+
+    # ...and it must actually batch. The first frame after an idle period goes
+    # out immediately (the interval has long since elapsed), so the twenty
+    # frames become a handful of reports, not twenty.
+    assert len(reports) < 20, (
+        f"nothing was merged: {len(reports)} reports for 20 frames")
 
 
 @tests.test

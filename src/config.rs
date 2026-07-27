@@ -87,8 +87,77 @@ pub enum PairingMode {
     Confirm,
 }
 
+/// What drives a flush of buffered pointer motion (design/ARCH.md §7.2c). A
+/// `SYN_REPORT` frame boundary is necessary for a flush in every mode, and
+/// sufficient in `None`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Batch {
+    /// A per-transport minimum spacing between pointer reports (the default):
+    /// 8 ms on Classic, 15 ms on BLE.
+    #[default]
+    Auto,
+    /// No timer: coalesce whatever piled up while the previous send was in
+    /// flight. Genuinely backpressure-driven on Classic, opportunistic on BLE.
+    Adaptive,
+    /// No buffering: flush on every frame boundary.
+    None,
+    /// An explicit minimum spacing in milliseconds, overriding `Auto`.
+    Millis(u64),
+}
+
+impl Batch {
+    /// The minimum spacing between flushes, given the transport's `auto` pick.
+    /// `None` for the untimed modes.
+    pub fn interval(self, auto: std::time::Duration) -> Option<std::time::Duration> {
+        match self {
+            Batch::Auto => Some(auto),
+            Batch::Millis(ms) => Some(std::time::Duration::from_millis(ms)),
+            Batch::Adaptive | Batch::None => None,
+        }
+    }
+}
+
+/// The width of the relative X/Y axes in the HID report descriptor. Widening
+/// them lets merged motion accumulate without saturating, at the cost of a
+/// descriptor change (design/ARCH.md §3.2, §7.2c).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AxisBits {
+    /// Signed 8-bit, −127..=127 — the compatible default.
+    #[default]
+    Eight,
+    /// Signed 16-bit, −32767..=32767.
+    Sixteen,
+}
+
+impl AxisBits {
+    /// The largest magnitude one report can carry on X/Y.
+    pub fn max(self) -> i32 {
+        match self {
+            AxisBits::Eight => 127,
+            AxisBits::Sixteen => 32767,
+        }
+    }
+}
+
+/// What to do when accumulated motion exceeds what one report can carry
+/// (design/ARCH.md §7.2c).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Overflow {
+    /// Emit as many back-to-back reports as it takes (the default). Lossless,
+    /// and bounded by the outgoing buffer.
+    #[default]
+    Burst,
+    /// Emit one saturated report and keep the remainder for the next frame.
+    Carry,
+    /// Emit one saturated report and discard the remainder.
+    Clamp,
+}
+
+/// Outgoing report slots per connection when `[pointer] buffer` is unset.
+pub const DEFAULT_BUFFER: usize = 16;
+
 /// The parsed configuration file.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Config {
     pub hotkeys: Hotkeys,
     pub gamepad_slots: GamepadSlots,
@@ -98,6 +167,28 @@ pub struct Config {
     pub pairing: Option<PairingMode>,
     /// Address of a host to initiate an outgoing HID connection to (§3.2, §6).
     pub reconnect: Option<String>,
+    /// Pointer batching (§7.2c).
+    pub batch: Batch,
+    pub buffer: usize,
+    pub axis_bits: AxisBits,
+    pub overflow: Overflow,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            hotkeys: Hotkeys::default(),
+            gamepad_slots: GamepadSlots::default(),
+            hotplug: Hotplug::default(),
+            protocol: Protocol::default(),
+            pairing: None,
+            reconnect: None,
+            batch: Batch::default(),
+            buffer: DEFAULT_BUFFER,
+            axis_bits: AxisBits::default(),
+            overflow: Overflow::default(),
+        }
+    }
 }
 
 /// The recognized `[hotkeys]` keys and their built-in defaults. An empty
@@ -188,6 +279,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
         Ok(top) => {
             let gamepad = top.gamepad.unwrap_or_default();
             let connection = top.connection.unwrap_or_default();
+            let pointer = top.pointer.unwrap_or_default();
             Ok(Config {
                 hotkeys: top.hotkeys.unwrap_or_default(),
                 gamepad_slots: gamepad.slots,
@@ -195,6 +287,10 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 protocol: connection.protocol,
                 pairing: connection.pairing,
                 reconnect: connection.reconnect,
+                batch: pointer.batch,
+                buffer: pointer.buffer,
+                axis_bits: pointer.axis_bits,
+                overflow: pointer.overflow,
             })
         }
         Err(e) => {
@@ -211,12 +307,13 @@ pub fn parse(text: &str) -> Result<Config, String> {
     }
 }
 
-/// The whole config file: the optional `[hotkeys]`, `[gamepad]` and
-/// `[connection]` tables.
+/// The whole config file: the optional `[hotkeys]`, `[gamepad]`, `[connection]`
+/// and `[pointer]` tables.
 struct TopLevel {
     hotkeys: Option<Hotkeys>,
     gamepad: Option<Gamepad>,
     connection: Option<Connection>,
+    pointer: Option<Pointer>,
 }
 
 impl<'de> FromToml<'de> for TopLevel {
@@ -225,12 +322,104 @@ impl<'de> FromToml<'de> for TopLevel {
         let hotkeys = th.optional("hotkeys");
         let gamepad = th.optional("gamepad");
         let connection = th.optional("connection");
+        let pointer = th.optional("pointer");
         th.require_empty()?;
         Ok(TopLevel {
             hotkeys,
             gamepad,
             connection,
+            pointer,
         })
+    }
+}
+
+/// The `[pointer]` table (design/ARCH.md §7.2c).
+struct Pointer {
+    batch: Batch,
+    buffer: usize,
+    axis_bits: AxisBits,
+    overflow: Overflow,
+}
+
+impl Default for Pointer {
+    fn default() -> Self {
+        Self {
+            batch: Batch::default(),
+            buffer: DEFAULT_BUFFER,
+            axis_bits: AxisBits::default(),
+            overflow: Overflow::default(),
+        }
+    }
+}
+
+impl<'de> FromToml<'de> for Pointer {
+    fn from_toml(ctx: &mut Context<'de>, item: &Item<'de>) -> Result<Self, Failed> {
+        let mut th = item.table_helper(ctx)?;
+        let batch = th.optional_mapped("batch", batch_item).unwrap_or_default();
+        let buffer = th
+            .optional_mapped("buffer", buffer_item)
+            .unwrap_or(DEFAULT_BUFFER);
+        let axis_bits = th
+            .optional_mapped("axis_bits", axis_bits_item)
+            .unwrap_or_default();
+        let overflow = th
+            .optional_mapped("overflow", overflow_item)
+            .unwrap_or_default();
+        th.require_empty()?;
+        Ok(Pointer {
+            batch,
+            buffer,
+            axis_bits,
+            overflow,
+        })
+    }
+}
+
+/// Parse the `batch` value: `"auto"`, `"adaptive"`, `"none"`, or milliseconds.
+fn batch_item(item: &Item<'_>) -> Result<Batch, toml_spanner::Error> {
+    match item.as_str() {
+        Some("auto") => return Ok(Batch::Auto),
+        Some("adaptive") => return Ok(Batch::Adaptive),
+        Some("none") => return Ok(Batch::None),
+        Some(_) => {}
+        None => {
+            if let Some(ms) = item.as_u64() {
+                // 0 ms is not "no spacing but still buffered" — that is `"none"`.
+                return Ok(if ms == 0 {
+                    Batch::None
+                } else {
+                    Batch::Millis(ms)
+                });
+            }
+        }
+    }
+    Err(item.expected(&"\"auto\", \"adaptive\", \"none\", or a millisecond count"))
+}
+
+/// Parse the `buffer` value: how many outgoing report slots to hold.
+fn buffer_item(item: &Item<'_>) -> Result<usize, toml_spanner::Error> {
+    match item.as_u64() {
+        Some(n) if n >= 1 => Ok(n as usize),
+        _ => Err(item.expected(&"an integer of at least 1")),
+    }
+}
+
+/// Parse the `axis_bits` value: the integer 8 or 16.
+fn axis_bits_item(item: &Item<'_>) -> Result<AxisBits, toml_spanner::Error> {
+    match item.as_u64() {
+        Some(8) => Ok(AxisBits::Eight),
+        Some(16) => Ok(AxisBits::Sixteen),
+        _ => Err(item.expected(&"8 or 16")),
+    }
+}
+
+/// Parse the `overflow` value: `"burst"`, `"carry"` or `"clamp"`.
+fn overflow_item(item: &Item<'_>) -> Result<Overflow, toml_spanner::Error> {
+    match item.as_str() {
+        Some("burst") => Ok(Overflow::Burst),
+        Some("carry") => Ok(Overflow::Carry),
+        Some("clamp") => Ok(Overflow::Clamp),
+        _ => Err(item.expected(&"\"burst\", \"carry\" or \"clamp\"")),
     }
 }
 
@@ -449,6 +638,54 @@ mod tests {
         assert_eq!(cfg.protocol, Protocol::Ble);
         assert_eq!(cfg.pairing, None);
         assert_eq!(cfg.reconnect, None);
+        assert_eq!(cfg.batch, Batch::Auto);
+        assert_eq!(cfg.buffer, DEFAULT_BUFFER);
+        assert_eq!(cfg.axis_bits, AxisBits::Eight);
+        assert_eq!(cfg.overflow, Overflow::Burst);
+    }
+
+    #[test]
+    fn pointer_parse() {
+        // Absent → defaults, both with and without the table present.
+        assert_eq!(parse("").unwrap().batch, Batch::Auto);
+        assert_eq!(parse("[pointer]\n").unwrap().batch, Batch::Auto);
+        assert_eq!(parse("[pointer]\n").unwrap().buffer, DEFAULT_BUFFER);
+
+        for (text, want) in [
+            ("\"auto\"", Batch::Auto),
+            ("\"adaptive\"", Batch::Adaptive),
+            ("\"none\"", Batch::None),
+            ("30", Batch::Millis(30)),
+            // An explicit zero is "no spacing", i.e. no buffering.
+            ("0", Batch::None),
+        ] {
+            let cfg = parse(&format!("[pointer]\nbatch = {text}\n")).unwrap();
+            assert_eq!(cfg.batch, want, "batch = {text}");
+        }
+
+        assert_eq!(parse("[pointer]\nbuffer = 4\n").unwrap().buffer, 4);
+        assert_eq!(
+            parse("[pointer]\naxis_bits = 16\n").unwrap().axis_bits,
+            AxisBits::Sixteen
+        );
+        assert_eq!(
+            parse("[pointer]\noverflow = \"carry\"\n").unwrap().overflow,
+            Overflow::Carry
+        );
+        assert_eq!(
+            parse("[pointer]\noverflow = \"clamp\"\n").unwrap().overflow,
+            Overflow::Clamp
+        );
+
+        // Rejections: bad strings, wrong types, out-of-range values.
+        assert!(parse("[pointer]\nbatch = \"fast\"\n").is_err());
+        assert!(parse("[pointer]\nbatch = true\n").is_err());
+        assert!(parse("[pointer]\nbuffer = 0\n").is_err());
+        assert!(parse("[pointer]\nbuffer = \"16\"\n").is_err());
+        assert!(parse("[pointer]\naxis_bits = 12\n").is_err());
+        assert!(parse("[pointer]\naxis_bits = \"8\"\n").is_err());
+        assert!(parse("[pointer]\noverflow = \"wrap\"\n").is_err());
+        assert!(parse("[pointer]\nunknown = 1\n").is_err());
     }
 
     #[test]

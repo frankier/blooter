@@ -45,8 +45,12 @@ BT_SECURITY = 4
 BT_SECURITY_LOW = 1
 
 # evdev event types/codes (linux/input-event-codes.h).
+EV_SYN = 0x00
 EV_KEY = 0x01
 EV_REL = 0x02
+# SYN_REPORT: end of an input frame. blooter only emits a report at a frame
+# boundary (design/ARCH.md §7.2c), so every injected event needs one after it.
+SYN_REPORT = 0x00
 KEY_A = 30
 KEY_B = 48
 BTN_LEFT = 0x110
@@ -395,11 +399,15 @@ class Blooter:
     reports that come out the other end.
     """
 
-    def __init__(self, binary, extra_args=(), fifo=None, protocol="classic"):
+    def __init__(self, binary, extra_args=(), fifo=None, protocol="classic",
+                 batch="none"):
         self.binary = binary
         self.fifo_path = fifo or os.path.join(RUNDIR, "blooter.fifo")
         self.extra_args = list(extra_args)
         self.protocol = protocol
+        # Default to unbatched so a report arrives per injected frame; tests
+        # that exercise batching pass batch="auto" or a millisecond count.
+        self.batch = batch
         self.config_path = os.path.join(RUNDIR, "blooter.toml")
         self.proc = None
         self._fifo_fd = None
@@ -412,6 +420,12 @@ class Blooter:
         # change of default cannot silently move a test to the other transport.
         with open(self.config_path, "w") as fh:
             fh.write(f'[connection]\nprotocol = "{self.protocol}"\n')
+            # Pointer batching is pinned per test rather than left to the
+            # default, so report-content assertions do not depend on timing.
+            # A millisecond count is a TOML integer, the modes are strings.
+            batch = (self.batch if isinstance(self.batch, int)
+                     else f'"{self.batch}"')
+            fh.write(f'[pointer]\nbatch = {batch}\n')
 
         env = dict(os.environ, RUST_BACKTRACE="1")
         # Full adapter setup is deliberately left on (no `-n`): blooter making
@@ -437,10 +451,19 @@ class Blooter:
         os.write(self._fifo_fd, b"".join(events))
 
     def key(self, code, pressed):
-        self.send_events(input_event(EV_KEY, code, 1 if pressed else 0))
+        self.send_events(input_event(EV_KEY, code, 1 if pressed else 0),
+                         input_event(EV_SYN, SYN_REPORT, 0))
 
     def rel(self, code, value):
-        self.send_events(input_event(EV_REL, code, value))
+        self.send_events(input_event(EV_REL, code, value),
+                         input_event(EV_SYN, SYN_REPORT, 0))
+
+    def rel_frame(self, *axes):
+        """One input frame carrying several relative axes, e.g.
+        `rel_frame((REL_X, 3), (REL_Y, -4))`. blooter merges the whole frame
+        into a single report."""
+        self.send_events(*[input_event(EV_REL, c, v) for c, v in axes],
+                         input_event(EV_SYN, SYN_REPORT, 0))
 
     def output(self):
         return self.proc.output() if self.proc else ""
@@ -753,9 +776,9 @@ class TestContext:
         self.blooter = None
         self.hosts = []
 
-    def start_blooter(self, extra_args=(), protocol="classic"):
+    def start_blooter(self, extra_args=(), protocol="classic", batch="none"):
         self.blooter = Blooter(self.binary, extra_args=extra_args,
-                               protocol=protocol).start()
+                               protocol=protocol, batch=batch).start()
         return self.blooter
 
     def host(self):

@@ -94,3 +94,55 @@
 # runtime instead). Once any link is up the target is cleared, so blooter does
 # not fight an intentional disconnect.
 #reconnect = "AA:BB:CC:DD:EE:FF"
+
+[pointer]
+
+# Mice and touchpads generate events far faster than a Bluetooth link consumes
+# them — a touchpad can emit hundreds of frames a second, while BLE delivers
+# roughly one notification per connection interval. Left unbatched, motion
+# queues up and the pointer keeps gliding after you stop. blooter accumulates
+# the motion in a frame and sends it as one larger report instead, trading a
+# little pointer resolution for responsiveness (see design/ARCH.md §7.2c).
+#
+# What triggers a send. An input frame boundary (SYN_REPORT) is required in
+# every mode, so a report never splits a frame.
+#
+#   "auto"      wait at least one transport-specific interval between pointer
+#               reports — 8 ms on Classic, 15 ms on BLE (the default)
+#   "adaptive"  no timer: merge whatever piled up while the previous report was
+#               being sent. Zero added latency, and genuinely backpressure-driven
+#               on Classic. On BLE a notification is handed to bluetoothd rather
+#               than paced by the radio, so there it only merges opportunistically
+#               and will not throttle to the connection interval — prefer "auto"
+#   "none"      no batching: send at every frame boundary
+#   N           wait at least N milliseconds, overriding what "auto" would pick
+#batch = "auto"
+
+# How many outgoing reports to hold per connection. Allocated once when a host
+# connects. Pointer motion merges in place rather than filling slots, so this
+# only bounds bursts of keyboard, gamepad and unmergeable pointer reports; the
+# buffer is always flushed before it can overflow, so nothing is dropped.
+#buffer = 16
+
+# Width of the relative X/Y fields in the HID report descriptor. 8-bit caps a
+# single report at ±127 counts, which merged motion can exceed during a fast
+# flick; 16-bit (±32767) makes batching lossless at any interval.
+#
+# This changes the HID report descriptor, which hosts cache for the lifetime of
+# their bond — the same caveat as [gamepad] slots. On Classic, blooter notices
+# and offers [f] in the connection menu (design/CONNECTION.md §7). On BLE there
+# is no such repair: a host bonded under the other width keeps its cached Report
+# Map and will misread the reports, so re-pair it by hand after changing this.
+#axis_bits = 8
+
+# What to do when merged motion exceeds what one report can carry.
+#
+#   "burst"  send as many back-to-back reports as it takes (the default).
+#            Lossless, and bounded by the buffer above
+#   "carry"  send one saturated report and carry the remainder into the next
+#            frame. Smoother, but a fast flick lags slightly behind
+#   "clamp"  send one saturated report and discard the remainder. The pointer
+#            travels less than you moved
+#
+# With axis_bits = 16 this effectively never comes into play.
+#overflow = "burst"

@@ -146,6 +146,38 @@ With an explicit `-e` selection, only the listed event numbers are opened. This
 needs system **libudev** (a build- and run-time dependency, present on any
 systemd/udev Linux).
 
+### Pointer batching
+
+A mouse or touchpad produces events far faster than a Bluetooth link carries
+them — a touchpad can emit hundreds of frames a second, while BLE delivers
+roughly one notification per connection interval. Left alone, the surplus queues
+up and the pointer keeps drifting for a moment after you stop moving. blooter
+instead accumulates the motion between sends and delivers it as one larger
+movement, which trades a little pointer resolution for responsiveness.
+
+`[pointer] batch` sets what triggers a send:
+
+- `"auto"` (the default) — leave at least one transport-appropriate interval
+  between pointer reports: 8 ms on Classic, 15 ms on BLE;
+- `"adaptive"` — no timer; merge only what arrives while the previous report is
+  being sent. No added latency, and self-tuning on Classic — but on BLE a
+  notification is handed to `bluetoothd` rather than paced by the radio, so
+  there it cannot see the real link speed. Prefer `"auto"` on BLE;
+- `"none"` — send at every input frame;
+- `N` — leave at least `N` milliseconds, overriding `"auto"`.
+
+An input frame is never split, in any mode, so a click and the motion alongside
+it always arrive together.
+
+A single report carries at most ±127 counts per axis, which a fast flick can
+exceed once motion is merged. By default (`[pointer] overflow = "burst"`) the
+excess goes out as extra reports, so nothing is lost; `"carry"` spreads it over
+following reports instead, and `"clamp"` drops it. Setting
+`[pointer] axis_bits = 16` widens the axes to ±32767 so this stops arising at
+all — but it changes the HID report descriptor, which hosts cache, so already
+paired hosts need fixing (`[f]` in the connection menu, on Classic) or
+re-pairing (on BLE).
+
 ## How it works
 
 On **BLE** (the default):

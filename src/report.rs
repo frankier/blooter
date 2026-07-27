@@ -1,13 +1,58 @@
 //! Session input state and translation of Linux input events into HID Boot
 //! input reports. See design/ARCH.md §5 and §7.
 
-use crate::config::{Action, Hotkeys};
+use crate::config::{Action, AxisBits, Hotkeys, Overflow};
 use crate::keymap;
 
 // Linux event types (from <linux/input-event-codes.h>).
+pub const EV_SYN: u16 = 0x00;
 pub const EV_KEY: u16 = 0x01;
 pub const EV_REL: u16 = 0x02;
 pub const EV_ABS: u16 = 0x03;
+
+/// `EV_SYN` code marking the end of an input frame.
+pub const SYN_REPORT: u16 = 0;
+
+/// The largest input report blooter emits (keyboard and gamepad are both 11
+/// bytes including the `0xA1` HIDP header; a mouse report is 6 or 8).
+pub const MAX_REPORT: usize = 11;
+
+/// One built HID input report, `[0xA1, report_id, payload…]`. Fixed-size so it
+/// can sit in the outgoing ring without allocating (design/ARCH.md §7.2c).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Report {
+    len: u8,
+    bytes: [u8; MAX_REPORT],
+}
+
+impl Report {
+    /// Build from a slice of at most `MAX_REPORT` bytes.
+    pub fn new(src: &[u8]) -> Self {
+        let mut bytes = [0u8; MAX_REPORT];
+        bytes[..src.len()].copy_from_slice(src);
+        Report {
+            len: src.len() as u8,
+            bytes,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+
+    /// The HID report id (byte 1, after the `0xA1` HIDP header).
+    pub fn id(&self) -> u8 {
+        self.bytes[1]
+    }
+}
+
+impl std::ops::Deref for Report {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
 
 /// A decoded Linux `struct input_event`. Keyboard/mouse/touchpad events carry
 /// `gamepad: None` and merge into one logical device; gamepad events carry
@@ -90,6 +135,23 @@ impl GamepadState {
     }
 }
 
+/// Pointer motion accumulated since the last flush, in device units. Held as
+/// `i32` so merging many frames cannot overflow the axis range mid-way; the
+/// clamp to what one report can carry happens in `take_mouse_frame`
+/// (design/ARCH.md §7.2c).
+#[derive(Clone, Copy, Default)]
+struct MouseAccum {
+    x: i32,
+    y: i32,
+    wheel: i32,
+}
+
+impl MouseAccum {
+    fn is_empty(&self) -> bool {
+        self.x == 0 && self.y == 0 && self.wheel == 0
+    }
+}
+
 /// The per-session state, reset on every new host connection (design/ARCH.md §7).
 pub struct InputState {
     pub mouse_buttons: u8,
@@ -105,6 +167,14 @@ pub struct InputState {
     /// One entry per advertised gamepad slot (empty when gamepad forwarding is
     /// off), indexed by the `slot` carried on gamepad `RawEvent`s.
     gamepads: Box<[GamepadState]>,
+    /// Pointer motion pending since the last frame boundary, and how it is
+    /// encoded once a flush is due (§7.2c).
+    accum: MouseAccum,
+    /// Set when the button state changed this frame, so a click with no motion
+    /// still produces a report.
+    mouse_dirty: bool,
+    axis_bits: AxisBits,
+    overflow: Overflow,
 }
 
 impl Default for InputState {
@@ -114,7 +184,7 @@ impl Default for InputState {
 }
 
 impl InputState {
-    /// Session state advertising `n_gamepads` gamepad slots.
+    /// Session state advertising `n_gamepads` gamepad slots, with 8-bit axes.
     pub fn with_gamepads(n_gamepads: usize) -> Self {
         Self {
             mouse_buttons: 0,
@@ -124,7 +194,56 @@ impl InputState {
             touching: false,
             last_abs: [None; 2],
             gamepads: vec![GamepadState::neutral(); n_gamepads].into_boxed_slice(),
+            accum: MouseAccum::default(),
+            mouse_dirty: false,
+            axis_bits: AxisBits::Eight,
+            overflow: Overflow::Burst,
         }
+    }
+
+    /// Set the pointer encoding from `[pointer] axis_bits` / `overflow`.
+    pub fn with_pointer(mut self, axis_bits: AxisBits, overflow: Overflow) -> Self {
+        self.axis_bits = axis_bits;
+        self.overflow = overflow;
+        self
+    }
+
+    pub fn axis_bits(&self) -> AxisBits {
+        self.axis_bits
+    }
+
+    pub fn overflow(&self) -> Overflow {
+        self.overflow
+    }
+
+    /// Whether any pointer motion or button change is waiting to be flushed.
+    pub fn mouse_pending(&self) -> bool {
+        self.mouse_dirty || !self.accum.is_empty()
+    }
+
+    /// Discard pending pointer state, so it cannot surface after a capture
+    /// pause, a dropped session or a reconnect (design/ARCH.md §6.3).
+    pub fn clear_mouse(&mut self) {
+        self.accum = MouseAccum::default();
+        self.mouse_dirty = false;
+    }
+
+    /// Take up to one report's worth of accumulated motion, clamped to the
+    /// configured axis range and subtracted from the accumulator. Returns
+    /// `None` once nothing is pending, so `Overflow::Burst` can loop on it.
+    pub fn take_mouse_frame(&mut self) -> Option<Report> {
+        if !self.mouse_pending() {
+            return None;
+        }
+        self.mouse_dirty = false;
+        let max = self.axis_bits.max();
+        let x = self.accum.x.clamp(-max, max);
+        let y = self.accum.y.clamp(-max, max);
+        let wheel = self.accum.wheel.clamp(-127, 127);
+        self.accum.x -= x;
+        self.accum.y -= y;
+        self.accum.wheel -= wheel;
+        Some(self.mouse_report(x, y, wheel))
     }
 }
 
@@ -132,12 +251,13 @@ impl InputState {
 pub enum Outcome {
     /// Nothing to send.
     Nothing,
-    /// A mouse input report (6 bytes incl. the `0xA1` HIDP header).
-    Mouse([u8; 6]),
-    /// A keyboard input report (11 bytes incl. the `0xA1` HIDP header).
-    Keyboard([u8; 11]),
-    /// A gamepad input report (11 bytes incl. the `0xA1` HIDP header).
-    Gamepad([u8; 11]),
+    /// A keyboard input report.
+    Keyboard(Report),
+    /// A gamepad input report.
+    Gamepad(Report),
+    /// End of an input frame (`SYN_REPORT`): a flush point. Necessary for a
+    /// flush in every batching mode, and sufficient in `Batch::None` (§7.2c).
+    Sync,
     /// The drop-connection hotkey fired: drop the current session.
     DropSession,
     /// The exit hotkey fired: terminate the whole program.
@@ -157,6 +277,7 @@ impl InputState {
         self.capture = true;
         self.touching = false;
         self.last_abs = [None; 2];
+        self.accum = MouseAccum::default();
         for gp in self.gamepads.iter_mut() {
             *gp = GamepadState::neutral();
         }
@@ -164,41 +285,49 @@ impl InputState {
 
     /// A neutral input report for every advertised gamepad, to release any held
     /// controller state host-side (on drop/exit/capture-off).
-    pub fn gamepad_neutral_reports(&self) -> Vec<[u8; 11]> {
+    pub fn gamepad_neutral_reports(&self) -> Vec<Report> {
         let neutral = GamepadState::neutral();
         (0..self.gamepads.len())
-            .map(|slot| neutral.report(slot as u8))
+            .map(|slot| Report::new(&neutral.report(slot as u8)))
             .collect()
     }
 
-    /// Build a mouse report from the current button state and given axes.
-    pub fn mouse_report(&self, x: i8, y: i8, wheel: i8) -> [u8; 6] {
-        [
-            0xA1,
-            0x01,
-            self.mouse_buttons,
-            x as u8,
-            y as u8,
-            wheel as u8,
-        ]
+    /// Build a mouse report from the current button state and given axes. The
+    /// axis fields are 8- or 16-bit little-endian per `[pointer] axis_bits`,
+    /// matching `sdp::mouse_block` (design/ARCH.md §5).
+    pub fn mouse_report(&self, x: i32, y: i32, wheel: i32) -> Report {
+        let buttons = self.mouse_buttons;
+        let wheel = wheel.clamp(-127, 127) as i8 as u8;
+        match self.axis_bits {
+            AxisBits::Eight => {
+                let x = x.clamp(-127, 127) as i8 as u8;
+                let y = y.clamp(-127, 127) as i8 as u8;
+                Report::new(&[0xA1, 0x01, buttons, x, y, wheel])
+            }
+            AxisBits::Sixteen => {
+                let [x_lo, x_hi] = (x.clamp(-32767, 32767) as i16).to_le_bytes();
+                let [y_lo, y_hi] = (y.clamp(-32767, 32767) as i16).to_le_bytes();
+                Report::new(&[0xA1, 0x01, buttons, x_lo, x_hi, y_lo, y_hi, wheel])
+            }
+        }
     }
 
     /// Build a keyboard report from the current modifier and key state.
-    pub fn keyboard_report(&self) -> [u8; 11] {
+    pub fn keyboard_report(&self) -> Report {
         let mut r = [0u8; 11];
         r[0] = 0xA1;
         r[1] = 0x02;
         r[2] = self.modifiers;
         r[3..11].copy_from_slice(&self.pressed_keys);
-        r
+        Report::new(&r)
     }
 
     /// An all-keys-up keyboard report (modifiers 0, no keys).
-    pub fn keys_up_report() -> [u8; 11] {
+    pub fn keys_up_report() -> Report {
         let mut r = [0u8; 11];
         r[0] = 0xA1;
         r[1] = 0x02;
-        r
+        Report::new(&r)
     }
 
     fn press(&mut self, usage: u8) {
@@ -224,6 +353,15 @@ impl InputState {
 /// Translate one raw input event, updating `state`. Returns the report (if any)
 /// to transmit, or a hotkey action.
 pub fn translate(hotkeys: &Hotkeys, state: &mut InputState, ev: RawEvent) -> Outcome {
+    // Frame boundaries are checked ahead of the gamepad dispatch: every device
+    // shares one channel, and a SYN from any of them is a valid flush point.
+    if ev.type_ == EV_SYN {
+        return if ev.code == SYN_REPORT {
+            Outcome::Sync
+        } else {
+            Outcome::Nothing
+        };
+    }
     if let Some(slot) = ev.gamepad {
         return translate_gamepad(state, slot, ev.type_, ev.code, ev.value);
     }
@@ -279,7 +417,7 @@ fn translate_gamepad(
         _ => false,
     };
     if recognized && capture {
-        Outcome::Gamepad(gp.report(slot))
+        Outcome::Gamepad(Report::new(&gp.report(slot)))
     } else {
         Outcome::Nothing
     }
@@ -299,11 +437,13 @@ fn translate_key(hotkeys: &Hotkeys, state: &mut InputState, code: u16, value: i3
             } else {
                 state.mouse_buttons &= !(1 << bit);
             }
+            // Like motion, a button change waits for the frame boundary, so a
+            // click and the motion alongside it become one report and neither
+            // can overtake the other (§7.2c).
             if state.capture {
-                Outcome::Mouse(state.mouse_report(0, 0, 0))
-            } else {
-                Outcome::Nothing
+                state.mouse_dirty = true;
             }
+            Outcome::Nothing
         }
         BTN_TOUCH => {
             state.touching = value != 0;
@@ -363,17 +503,21 @@ fn translate_key(hotkeys: &Hotkeys, state: &mut InputState, code: u16, value: i3
     }
 }
 
+/// Accumulate relative motion. Nothing is emitted here: a hardware frame
+/// carries one event per axis, so emitting per event would cost two reports for
+/// a plain diagonal move. The accumulator is drained at the next `SYN_REPORT`
+/// (design/ARCH.md §7.2c).
 fn translate_rel(state: &mut InputState, code: u16, value: i32) -> Outcome {
     if !state.capture {
         return Outcome::Nothing;
     }
-    let v = value.clamp(-127, 127) as i8;
     match code {
-        keymap::REL_X => Outcome::Mouse(state.mouse_report(v, 0, 0)),
-        keymap::REL_Y => Outcome::Mouse(state.mouse_report(0, v, 0)),
-        keymap::REL_WHEEL => Outcome::Mouse(state.mouse_report(0, 0, v)),
-        _ => Outcome::Nothing,
+        keymap::REL_X => state.accum.x += value,
+        keymap::REL_Y => state.accum.y += value,
+        keymap::REL_WHEEL => state.accum.wheel += value,
+        _ => {}
     }
+    Outcome::Nothing
 }
 
 /// Touchpads report absolute finger positions (single-touch emulation axes);
@@ -396,12 +540,14 @@ fn translate_abs(state: &mut InputState, code: u16, value: i32) -> Outcome {
     if !state.capture {
         return Outcome::Nothing;
     }
-    let d = (value - prev).clamp(-127, 127) as i8;
+    // Same accumulate-and-drain-at-SYN treatment as EV_REL (§7.2c).
+    let d = value - prev;
     if axis == 0 {
-        Outcome::Mouse(state.mouse_report(d, 0, 0))
+        state.accum.x += d;
     } else {
-        Outcome::Mouse(state.mouse_report(0, d, 0))
+        state.accum.y += d;
     }
+    Outcome::Nothing
 }
 
 #[cfg(test)]
@@ -413,6 +559,25 @@ mod tests {
             type_: EV_KEY,
             code,
             value,
+            gamepad: None,
+        }
+    }
+
+    fn rel(code: u16, value: i32) -> RawEvent {
+        RawEvent {
+            type_: EV_REL,
+            code,
+            value,
+            gamepad: None,
+        }
+    }
+
+    /// End of an input frame — the flush point every batching mode needs.
+    fn syn() -> RawEvent {
+        RawEvent {
+            type_: EV_SYN,
+            code: SYN_REPORT,
+            value: 0,
             gamepad: None,
         }
     }
@@ -531,38 +696,141 @@ mod tests {
             translate(&hk, &mut s, abs(keymap::ABS_Y, 800)),
             Outcome::Nothing
         ));
-        // Subsequent positions produce relative motion.
-        match translate(&hk, &mut s, abs(keymap::ABS_X, 1010)) {
-            Outcome::Mouse(r) => assert_eq!(r, [0xA1, 0x01, 0x00, 10, 0, 0]),
-            _ => panic!(),
-        }
-        match translate(&hk, &mut s, abs(keymap::ABS_Y, 795)) {
-            Outcome::Mouse(r) => assert_eq!(r, [0xA1, 0x01, 0x00, 0, -5i8 as u8, 0]),
-            _ => panic!(),
-        }
+        // Subsequent positions accumulate relative motion; both axes of the
+        // frame land in the one report the SYN drains.
+        assert!(matches!(
+            translate(&hk, &mut s, abs(keymap::ABS_X, 1010)),
+            Outcome::Nothing
+        ));
+        assert!(matches!(
+            translate(&hk, &mut s, abs(keymap::ABS_Y, 795)),
+            Outcome::Nothing
+        ));
+        assert!(matches!(translate(&hk, &mut s, syn()), Outcome::Sync));
+        assert_eq!(
+            s.take_mouse_frame().unwrap().as_slice(),
+            [0xA1, 0x01, 0x00, 10, -5i8 as u8, 0]
+        );
+        assert!(s.take_mouse_frame().is_none());
         // Lifting resets the reference: no jump on the next touch.
         translate(&hk, &mut s, key(keymap::BTN_TOUCH, 0));
         translate(&hk, &mut s, key(keymap::BTN_TOUCH, 1));
-        assert!(matches!(
-            translate(&hk, &mut s, abs(keymap::ABS_X, 2000)),
-            Outcome::Nothing
-        ));
+        translate(&hk, &mut s, abs(keymap::ABS_X, 2000));
+        assert!(!s.mouse_pending());
     }
 
+    /// One hardware frame carrying both axes must cost exactly one report, not
+    /// one per axis (design/ARCH.md §7.2c).
     #[test]
-    fn mouse_rel_clamped() {
+    fn rel_frame_is_one_report() {
         let hk = Hotkeys::default();
         let mut s = InputState::default();
-        let ev = RawEvent {
-            type_: EV_REL,
-            code: keymap::REL_X,
-            value: 5000,
-            gamepad: None,
+        assert!(matches!(
+            translate(&hk, &mut s, rel(keymap::REL_X, 3)),
+            Outcome::Nothing
+        ));
+        assert!(matches!(
+            translate(&hk, &mut s, rel(keymap::REL_Y, -4)),
+            Outcome::Nothing
+        ));
+        assert!(matches!(translate(&hk, &mut s, syn()), Outcome::Sync));
+        assert_eq!(
+            s.take_mouse_frame().unwrap().as_slice(),
+            [0xA1, 0x01, 0x00, 3, -4i8 as u8, 0]
+        );
+        assert!(s.take_mouse_frame().is_none());
+    }
+
+    /// Motion beyond one report's range is handed out a report at a time, so
+    /// `Overflow::Burst` can drain it losslessly.
+    #[test]
+    fn mouse_rel_saturates_a_report_at_a_time() {
+        let hk = Hotkeys::default();
+        let mut s = InputState::default();
+        translate(&hk, &mut s, rel(keymap::REL_X, 300));
+        translate(&hk, &mut s, syn());
+        assert_eq!(
+            s.take_mouse_frame().unwrap().as_slice(),
+            [0xA1, 0x01, 0x00, 127, 0, 0]
+        );
+        assert_eq!(
+            s.take_mouse_frame().unwrap().as_slice(),
+            [0xA1, 0x01, 0x00, 127, 0, 0]
+        );
+        assert_eq!(
+            s.take_mouse_frame().unwrap().as_slice(),
+            [0xA1, 0x01, 0x00, 46, 0, 0]
+        );
+        assert!(s.take_mouse_frame().is_none());
+    }
+
+    /// With 16-bit axes the same motion fits in one 8-byte report.
+    #[test]
+    fn mouse_rel_16_bit() {
+        let hk = Hotkeys::default();
+        let mut s = InputState::default().with_pointer(AxisBits::Sixteen, Overflow::Burst);
+        translate(&hk, &mut s, rel(keymap::REL_X, 300));
+        translate(&hk, &mut s, rel(keymap::REL_Y, -300));
+        translate(&hk, &mut s, syn());
+        assert_eq!(
+            s.take_mouse_frame().unwrap().as_slice(),
+            [0xA1, 0x01, 0x00, 0x2C, 0x01, 0xD4, 0xFE, 0]
+        );
+        assert!(s.take_mouse_frame().is_none());
+    }
+
+    /// A click and the motion alongside it are one report, and a click with no
+    /// motion still produces one.
+    #[test]
+    fn button_change_joins_the_frame() {
+        let hk = Hotkeys::default();
+        let mut s = InputState::default();
+        translate(&hk, &mut s, rel(keymap::REL_X, 2));
+        assert!(matches!(
+            translate(&hk, &mut s, key(keymap::BTN_LEFT, 1)),
+            Outcome::Nothing
+        ));
+        translate(&hk, &mut s, syn());
+        assert_eq!(
+            s.take_mouse_frame().unwrap().as_slice(),
+            [0xA1, 0x01, 0x01, 2, 0, 0]
+        );
+        // Release with no motion: still a report, so the host sees the button up.
+        translate(&hk, &mut s, key(keymap::BTN_LEFT, 0));
+        translate(&hk, &mut s, syn());
+        assert_eq!(
+            s.take_mouse_frame().unwrap().as_slice(),
+            [0xA1, 0x01, 0x00, 0, 0, 0]
+        );
+        assert!(s.take_mouse_frame().is_none());
+    }
+
+    /// Pending motion must not survive a capture pause or a reconnect (§6.3).
+    #[test]
+    fn pending_motion_is_discarded_on_reset() {
+        let hk = Hotkeys::default();
+        let mut s = InputState::default();
+        translate(&hk, &mut s, rel(keymap::REL_X, 40));
+        assert!(s.mouse_pending());
+        s.clear_mouse();
+        assert!(!s.mouse_pending());
+
+        translate(&hk, &mut s, rel(keymap::REL_X, 40));
+        s.reset();
+        assert!(!s.mouse_pending());
+    }
+
+    /// Motion arriving while capture is off is dropped, not banked up.
+    #[test]
+    fn no_accumulation_while_capture_off() {
+        let hk = Hotkeys::default();
+        let mut s = InputState {
+            capture: false,
+            ..Default::default()
         };
-        match translate(&hk, &mut s, ev) {
-            Outcome::Mouse(r) => assert_eq!(r, [0xA1, 0x01, 0x00, 127, 0, 0]),
-            _ => panic!(),
-        }
+        translate(&hk, &mut s, rel(keymap::REL_X, 40));
+        translate(&hk, &mut s, syn());
+        assert!(!s.mouse_pending());
     }
 
     #[test]
