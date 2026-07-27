@@ -3,19 +3,25 @@
 //! A small, pre-emptable TUI built directly on `crossterm`'s async
 //! [`EventStream`]: arrow keys move, number keys pick a host, letter keys drive
 //! actions ("Other devices" submenu, rescan, skip). It runs as a spawned task
-//! that the Classic transport races against an incoming connection; a `oneshot`
+//! that the active transport races against an incoming connection; a `oneshot`
 //! cancel signal (fired on inbound-accept or shutdown) preempts the menu at any
 //! await point and the terminal is always restored.
+//!
+//! Both transports use it: [`Kind`] carries the only differences — which
+//! discovery transport to scan on, and whether `[f] Fix connection` applies
+//! (Classic only, §7). [`Session`] wraps the spawn/cancel/join plumbing so each
+//! transport's `wait_connected` drives the menu the same way.
 //!
 //! Ineligible devices — Bluetooth audio/headsets, and devices with no real name
 //! (only a hex identifier) — are moved to an "Other devices" submenu so the main
 //! list shows just plausible HID hosts (computers/phones).
 
+use std::future;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
-use bluer::{Adapter, AdapterEvent, Address, Device};
+use bluer::{Adapter, AdapterEvent, Address, Device, DiscoveryFilter, DiscoveryTransport};
 use crossterm::cursor;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::style::Print;
@@ -24,10 +30,36 @@ use crossterm::{execute, queue};
 use futures::StreamExt;
 use log::{info, warn};
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 
 /// How long to scan on entry and on each rescan.
 const SCAN_SECS: u64 = 4;
+
+/// Which transport the menu is running for. The list and the key handling are
+/// otherwise identical (design/CONNECTION.md §6).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind {
+    Classic,
+    Ble,
+}
+
+impl Kind {
+    /// Scan only on the transport in use, so the list never offers a device the
+    /// caller cannot connect to.
+    fn discovery_transport(self) -> DiscoveryTransport {
+        match self {
+            Self::Classic => DiscoveryTransport::BrEdr,
+            Self::Ble => DiscoveryTransport::Le,
+        }
+    }
+
+    /// `[f] Fix connection` invalidates a host's cached SDP record with a HIDP
+    /// virtual-cable unplug, which exists only on Classic (§7).
+    fn allow_fix(self) -> bool {
+        self == Self::Classic
+    }
+}
 
 // --- Pure model ----------------------------------------------------------
 
@@ -81,6 +113,8 @@ struct MenuState {
     main_devs: Vec<Device>,
     other_devs: Vec<Device>,
     selected: usize,
+    /// Whether `[f] Fix connection` is offered at all ([`Kind::allow_fix`]).
+    allow_fix: bool,
 }
 
 impl MenuState {
@@ -99,21 +133,35 @@ impl MenuState {
     }
 }
 
+/// GAP Appearance categories (`appearance >> 6`) that cannot be a HID host: a
+/// HID peripheral like another keyboard or mouse, and LE audio devices.
+const APPEARANCE_HID: u16 = 0x0f;
+const APPEARANCE_AUDIO_SINK: u16 = 0x21;
+const APPEARANCE_AUDIO_SOURCE: u16 = 0x22;
+
 /// True if a device belongs in the "Other devices" submenu rather than the main
 /// host list. Strict rule, applied uniformly (even to paired/connected devices):
-/// a device is "Other" if it has no real name, or its Class of Device marks it
-/// as audio (headset/speaker/etc.). A named device with an unknown class stays
-/// in the main list.
-fn is_other(class: Option<u32>, has_real_name: bool) -> bool {
+/// a device is "Other" if it has no real name, if its Class of Device marks it
+/// as audio (headset/speaker/etc.), or if its GAP Appearance marks it as another
+/// HID peripheral or an audio device. Both property checks are applied whenever
+/// the property is present — LE-only peers have no Class of Device and BR/EDR
+/// peers usually have no Appearance, so each simply falls through for the other.
+/// A named device with neither marker stays in the main list.
+fn is_other(class: Option<u32>, appearance: Option<u16>, has_real_name: bool) -> bool {
     if !has_real_name {
         return true;
     }
-    match class {
-        // Major device class (bits 8-12) == 4 is Audio/Video; the Audio service
-        // class flag is bit 21. Either marks a headset/speaker-type device.
-        Some(c) => ((c >> 8) & 0x1f) == 4 || (c & (1 << 21)) != 0,
-        None => false,
+    // Major device class (bits 8-12) == 4 is Audio/Video; the Audio service
+    // class flag is bit 21. Either marks a headset/speaker-type device.
+    if let Some(c) = class
+        && (((c >> 8) & 0x1f) == 4 || (c & (1 << 21)) != 0)
+    {
+        return true;
     }
+    matches!(
+        appearance.map(|a| a >> 6),
+        Some(APPEARANCE_HID | APPEARANCE_AUDIO_SINK | APPEARANCE_AUDIO_SOURCE)
+    )
 }
 
 /// Map a keypress to an [`Action`], applying cursor/screen changes in place.
@@ -161,10 +209,10 @@ fn on_key(state: &mut MenuState, key: KeyEvent) -> Action {
             }
             Action::None
         }
-        // Only bonded hosts have a cached record to invalidate; on anything else
-        // the key is a no-op.
+        // Only bonded hosts have a cached record to invalidate, and only on
+        // Classic; on anything else the key is a no-op.
         KeyCode::Char('f') | KeyCode::Char('F') => match state.rows().get(state.selected) {
-            Some(r) if r.paired => Action::Fix(state.selected),
+            Some(r) if state.allow_fix && r.paired => Action::Fix(state.selected),
             _ => Action::None,
         },
         KeyCode::Char('r') | KeyCode::Char('R') => Action::Rescan,
@@ -215,7 +263,7 @@ fn render_lines(state: &MenuState) -> Vec<String> {
     // `[f]` applies to bonded hosts only, so it is offered only when the cursor
     // is on one.
     let fix = match rows.get(state.selected) {
-        Some(r) if r.paired => "[f] Fix connection   ",
+        Some(r) if state.allow_fix && r.paired => "[f] Fix connection   ",
         _ => "",
     };
     let footer = match state.screen {
@@ -398,6 +446,7 @@ async fn collect(adapter: &Adapter, stale: &[Address]) -> (Vec<(Row, Device)>, V
             continue;
         };
         let class = dev.class().await.ok().flatten();
+        let appearance = dev.appearance().await.ok().flatten();
         // `alias()` always yields a name (falling back to the MAC string), so the
         // "no real name" test is on `name()`, which is None when unset.
         let has_real_name = dev.name().await.ok().flatten().is_some();
@@ -411,7 +460,7 @@ async fn collect(adapter: &Adapter, stale: &[Address]) -> (Vec<(Row, Device)>, V
             // Only a bond carries a cached record, so only bonded hosts can be stale.
             stale: paired && stale.contains(&addr),
         };
-        if is_other(class, has_real_name) {
+        if is_other(class, appearance, has_real_name) {
             other.push((row, dev));
         } else {
             main.push((row, dev));
@@ -439,9 +488,19 @@ fn sort_entries(v: &mut [(Row, Device)]) {
 /// Returns `None` only if cancelled mid-scan.
 async fn scan(
     adapter: &Adapter,
+    kind: Kind,
     stale: &[Address],
     cancel: &mut oneshot::Receiver<()>,
 ) -> Option<MenuState> {
+    // Restrict the scan to the transport in use. Best-effort: a controller that
+    // rejects the filter still gets the default (interleaved) scan.
+    let filter = DiscoveryFilter {
+        transport: kind.discovery_transport(),
+        ..Default::default()
+    };
+    if let Err(e) = adapter.set_discovery_filter(filter).await {
+        warn!("could not restrict discovery to {kind:?}: {e}");
+    }
     match adapter.discover_devices().await {
         Ok(mut events) => {
             let end = Instant::now() + Duration::from_secs(SCAN_SECS);
@@ -467,6 +526,7 @@ async fn scan(
         main_devs,
         other_devs,
         selected: 0,
+        allow_fix: kind.allow_fix(),
     })
 }
 
@@ -548,6 +608,7 @@ async fn finalize(
 /// by the caller after the terminal is restored), or `None` on skip/cancel.
 async fn menu_loop(
     adapter: &Adapter,
+    kind: Kind,
     stale: &[Address],
     suspend_rx: &mut mpsc::Receiver<SuspendReq>,
     cancel: &mut oneshot::Receiver<()>,
@@ -555,7 +616,7 @@ async fn menu_loop(
     let mut out = io::stdout();
     let mut events = EventStream::new();
     let mut prev = draw_lines(&mut out, &scanning_line(), 0).ok()?;
-    let mut state = scan(adapter, stale, cancel).await?;
+    let mut state = scan(adapter, kind, stale, cancel).await?;
     loop {
         prev = draw_lines(&mut out, &render_lines(&state), prev).ok()?;
         tokio::select! {
@@ -583,7 +644,7 @@ async fn menu_loop(
                         Action::Skip => return None,
                         Action::Rescan => {
                             prev = draw_lines(&mut out, &scanning_line(), prev).ok()?;
-                            state = scan(adapter, stale, cancel).await?;
+                            state = scan(adapter, kind, stale, cancel).await?;
                         }
                         Action::Select(i) => {
                             return state.devs().get(i).cloned().map(|d| (d, false));
@@ -623,10 +684,11 @@ async fn suspend_for_prompt(
     }
 }
 
-/// Entry point: run the menu to a decision. Spawned as a task by the Classic
-/// transport; the returned address (if any) is sent back over its channel.
-pub async fn run(
+/// Entry point: run the menu to a decision. Spawned as a task by [`Session`];
+/// the returned pick (if any) is sent back over its channel.
+async fn run(
     adapter: Adapter,
+    kind: Kind,
     stale: Vec<Address>,
     coord: TermCoord,
     mut cancel: oneshot::Receiver<()>,
@@ -638,7 +700,7 @@ pub async fn run(
     // Raw mode is confined to the navigation loop; the guard drops (restoring the
     // terminal) before any pairing prompt/logs in `finalize`.
     let picked = match TermGuard::enter() {
-        Ok(_guard) => menu_loop(&adapter, &stale, &mut suspend_rx, &mut cancel).await,
+        Ok(_guard) => menu_loop(&adapter, kind, &stale, &mut suspend_rx, &mut cancel).await,
         Err(_) => None,
     };
     coord.deregister();
@@ -653,6 +715,90 @@ pub async fn run(
             .await
             .map(|addr| Pick { addr, fix: false }),
         None => None,
+    }
+}
+
+// --- Transport-facing handle ---------------------------------------------
+
+/// One accept cycle's menu, as the transports drive it (design/CONNECTION.md §6):
+/// spawned at the top of `wait_connected` so it re-opens after a disconnect,
+/// raced against the link coming up, then cancelled and joined on the way out so
+/// the terminal is restored before anything else prints.
+///
+/// Keep this in a *local* of `wait_connected`, not a transport field: its `&mut`
+/// borrow in a `select!` arm would otherwise conflict with the shared `&self`
+/// borrow the concurrent accept/dial futures take.
+pub struct Session {
+    /// `None` once the menu has resolved (picked, skipped, or gone), which makes
+    /// [`Session::recv`] pend forever thereafter.
+    pick_rx: Option<mpsc::Receiver<Pick>>,
+    cancel_tx: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl Session {
+    /// Spawn this cycle's menu. With no adapter or outside interactive mode the
+    /// result is inert: nothing is spawned and [`Session::recv`] never resolves.
+    pub fn spawn(
+        adapter: Option<&Adapter>,
+        interactive: bool,
+        kind: Kind,
+        stale: Vec<Address>,
+        coord: &TermCoord,
+    ) -> Self {
+        let (Some(adapter), true) = (adapter, interactive) else {
+            return Self {
+                pick_rx: None,
+                cancel_tx: None,
+                task: None,
+            };
+        };
+        let (pick_tx, pick_rx) = mpsc::channel::<Pick>(1);
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        let adapter = adapter.clone();
+        let coord = coord.clone();
+        let task = tokio::spawn(async move {
+            if let Some(pick) = run(adapter, kind, stale, coord, cancel_rx).await {
+                let _ = pick_tx.send(pick).await;
+            }
+        });
+        Self {
+            pick_rx: Some(pick_rx),
+            cancel_tx: Some(cancel_tx),
+            task: Some(task),
+        }
+    }
+
+    /// Whether the menu is still up, for the "incoming connection preempts the
+    /// menu" note.
+    pub fn is_open(&self) -> bool {
+        self.pick_rx.is_some()
+    }
+
+    /// Resolve once with the menu's outcome — `Some(pick)`, or `None` if it was
+    /// skipped or its sender was dropped — then pend forever, so this can sit in
+    /// a `select!` loop that keeps running afterwards.
+    pub async fn recv(&mut self) -> Option<Pick> {
+        match &mut self.pick_rx {
+            Some(rx) => {
+                let picked = rx.recv().await;
+                self.pick_rx = None;
+                picked
+            }
+            None => future::pending().await,
+        }
+    }
+
+    /// Preempt the menu and wait for it to restore the terminal. Idempotent, so
+    /// it can be called on every exit path.
+    pub async fn finish(&mut self) {
+        if let Some(tx) = self.cancel_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+        self.pick_rx = None;
     }
 }
 
@@ -676,6 +822,7 @@ mod tests {
         }
     }
 
+    /// A Classic menu state (where `[f]` applies); [`ble_state`] is the LE one.
     fn state(main: Vec<Row>, other: Vec<Row>) -> MenuState {
         MenuState {
             screen: Screen::Main,
@@ -684,6 +831,14 @@ mod tests {
             main_devs: Vec::new(),
             other_devs: Vec::new(),
             selected: 0,
+            allow_fix: Kind::Classic.allow_fix(),
+        }
+    }
+
+    fn ble_state(main: Vec<Row>, other: Vec<Row>) -> MenuState {
+        MenuState {
+            allow_fix: Kind::Ble.allow_fix(),
+            ..state(main, other)
         }
     }
 
@@ -694,26 +849,52 @@ mod tests {
     #[test]
     fn classify_audio_major_class() {
         // Major class 4 (Audio/Video), e.g. a headset.
-        assert!(is_other(Some(0x0024_0404), true));
+        assert!(is_other(Some(0x0024_0404), None, true));
     }
 
     #[test]
     fn classify_audio_service_bit() {
-        assert!(is_other(Some(1 << 21), true));
+        assert!(is_other(Some(1 << 21), None, true));
     }
 
     #[test]
     fn classify_no_name_is_other() {
-        assert!(is_other(Some(0x0000_010c), false));
-        assert!(is_other(None, false));
+        assert!(is_other(Some(0x0000_010c), None, false));
+        assert!(is_other(None, None, false));
     }
 
     #[test]
     fn classify_named_hosts_are_main() {
         // Computer (major 1) and phone (major 2), and an unknown class but named.
-        assert!(!is_other(Some(0x0000_010c), true)); // major 1 computer
-        assert!(!is_other(Some(0x0000_020c), true)); // major 2 phone
-        assert!(!is_other(None, true));
+        assert!(!is_other(Some(0x0000_010c), None, true)); // major 1 computer
+        assert!(!is_other(Some(0x0000_020c), None, true)); // major 2 phone
+        assert!(!is_other(None, None, true));
+    }
+
+    #[test]
+    fn classify_by_appearance_when_le_only() {
+        // LE-only peers carry no Class of Device, so the GAP Appearance decides.
+        // Keyboard (0x03C1) and mouse (0x03C2) are category 0x0F (HID); a
+        // standalone speaker (0x0841) is category 0x21 (Audio Sink).
+        assert!(is_other(None, Some(0x03C1), true));
+        assert!(is_other(None, Some(0x03C2), true));
+        assert!(is_other(None, Some(0x0841), true));
+        // Generic Computer (0x0080) and Generic Phone (0x0040) are hosts, and so
+        // is anything with an unknown/unset appearance.
+        assert!(!is_other(None, Some(0x0080), true));
+        assert!(!is_other(None, Some(0x0040), true));
+        assert!(!is_other(None, Some(0x0000), true));
+    }
+
+    #[test]
+    fn fix_hidden_on_ble() {
+        // Same bonded host as `fix_offered_only_for_bonded_hosts`, but on BLE
+        // there is no cached SDP record to invalidate, so `[f]` is inert and
+        // unadvertised (design/CONNECTION.md §7).
+        let mut s = ble_state(vec![row("Laptop", false, true, None)], vec![]);
+        assert_eq!(on_key(&mut s, key(KeyCode::Char('f'))), Action::None);
+        assert!(!render_lines(&s).last().unwrap().contains("[f]"));
+        assert_eq!(render_lines(&s).last().unwrap(), "[r] Rescan   [q] Skip");
     }
 
     #[test]

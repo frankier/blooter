@@ -1,7 +1,7 @@
 # Architecture: blooter (Bluetooth HID device emulator)
 
 This document describes the observable behaviour and internal architecture of
-`blooter` — a Bluetooth Classic HID *device* emulator that makes a Linux box
+`blooter` — a Bluetooth HID *device* emulator that makes a Linux box
 appear to remote hosts as a Bluetooth keyboard + mouse (and, optionally, one or
 more gamepads). It describes *what* the program does and how the pieces fit
 together; it is a reference for maintenance, not a specification to implement
@@ -24,7 +24,7 @@ configuration-file and adapter-setup support. The source is organized as:
 | `state.rs` | Per-host record of the descriptor each host bonded under (CONNECTION.md §7). |
 | `setup.rs` | Adapter class/name/SSP setup and the interactive host menu (§10). |
 
-The report *bytes* (`report.rs`) and the whole input pipeline are transport-agnostic; only delivery and discovery differ between Classic and LE. The transport is chosen by the `[connection] protocol` config key — `"classic"` (default) or `"ble"` (§4, §10).
+The report *bytes* (`report.rs`) and the whole input pipeline are transport-agnostic; only delivery and discovery differ between Classic and LE. The transport is chosen by the `[connection] protocol` config key — `"ble"` (default) or `"classic"` (§4, §10).
 
 ## 1. Overview
 
@@ -196,9 +196,9 @@ cached copy; see CONNECTION.md §7.
 ## 4. Transports
 
 blooter drives one `Transport` (`transport/` module) chosen at startup by the
-`[connection] protocol` config key (§10): the default **Classic** L2CAP
-transport (§4.1, `"classic"`) or the **LE** HID-over-GATT transport (§4.2,
-`"ble"`). Both share the same accept → session loop in `main.rs`: wait for a host,
+`[connection] protocol` config key (§10): the default **LE** HID-over-GATT
+transport (§4.2, `"ble"`) or the **Classic** L2CAP transport (§4.1,
+`"classic"`). Both share the same accept → session loop in `main.rs`: wait for a host,
 reset per-session state, forward translated reports (§5, §7) until the host
 disconnects or a hotkey/signal fires, then return to accepting. The report bytes
 are identical; only how they are delivered and how the device is discovered
@@ -303,6 +303,10 @@ device, one advertisement set per adapter suffices.
   reports so the host has state; `send_report` no-ops for any report the host has
   not subscribed to. The session ends when the last subscription is dropped
   (unsubscribe or link loss).
+- **Initiating a connection:** when a target is set (host menu or `[connection]
+  reconnect`), `wait_connected` races a backoff-gated `Device.Connect()` against
+  the subscribe. A successful connect is not yet a session — the host still has
+  to subscribe (CONNECTION.md §4, §6).
 - **Out of scope (as for classic, TODO.md):** output reports (keyboard LEDs) and
   boot-protocol mode; more than one bonded host at a time; and advertising
   Classic and LE simultaneously as one logical device (the transport is chosen
@@ -573,14 +577,15 @@ default value commented out.
   (§6.4).
 - **`[gamepad] hotplug`** — `"auto"` (default: on iff `slots` is a fixed count
   > 0), `"on"` (always monitor), or `"off"` (§6.4).
-- **`[connection] protocol`** — `"classic"` (default, BR/EDR HID) or `"ble"`
-  (Bluetooth Low Energy / HOGP). Selects the transport (§4).
+- **`[connection] protocol`** — `"ble"` (default, Bluetooth Low Energy / HOGP)
+  or `"classic"` (BR/EDR HID). Selects the transport (§4).
 - **`[connection] pairing`** — `"auto"` (silent "Just Works") or `"confirm"`
   (prompt on the TTY). Absent → inferred: `confirm` interactively, else `auto`
   (CONNECTION.md §5).
-- **`[connection] reconnect`** — a host address `"AA:BB:CC:DD:EE:FF"` to initiate
-  an outgoing HID connection to (Classic only; CONNECTION.md §3.2, §6). Absent →
-  accept-only unless the host menu supplies a target.
+- **`[connection] reconnect`** — an already-bonded host address
+  `"AA:BB:CC:DD:EE:FF"` to initiate an outgoing connection to (CONNECTION.md
+  §3.2 on Classic, §4 on BLE). Absent → accept-only unless the host menu
+  supplies a target.
 
 Parse errors report the offending line and abort startup (exit 1).
 
@@ -608,9 +613,12 @@ blooter prints that it is now visible, so a host can find and connect to it.
 When stdin is a TTY, an interactive **host menu** runs **concurrently** with the
 accept loop (CONNECTION.md §6): a short (~4 s) discovery pass, then a list of
 known devices (connected first, then paired, then unpaired; each strongest-signal
-first). Selecting one pairs it from here if it is new, then the Classic transport
-initiates the outgoing HID connection to it (CONNECTION.md §3.2). Because the menu
-is concurrent, an **incoming** connection that arrives while it is open is taken
-as the user's choice: blooter uses it and closes the menu with a note. Pressing
-Enter skips, leaving blooter accepting (plus dialing any bonded `[connection]
-reconnect` target).
+first). The scan is filtered to the transport in use — BR/EDR inquiry on Classic,
+LE scan on BLE — so the list only offers devices that can actually be connected
+to. Selecting one pairs it from here if it is new, then the transport initiates
+the outgoing connection to it: the HID L2CAP PSMs on Classic (CONNECTION.md
+§3.2), `Device.Connect()` on BLE (§4). Because the menu is concurrent, an
+**incoming** connection that arrives while it is open is taken as the user's
+choice: blooter uses it and closes the menu with a note. Pressing Enter skips,
+leaving blooter accepting (plus dialing any bonded `[connection] reconnect`
+target). `[f] Fix connection` is offered on Classic only (CONNECTION.md §7).

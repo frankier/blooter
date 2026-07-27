@@ -11,8 +11,8 @@ whole picture; the exit status is non-zero if any suite failed.
 | Suite | What it proves | Stack |
 |---|---|---|
 | `unit` | report encoding, keymap, config, menu rendering | `cargo test` |
-| [`btvirt`](btvirt/) | the real HID link: accept, forward reports, disconnect, unplug | real bluetoothd + emulated controllers, real L2CAP |
-| [`termdbus`](termdbus/) | the interactive menu and the pairing prompt | mocked BlueZ + real PTY |
+| [`btvirt`](btvirt/) | the real HID link on both transports: connect, forward reports, disconnect, unplug | real bluetoothd + emulated controllers, real L2CAP and ATT/GATT |
+| [`termdbus`](termdbus/) | the interactive menu (Classic and BLE) and the pairing prompt | mocked BlueZ + real PTY |
 
 The two integration suites are deliberately complementary. `btvirt` gets a
 genuine L2CAP link but has to run blooter non-interactively; `termdbus` gets
@@ -30,8 +30,9 @@ cargo install termwright
 Only the `dnf` line needs root, and only once:
 
 - `virtme-ng` — runs both integration suites in a VM.
-- `glib2-devel`, `readline-devel` — build `btvirt` (not packaged on Fedora) and
-  `btmgmt` (packaged, but older ones hang when driven non-interactively).
+- `glib2-devel`, `readline-devel` — build `btvirt` (not packaged on Fedora),
+  `btmgmt` (packaged, but older ones hang when driven non-interactively) and
+  `btgatt-client` (the BLE tests' host side).
 - `fontconfig-devel` — builds `termwright` (for a screenshot feature the tests
   do not use).
 

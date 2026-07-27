@@ -12,10 +12,16 @@ pub mod le;
 
 use crate::report::{InputState, Outcome, RawEvent};
 use crate::{Ctx, Signals};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 pub use classic::Classic;
 pub use le::Le;
+
+/// Backoff between failed attempts to initiate a link to a known host — the
+/// Classic HID dial and the LE connect alike (design/CONNECTION.md §3.2, §4).
+const DIAL_BACKOFF_START: Duration = Duration::from_secs(1);
+const DIAL_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// Outcome of the accept phase.
 pub enum Accept {

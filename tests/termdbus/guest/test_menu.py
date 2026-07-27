@@ -9,6 +9,9 @@ they are. See design/CONNECTION.md §5 (pairing) and §6 (menu).
 import sys
 
 from harness import (
+    APPEARANCE_COMPUTER,
+    APPEARANCE_KEYBOARD,
+    APPEARANCE_SPEAKER,
     CLASS_COMPUTER,
     CLASS_HEADSET,
     Registry,
@@ -18,6 +21,7 @@ from harness import (
     assert_screen_lacks,
     menu_rows,
     selected_index,
+    wait_for,
     wait_for_menu,
 )
 
@@ -251,6 +255,87 @@ def test_menu_resumes_after_pairing_prompt(t):
     # ...and still driving keys, which it cannot do without a live EventStream.
     term.press("o")
     wait_for_menu(term, "Other devices:")
+
+
+# --------------------------------------------------------------------------
+# The BLE menu (§4, §6)
+#
+# Same menu, same rendering, driven by the LE transport. The devices here carry
+# no Class of Device -- as an LE-only peer does not -- so the "Other devices"
+# split has to come from GAP Appearance instead.
+# --------------------------------------------------------------------------
+
+@tests.test
+def test_ble_menu_lists_discovered_hosts(t):
+    """The menu opens on BLE too, with the same title, rows and footer."""
+    t.mock.add_device(LAPTOP, "my-laptop", cls=None,
+                      appearance=APPEARANCE_COMPUTER)
+    term = t.menu(protocol="ble")
+
+    assert_screen_contains(term, "Bluetooth hosts:", "menu title")
+    assert_screen_contains(term, LAPTOP, "the device address")
+    assert_screen_contains(term, "my-laptop", "the device alias")
+    assert_screen_contains(term, "[q] Skip", "the footer")
+
+
+@tests.test
+def test_ble_appearance_moves_peripherals_to_other_devices(t):
+    """With no Class of Device to go on, a keyboard (Appearance category 0x0F)
+    and a speaker (0x21) are filed under 'Other devices' by Appearance."""
+    t.mock.add_device(LAPTOP, "my-laptop", cls=None,
+                      appearance=APPEARANCE_COMPUTER)
+    t.mock.add_device(HEADSET, "my-speaker", cls=None,
+                      appearance=APPEARANCE_SPEAKER)
+    t.mock.add_device(DESKTOP, "some-keyboard", cls=None,
+                      appearance=APPEARANCE_KEYBOARD)
+    term = t.menu(protocol="ble")
+
+    assert_screen_contains(term, "my-laptop", "the laptop in the main list")
+    assert_screen_lacks(term, "my-speaker", "the speaker in the main list")
+    assert_screen_lacks(term, "some-keyboard", "the keyboard in the main list")
+    assert_menu_contains(term, "[o] Other devices (2)", "the submenu offer")
+
+
+@tests.test
+def test_ble_offers_no_fix_for_a_bonded_host(t):
+    """`[f] Fix connection` unplugs a cached SDP record, which BLE has none of,
+    so it must not be offered even on a bonded host (design/CONNECTION.md §7)."""
+    t.mock.add_device(LAPTOP, "my-laptop", cls=None, paired=True,
+                      appearance=APPEARANCE_COMPUTER)
+    term = t.menu(protocol="ble")
+
+    assert_screen_contains(term, "[paired", "the paired status marker")
+    assert_menu_lacks(term, "[f] Fix connection", "fix offered on BLE")
+
+
+@tests.test
+def test_ble_pick_pairs_then_connects(t):
+    """Selecting an unbonded host bonds it from here and then initiates the
+    outgoing LE connection (design/CONNECTION.md §4, §6)."""
+    path = t.mock.add_device(LAPTOP, "my-laptop", cls=None, paired=False,
+                             appearance=APPEARANCE_COMPUTER)
+    term = t.menu(protocol="ble")
+
+    term.press("Enter")
+    term.wait_for_text("Pairing with my-laptop")
+    wait_for(lambda: "Connect" in t.mock.calls(path), 15.0,
+             "blooter to pair and then connect to the picked host")
+
+    calls = t.mock.calls(path)
+    assert calls.index("Pair") < calls.index("Connect"), \
+        f"expected Pair before Connect, got {calls}"
+
+
+@tests.test
+def test_ble_skip_closes_the_menu(t):
+    """`[q]` skips, leaving blooter advertising and waiting to be subscribed."""
+    t.mock.add_device(LAPTOP, "my-laptop", cls=None,
+                      appearance=APPEARANCE_COMPUTER)
+    term = t.menu(protocol="ble")
+
+    term.press("q")
+    term.wait_for_text("ready to accept connections")
+    assert term.running(), "blooter exited when the BLE menu was skipped"
 
 
 def main():

@@ -81,8 +81,9 @@ jobs:
           vng -r "$VNG_KERNEL" --user root -e "$RUNNER_TEMP/probe.sh"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # build-btvirt.sh short-circuits once emulator/btvirt exists, so a hit
-      # makes its whole fetch+configure+make step a no-op.
+      # build-btvirt.sh short-circuits once all three binaries exist, so a hit
+      # makes its whole fetch+configure+make step a no-op. The key hashes the
+      # script, so adding a build target invalidates it.
       - name: Cache btvirt build
         uses: actions/cache@v4
         with:

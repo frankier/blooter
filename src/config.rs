@@ -65,14 +65,14 @@ impl Hotplug {
     }
 }
 
-/// Which Bluetooth transport blooter presents itself over. Classic (BR/EDR HID)
-/// is the default; BLE uses HID-over-GATT (HOGP). See design/ARCH.md §4.2.
+/// Which Bluetooth transport blooter presents itself over. BLE (HID-over-GATT,
+/// HOGP) is the default; Classic is BR/EDR HID. See design/ARCH.md §4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Protocol {
-    /// Bluetooth Classic (BR/EDR) HID (the default).
-    #[default]
+    /// Bluetooth Classic (BR/EDR) HID.
     Classic,
-    /// Bluetooth Low Energy (HID-over-GATT / HOGP).
+    /// Bluetooth Low Energy (HID-over-GATT / HOGP) — the default.
+    #[default]
     Ble,
 }
 
@@ -446,7 +446,7 @@ mod tests {
         assert_eq!(cfg.hotkeys.chords.len(), def.chords.len());
         assert_eq!(cfg.gamepad_slots, GamepadSlots::Initial);
         assert_eq!(cfg.hotplug, Hotplug::Auto);
-        assert_eq!(cfg.protocol, Protocol::Classic);
+        assert_eq!(cfg.protocol, Protocol::Ble);
         assert_eq!(cfg.pairing, None);
         assert_eq!(cfg.reconnect, None);
     }
@@ -484,9 +484,9 @@ mod tests {
 
     #[test]
     fn protocol_parse() {
-        // Absent → default (Classic).
-        assert_eq!(parse("").unwrap().protocol, Protocol::Classic);
-        assert_eq!(parse("[connection]\n").unwrap().protocol, Protocol::Classic);
+        // Absent → default (BLE).
+        assert_eq!(parse("").unwrap().protocol, Protocol::Ble);
+        assert_eq!(parse("[connection]\n").unwrap().protocol, Protocol::Ble);
         // Explicit values.
         assert_eq!(
             parse("[connection]\nprotocol = \"classic\"\n")

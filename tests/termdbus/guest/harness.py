@@ -43,6 +43,12 @@ AGENT_MANAGER_PATH = "/org/bluez"
 CLASS_COMPUTER = 0x00010C  # major class 1 (computer) -- stays in the main list
 CLASS_HEADSET = 0x240404  # major class 4 (audio/video) -- goes to "Other devices"
 
+# GAP Appearance values, the LE counterpart of the classes above: LE-only peers
+# carry no Class of Device, so menu.rs::is_other falls through to these.
+APPEARANCE_COMPUTER = 0x0080  # category 0x02 -- stays in the main list
+APPEARANCE_KEYBOARD = 0x03C1  # category 0x0F (HID) -- goes to "Other devices"
+APPEARANCE_SPEAKER = 0x0841  # category 0x21 (audio sink) -- goes to "Other devices"
+
 
 class HarnessError(Exception):
     """Setup failed -- distinct from a test assertion failing."""
@@ -191,16 +197,26 @@ class MockBluez:
 
     def add_adapter(self):
         self._mock.AddAdapter(ADAPTER, "blooter-test")
+        # The bluez5 template serves LEAdvertisingManager1 but no GattManager1,
+        # which blooter's LE transport needs to register its HOGP tree. Stub it:
+        # accepting the registration is all the menu tests need.
+        self.mock_iface(ADAPTER_PATH).AddMethods("org.bluez.GattManager1", [
+            ("RegisterApplication", "oa{sv}", "", ""),
+            ("UnregisterApplication", "o", "", ""),
+        ])
         log(f"added adapter {ADAPTER}")
 
     def add_device(self, address, alias, cls=CLASS_COMPUTER, paired=False,
-                   named=True, rssi=-60):
+                   named=True, rssi=-60, appearance=None):
         """Add a discoverable device.
 
         `named=False` *removes* the Name property rather than blanking it:
         blooter's split keys off the property being absent
         (`dev.name().ok().flatten().is_some()`), and an empty string would still
         count as a real name.
+
+        `cls=None` likewise removes Class, which is what an LE-only peer looks
+        like; pass `appearance=` to drive the split from GAP Appearance instead.
         """
         import dbus
 
@@ -209,16 +225,31 @@ class MockBluez:
         props = self.mock_iface(path, "org.freedesktop.DBus.Properties")
         dev = self.mock_iface(path)
 
-        dev.UpdateProperties("org.bluez.Device1", {
-            "Class": dbus.UInt32(cls),
+        updates = {
             "RSSI": dbus.Int16(rssi),
             "Alias": dbus.String(alias),
-        })
+        }
+        if cls is not None:
+            updates["Class"] = dbus.UInt32(cls)
+        if appearance is not None:
+            updates["Appearance"] = dbus.UInt16(appearance)
+        dev.UpdateProperties("org.bluez.Device1", updates)
+        # The template gives every device a phone Class; an LE-only peer has
+        # none, so `cls=None` deletes it the same way `named=False` deletes Name.
+        if cls is None:
+            self.drop_property(path, "org.bluez.Device1", "Class")
         if paired:
             self._mock.PairDevice(ADAPTER, address)
         if not named:
             self.drop_property(path, "org.bluez.Device1", "Name")
         return path
+
+    def calls(self, path):
+        """The mock's recorded method calls on `path`, as a list of names.
+
+        Used to assert that a menu pick actually reached BlueZ (Pair, Connect).
+        """
+        return [str(name) for _ts, name, _args in self.mock_iface(path).GetCalls()]
 
     def drop_property(self, path, interface, name):
         """Delete a property outright.
@@ -480,20 +511,28 @@ class Blooter:
     """blooter running under a PTY, in FIFO input mode.
 
     FIFO mode keeps evdev and udev out of it; the menu, not input, is what these
-    tests are about. SDP registration is left on -- the mock serves
-    ProfileManager1 -- so blooter's startup path runs in full.
+    tests are about. Bluetooth registration is left on -- the mock serves
+    ProfileManager1 for Classic and GattManager1/LEAdvertisingManager1 for BLE --
+    so blooter's startup path runs in full either way.
+
+    The transport is always pinned with a written config file rather than left
+    to the default, so a change of default cannot silently move a test from one
+    transport to the other.
     """
 
-    def __init__(self, extra_args=()):
+    def __init__(self, extra_args=(), protocol="classic"):
         self.fifo_path = os.path.join(RUNDIR, "blooter.fifo")
         if os.path.exists(self.fifo_path):
             os.unlink(self.fifo_path)
         os.mkfifo(self.fifo_path, 0o600)
+        self.config_path = os.path.join(RUNDIR, "blooter.toml")
+        with open(self.config_path, "w") as fh:
+            fh.write(f'[connection]\nprotocol = "{protocol}"\n')
         env = dict(os.environ,
                    DBUS_SYSTEM_BUS_ADDRESS=BUS_ADDRESS,
                    RUST_BACKTRACE="1")
-        argv = [os.environ["BLOOTER"], "-f", self.fifo_path, "-d"] \
-            + list(extra_args)
+        argv = [os.environ["BLOOTER"], "-f", self.fifo_path,
+                "-c", self.config_path, "-d"] + list(extra_args)
         self.term = Term("blooter", argv, env=env)
         self._fifo_fd = None
 
@@ -685,13 +724,13 @@ class TestContext:
         self.mock = mock
         self.blooter = None
 
-    def start_blooter(self, extra_args=()):
-        self.blooter = Blooter(extra_args=extra_args)
+    def start_blooter(self, extra_args=(), protocol="classic"):
+        self.blooter = Blooter(extra_args=extra_args, protocol=protocol)
         return self.blooter
 
-    def menu(self, extra_args=()):
+    def menu(self, extra_args=(), protocol="classic"):
         """Start blooter and wait for the host menu to be on screen."""
-        blooter = self.start_blooter(extra_args)
+        blooter = self.start_blooter(extra_args, protocol=protocol)
         blooter.term.wait_for_text("Bluetooth hosts:")
         blooter.term.wait_for_idle()
         return blooter.term

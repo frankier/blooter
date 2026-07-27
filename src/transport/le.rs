@@ -2,8 +2,13 @@
 //! server (HID + Device Information + Battery services) and an LE advertisement,
 //! and pushes input reports as GATT notifications on per-report characteristics.
 //! See design/ARCH.md §4.2, §7.
+//!
+//! A host is "connected" once it subscribes to a Report characteristic's CCCD.
+//! While waiting for that, the interactive menu is up and can pick a host to
+//! bond with and connect out to, exactly as on Classic (design/CONNECTION.md §4, §6).
 
 use std::collections::HashMap;
+use std::future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -13,17 +18,18 @@ use bluer::gatt::local::{
     CharacteristicNotifyMethod, CharacteristicRead, CharacteristicWrite, CharacteristicWriteMethod,
     Descriptor, DescriptorRead, Service,
 };
-use bluer::{Adapter, Uuid, UuidExt};
+use bluer::{Adapter, Address, Uuid, UuidExt};
 use futures::FutureExt;
-use log::info;
+use log::{info, warn};
 use tokio::sync::{Mutex, mpsc, watch};
+use tokio::time::{Instant, sleep_until};
 
 /// Build a Bluetooth SIG 16-bit UUID as a full 128-bit [`Uuid`].
 fn uuid16(v: u16) -> Uuid {
     <Uuid as UuidExt>::from_u16(v)
 }
 
-use super::{Accept, Flow, Step, Transport, dispatch};
+use super::{Accept, DIAL_BACKOFF_MAX, DIAL_BACKOFF_START, Flow, Step, Transport, dispatch};
 use crate::report::{InputState, Outcome, RawEvent};
 use crate::sdp::{self, GAMEPAD_REPORT_ID_BASE};
 use crate::{AppError, Ctx, Signals};
@@ -98,10 +104,20 @@ impl Shared {
 
 /// The LE transport. Holds the registered GATT application and advertisement
 /// (dropping the handles unregisters them) plus the shared notification state.
+/// Optionally holds a host to connect out to (design/CONNECTION.md §4), which
+/// the interactive menu can also supply at runtime (§6).
 pub struct Le {
     adapter: Adapter,
     shared: Arc<Shared>,
     connected_rx: watch::Receiver<bool>,
+    /// A bonded host to initiate an outgoing LE connection to; cleared once a
+    /// host subscribes, so a later disconnect does not immediately reconnect.
+    target: Option<Address>,
+    /// Whether to run the interactive menu, (re)spawned each `wait_connected`
+    /// cycle so it re-opens after a disconnect (§6).
+    interactive: bool,
+    /// Terminal-ownership coordinator shared with the pairing agent (§5/§6).
+    term_coord: crate::menu::TermCoord,
     _app: ApplicationHandle,
     _adv: AdvertisementHandle,
 }
@@ -110,8 +126,15 @@ impl Le {
     /// Power the adapter, register the HOGP GATT tree and an LE advertisement of
     /// the HID service. The pairing agent (needed for the bonded link HOGP
     /// requires) is the shared one registered by `main::run` (design/CONNECTION.md
-    /// §5).
-    pub async fn new(adapter: Adapter, n_gamepads: usize) -> Result<Self, AppError> {
+    /// §5). `target` seeds the outgoing-connect path (§4); `interactive` enables
+    /// the menu, respawned each accept cycle (§6).
+    pub async fn new(
+        adapter: Adapter,
+        n_gamepads: usize,
+        target: Option<Address>,
+        interactive: bool,
+        term_coord: crate::menu::TermCoord,
+    ) -> Result<Self, AppError> {
         adapter
             .set_powered(true)
             .await
@@ -155,9 +178,20 @@ impl Le {
             adapter,
             shared,
             connected_rx,
+            target,
+            interactive,
+            term_coord,
             _app,
             _adv,
         })
+    }
+
+    /// Initiate an outgoing LE connection to a host picked from the menu (or
+    /// configured). GATT server/client roles are independent of the link role,
+    /// so blooter still serves its HOGP tree to a host it dialled itself; the
+    /// session only starts once that host subscribes (design/CONNECTION.md §4).
+    async fn connect(&self, target: Address) -> bluer::Result<()> {
+        self.adapter.device(target)?.connect().await
     }
 
     /// Best-effort address of a connected host, for logging.
@@ -196,6 +230,10 @@ impl Transport for Le {
         }
     }
 
+    /// Wait for a host to subscribe to a Report characteristic's CCCD. While
+    /// waiting, run the interactive menu and — if it (or the config) supplies a
+    /// target — race a backoff-gated outgoing connect against that subscribe
+    /// (design/CONNECTION.md §4, §6).
     async fn wait_connected(
         &mut self,
         rx: &mut mpsc::Receiver<RawEvent>,
@@ -206,26 +244,93 @@ impl Transport for Le {
         if *self.connected_rx.borrow_and_update() {
             return Accept::Connected(self.peer().await);
         }
-        loop {
-            tokio::select! {
-                r = self.connected_rx.changed() => {
-                    if r.is_err() {
-                        return Accept::Shutdown; // sender gone (shutting down)
+
+        // Connect and menu state live in locals so the select arm bodies can
+        // mutate them without conflicting with the shared `this` borrow the
+        // concurrent connect future takes — including the watch receiver, which
+        // is cloned rather than borrowed from `self` for the same reason.
+        let mut connected = self.connected_rx.clone();
+        let mut target = self.target;
+        let mut next_connect = target.map(|_| Instant::now());
+        let mut backoff = DIAL_BACKOFF_START;
+        // `[f] Fix connection` is Classic-only, so there is no stale list here.
+        let mut menu = crate::menu::Session::spawn(
+            Some(&self.adapter),
+            self.interactive,
+            crate::menu::Kind::Ble,
+            Vec::new(),
+            &self.term_coord,
+        );
+
+        let accept = loop {
+            let this: &Le = self;
+            let due = next_connect;
+            let connect_target = target;
+            let connect = async {
+                match (due, connect_target) {
+                    (Some(at), Some(t)) => {
+                        sleep_until(at).await;
+                        Some(this.connect(t).await)
                     }
-                    if *self.connected_rx.borrow_and_update() {
-                        return Accept::Connected(self.peer().await);
+                    _ => future::pending().await,
+                }
+            };
+
+            tokio::select! {
+                r = connected.changed() => {
+                    if r.is_err() {
+                        break Accept::Shutdown; // sender gone (shutting down)
+                    }
+                    if *connected.borrow_and_update() {
+                        if menu.is_open() {
+                            info!("a host subscribed; using it and closing the menu");
+                        }
+                        break Accept::Connected(self.peer().await);
+                    }
+                }
+                // Outgoing connect. Success is not a session: the host still has
+                // to subscribe, so stop connecting and keep waiting above.
+                Some(outcome) = connect => match outcome {
+                    Ok(()) => {
+                        info!("connected out to {}; waiting for it to subscribe",
+                              target.expect("connected with a target"));
+                        next_connect = None;
+                    }
+                    Err(e) => {
+                        warn!("connect to host failed: {e}");
+                        next_connect = Some(Instant::now() + backoff);
+                        backoff = (backoff * 2).min(DIAL_BACKOFF_MAX);
+                    }
+                },
+                // Menu pick: start connecting to the chosen host.
+                picked = menu.recv() => {
+                    if let Some(p) = picked {
+                        info!("menu selected {}; connecting to it", p.addr);
+                        target = Some(p.addr);
+                        next_connect = Some(Instant::now());
+                        backoff = DIAL_BACKOFF_START;
                     }
                 }
                 Some(ev) = rx.recv() => {
                     if matches!(ctx.translate(state, ev), Outcome::Exit) {
-                        return Accept::Shutdown;
+                        break Accept::Shutdown;
                     }
                 }
-                _ = signals.term.recv() => return Accept::Shutdown,
-                _ = signals.hup.recv() => return Accept::Shutdown,
-                _ = signals.int.recv() => return Accept::Shutdown, // no session active
+                _ = signals.term.recv() => break Accept::Shutdown,
+                _ = signals.hup.recv() => break Accept::Shutdown,
+                _ = signals.int.recv() => break Accept::Shutdown, // no session active
             }
+        };
+
+        // Preempt the menu and wait for it to restore the terminal before
+        // returning — ordered ahead of any further output (§6).
+        menu.finish().await;
+        // A link is up: stop initiating so a later drop does not immediately
+        // reconnect (§4), matching the Classic one-shot target.
+        if matches!(accept, Accept::Connected(_)) {
+            self.target = None;
         }
+        accept
     }
 
     async fn run_session(

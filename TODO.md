@@ -18,15 +18,16 @@ have since been done and are noted as such.
 The two integration suites (tests/README.md) leave these paths unexercised.
 Roughly in order of how much risk they carry.
 
-- **Reconnect-initiate / the outgoing dial** (design/CONNECTION.md §3.2). Neither
-  suite covers it: it needs blooter to dial an already-bonded target, which means
-  driving a pairing first. Arguably the largest untested block of connection
-  logic — the race, the exponential backoff, and the one-shot target clearing are
-  all only covered by reading.
+- **Reconnect-initiate / the outgoing dial** (design/CONNECTION.md §3.2, and its
+  BLE counterpart in §4). No suite covers it over a real link: that needs blooter
+  to initiate to an already-bonded target, which means driving a pairing first.
+  The race, the exponential backoff and the one-shot target clearing are still
+  only covered by reading.
 - **Menu-driven pairing** (`finalize` in `menu.rs`). Picking an unbonded host from
-  the menu drops raw mode, pairs from here, then dials. `tests/termdbus` asserts
-  the pick UI but stops before the pair; the mock accepts `Pair` without driving
-  the resulting agent exchange.
+  the menu drops raw mode, pairs from here, then initiates. `tests/termdbus`
+  asserts that a BLE pick calls `Pair` then `Connect`, but the mock accepts
+  `Pair` without driving the resulting agent exchange, and the Classic pick stops
+  at the UI.
 - **`[f] Fix connection`** (§7). Only its presence in the footer is asserted. The
   unplug + unbond it performs needs a real link, so it belongs in
   `tests/btvirt` — but it also needs a bonded peer that can be re-paired
@@ -37,8 +38,13 @@ Roughly in order of how much risk they carry.
   genuinely new host is untested at the link level.
 - **Reconnecting after a virtual-cable unplug.** blooter correctly drops its bond
   on unplug, so reconnecting needs a fresh pairing — same blocker.
-- **BLE / HOGP** (§4). Entirely untested: no suite touches the LE transport,
-  advertising, or the CCCD-subscribe connect/disconnect semantics.
+- **Bonded / encrypted BLE.** `tests/btvirt` covers the LE transport over a real
+  link — advertising, the GATT tree, the CCCD-subscribe connect/disconnect
+  semantics and report notifications — but subscribes on an *unencrypted* link,
+  which blooter permits (only the Report reads and the Report Map are
+  encryption-gated). A real HOGP host bonds first; those read paths are untested,
+  blocked by the same shared-agent artifact as everything else that needs a
+  pairing.
 - **Output-report and control-channel handling.** Only the
   `ERR_UNSUPPORTED_REQUEST` reply is asserted; if the features above are ever
   implemented they arrive with no test scaffolding.
@@ -87,7 +93,12 @@ Roughly in order of how much risk they carry.
 - **Outgoing HID (reconnect-initiate) connections** — implemented: when a
   reconnect target is set (the host menu, or `[connection] reconnect`), the
   Classic transport dials the host's HID L2CAP PSMs, raced against the inbound
-  accept (design/CONNECTION.md §3.2, §6).
+  accept (design/CONNECTION.md §3.2, §6). BLE does the same with
+  `Device::connect()`, raced against the CCCD subscribe (§4).
+- **BLE as the default transport, with its own connection menu** — implemented:
+  `[connection] protocol` defaults to `"ble"`, and both transports run the same
+  `menu.rs` (differing only in the discovery filter and whether `[f]` applies).
+  Covered by `tests/termdbus` (the menu) and `tests/btvirt` (the link).
 - **Absolute-pointer / touchpad support** — implemented: touchpad `EV_ABS`
   positions are converted to relative mouse motion (design/ARCH.md §7.2b).
 - **Gamepads** — implemented: one or more USB gamepads are forwarded as HID game

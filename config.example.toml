@@ -72,11 +72,13 @@
 # identical either way; only how reports are delivered and how the device is
 # discovered differ (see design/ARCH.md §4).
 #
-#   "classic"  Bluetooth Classic (BR/EDR) HID (the default). Needs
-#              `bluetoothd -P input` and privilege to bind the HID L2CAP PSMs.
-#   "ble"      Bluetooth Low Energy (HID-over-GATT / HOGP). Registers a GATT
-#              server and LE advertisement instead; no `-P input` required.
-#protocol = "classic"
+#   "ble"      Bluetooth Low Energy (HID-over-GATT / HOGP), the default.
+#              Registers a GATT server and an LE advertisement; no
+#              `bluetoothd -P input` and no privileged port bind required.
+#   "classic"  Bluetooth Classic (BR/EDR) HID. Needs `bluetoothd -P input` and
+#              privilege to bind the HID L2CAP PSMs, and is the only transport
+#              with `[f] Fix connection` (design/CONNECTION.md §7).
+#protocol = "ble"
 
 # How the pairing agent answers bonding requests (see design/CONNECTION.md §5).
 # When unset it is inferred: "confirm" if stdin is a TTY, else "auto".
@@ -85,9 +87,10 @@
 #   "confirm"  prompt on the terminal before bonding
 #pairing = "auto"
 
-# Address of a host to initiate an outgoing HID connection to on startup
-# (reconnect-initiate, Classic only; see design/CONNECTION.md §3.2). When unset,
-# blooter only accepts incoming connections (in interactive mode the host menu
-# can pick a target at runtime instead). Once any link is up the target is
-# cleared, so blooter does not fight an intentional disconnect.
+# Address of a host to initiate an outgoing connection to on startup
+# (reconnect-initiate; see design/CONNECTION.md §3.2 for Classic, §4 for BLE).
+# Only used if that host is already bonded. When unset, blooter waits for the
+# host to connect (in interactive mode the host menu can pick a target at
+# runtime instead). Once any link is up the target is cleared, so blooter does
+# not fight an intentional disconnect.
 #reconnect = "AA:BB:CC:DD:EE:FF"

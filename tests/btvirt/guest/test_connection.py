@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """End-to-end tests for blooter's connection logic.
 
-Every test drives the real binary over real L2CAP from a second emulated
-controller. See harness.py for the stack and design/CONNECTION.md for the
-behaviour being pinned down.
+Every test drives the real binary over a real link from a second emulated
+controller — L2CAP on Classic, ATT/GATT on BLE. See harness.py for the stack
+and design/CONNECTION.md for the behaviour being pinned down.
+
+Both transports live here rather than in separate files because the stack
+(btvirt + bluetoothd) is started once and shared by the whole run.
 """
 
 import sys
@@ -17,6 +20,7 @@ from harness import (
     Registry,
     assert_report,
     keyboard_report,
+    le_payload,
     mouse_report,
 )
 
@@ -189,6 +193,80 @@ def test_virtual_cable_unplug_ends_session(t):
     # Reconnecting *after* an unplug is not asserted here: it needs a fresh
     # pairing, which this stack cannot drive while blooter's agent is
     # registered (see README.md, "What this suite does not cover").
+
+
+# --------------------------------------------------------------------------
+# BLE / HOGP (design/CONNECTION.md §4, design/ARCH.md §4.2)
+#
+# The same input pipeline over the LE transport: blooter advertises its HOGP
+# GATT tree, the host subscribes to the Report CCCDs -- which is what counts as
+# connected -- and reports arrive as notifications instead of interrupt-channel
+# writes.
+# --------------------------------------------------------------------------
+
+@tests.test
+def test_ble_advertises_hogp_gatt_tree(t):
+    """blooter's HID service is discoverable over LE, with one Report
+    characteristic per report id (mouse and keyboard here)."""
+    t.start_blooter(protocol="ble")
+    host = t.le_host().connect()
+
+    handles = host.report_handles()
+    assert len(handles) == 2, \
+        f"expected mouse + keyboard Report characteristics, got {handles}"
+
+
+@tests.test
+def test_ble_subscribe_connects(t):
+    """A CCCD subscribe is the LE 'connect': blooter reports the host connected
+    once the first Report characteristic is subscribed to."""
+    t.start_blooter(protocol="ble")
+    t.connected_le_host()
+
+
+@tests.test
+def test_ble_keyboard_press_and_release(t):
+    """Key events reach the host as notifications, with the HIDP header and
+    report id stripped."""
+    t.start_blooter(protocol="ble")
+    host = t.connected_le_host()
+
+    t.blooter.key(KEY_A, True)
+    host.wait_for_notification(le_payload(keyboard_report(keys=[0x04])))
+
+    t.blooter.key(KEY_A, False)
+    host.wait_for_notification(le_payload(keyboard_report()))
+
+
+@tests.test
+def test_ble_mouse_movement_and_buttons(t):
+    """Relative motion and a button press notify on the mouse Report
+    characteristic."""
+    t.start_blooter(protocol="ble")
+    host = t.connected_le_host()
+
+    t.blooter.rel(REL_X, 5)
+    host.wait_for_notification(le_payload(mouse_report(x=5)))
+
+    t.blooter.rel(REL_Y, -3)
+    host.wait_for_notification(le_payload(mouse_report(y=-3)))
+
+    t.blooter.key(BTN_LEFT, True)
+    host.wait_for_notification(le_payload(mouse_report(buttons=0x01)))
+
+
+@tests.test
+def test_ble_unsubscribe_ends_session(t):
+    """Dropping the last subscription ends the session and returns blooter to
+    advertising, ready for the next host (§4)."""
+    t.start_blooter(protocol="ble")
+    host = t.connected_le_host()
+
+    host.close()
+    t.blooter.wait_for_output(
+        r"host disconnected", 10.0,
+        "blooter to end the session after the host left")
+    assert t.blooter.proc.alive(), "blooter exited when the LE host left"
 
 
 def main():

@@ -1,16 +1,27 @@
 # End-to-end connection tests
 
-Drives the real `blooter` binary over real L2CAP and asserts on the HID reports
-that actually cross the interrupt channel. Nothing is mocked: blooter talks to a
-real `bluetoothd` over a real system bus, on emulated controllers.
+Drives the real `blooter` binary over a real link and asserts on the HID reports
+that actually cross it. Nothing is mocked: blooter talks to a real `bluetoothd`
+over a real system bus, on emulated controllers. Both transports are covered —
+Classic over L2CAP, BLE over ATT/GATT — and each test pins its transport with a
+written config file rather than relying on the default.
 
 ```
   btvirt hci0 <--- real L2CAP (PSM 0x11 / 0x13) ---> btvirt hci1
-     |                                                  |
-  bluetoothd                                        FakeHost
+     |         <--- real ATT/GATT (BLE)          ->     |
+  bluetoothd                                   FakeHost / LeHost
      |                                            (test process)
   blooter  <--- struct input_event via FIFO --- the test
 ```
+
+`FakeHost` dials the two HID PSMs from raw `AF_BLUETOOTH` sockets. `LeHost` is
+its BLE counterpart: Python's socket module cannot express an ATT connection (no
+CID or address type in its L2CAP sockaddr), so it drives bluez's own
+`btgatt-client`, which opens its own ATT socket on hci1 — same idea, same reason
+to avoid a second `bluetoothd`. It parses the discovered GATT tree for the HID
+service's Report characteristics (handles are assigned at registration time and
+are not stable between runs), subscribes to their CCCDs — which is what blooter
+counts as "connected" — and matches the notifications that follow.
 
 ## Running
 
@@ -25,8 +36,9 @@ Prerequisites (one command, the only step needing root):
 sudo dnf install glib2-devel readline-devel virtme-ng
 ```
 
-`glib2-devel` and `readline-devel` are needed to build `btvirt` and `btmgmt`
-from bluez source (`build-btvirt.sh`), `virtme-ng` to run the VM. `btvirt` is
+`glib2-devel` and `readline-devel` are needed to build `btvirt`, `btmgmt` and
+`btgatt-client` from bluez source (`build-btvirt.sh`), `virtme-ng` to run the
+VM. `btvirt` is
 not packaged on Fedora at all (Debian has it in `bluez-test-tools`); `btmgmt` is
 packaged everywhere but the harness drives it non-interactively, and versions
 before ~5.8 never exit when driven that way — so both come from one pinned
@@ -108,11 +120,16 @@ Two btvirt quirks also apply:
 - **The interactive menu** (§6) — same reason: it needs a PTY. Tests here run
   blooter with stdin on `/dev/null`, so it infers non-interactive and the menu
   stays out of the way.
-- **Reconnect-initiate / the outgoing dial** (§3.2) — needs blooter to dial a
-  bonded target, which means driving pairing first.
+- **Reconnect-initiate / the outgoing dial** (§3.2, and its BLE counterpart in
+  §4) — needs blooter to initiate to a bonded target, which means driving
+  pairing first. The BLE menu pick's `Pair`-then-`Connect` sequence *is* covered,
+  but against mocked BlueZ in `tests/termdbus`, not over a real link.
 - **Reconnecting after a virtual-cable unplug** — blooter correctly drops its
   bond on unplug, and re-pairing hits the shared-agent artifact.
-- **BLE / HOGP** (§4) — a separate transport; nothing here touches it.
+- **Bonded / encrypted BLE.** The LE tests subscribe on an unencrypted link,
+  which blooter permits (only the Report *reads* and the Report Map are
+  encryption-gated). A real HOGP host bonds first, and the read paths that
+  requires are untested — the same shared-agent artifact blocks it.
 
 ## Adding a test
 

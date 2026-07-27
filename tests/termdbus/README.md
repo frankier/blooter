@@ -57,6 +57,11 @@ harness starts **no btvirt and no bluetoothd** — the mock is the whole stack.
   stdin. If the menu's `EventStream` swallowed the keystroke instead, pairing
   would stall forever. Also covers rejecting with `n`, and that the menu resumes
   and still responds to keys afterwards.
+- **The BLE menu** (§4, §6) — the same menu under `protocol = "ble"`: that it
+  renders at all, that the "Other devices" split falls back to GAP Appearance
+  when a device has no Class of Device (as an LE-only peer does not), that `[f]`
+  is *not* offered on BLE, and that picking an unbonded host calls `Pair` and
+  then `Connect`.
 
 ## Things worth knowing before editing
 
@@ -80,15 +85,26 @@ harness starts **no btvirt and no bluetoothd** — the mock is the whole stack.
 - **`named=False` deletes the `Name` property** rather than blanking it, because
   blooter keys off the property being absent — an empty string still counts as a
   real name. dbusmock has no D-Bus call for deleting a property, so the harness
-  uses `AddMethod` to run the deletion inside the mock process.
+  uses `AddMethod` to run the deletion inside the mock process. `cls=None` does
+  the same to `Class`, which is how an LE-only peer looks.
+- **The transport is always pinned** with a written config file passed as `-c`,
+  never left to blooter's default. A change of default must not silently move a
+  test from one transport to the other.
+- **dbusmock's bluez5 template has no `GattManager1`**, which the LE transport
+  needs to register its HOGP tree. `add_adapter` stubs it; the BLE link itself is
+  `tests/btvirt`, so accepting the registration is all that is needed here.
 
 ## What this suite does not cover
 
 - **The actual link** — connecting, report forwarding, disconnect/reconnect.
   That is `tests/btvirt`.
-- **Selecting a host and pairing from the menu** (`finalize` in `menu.rs`) — the
-  mock accepts `Pair` but does not drive the resulting agent exchange, so the
-  outgoing-pair path is not exercised end to end.
-- **`[f] Fix connection`** — its presence in the footer is asserted, but not the
-  unplug-and-unbond it performs, which needs a real link.
-- **BLE / HOGP** — a separate transport with no menu.
+- **Pairing from the menu over a real link** — the BLE tests assert that a pick
+  calls `Pair` and then `Connect`, but the mock does not drive the resulting
+  agent exchange, so the outgoing-pair path is not exercised end to end. The
+  Classic pick is not covered at all.
+- **`[f] Fix connection`** — its presence in the footer is asserted (and its
+  absence on BLE), but not the unplug-and-unbond it performs, which needs a real
+  link.
+- **The BLE link itself** — advertising, the CCCD subscribe and report
+  notifications are `tests/btvirt`; here the LE transport's GATT registration is
+  a mock stub.

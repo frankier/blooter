@@ -17,8 +17,9 @@ SRC="$BUILD/bluez-$VERSION"
 TARBALL="bluez-$VERSION.tar.xz"
 URL="https://mirrors.edge.kernel.org/pub/linux/bluetooth/$TARBALL"
 
-if [[ -x "$SRC/emulator/btvirt" && -x "$SRC/tools/btmgmt" ]]; then
-    echo "btvirt and btmgmt already built in: $SRC"
+if [[ -x "$SRC/emulator/btvirt" && -x "$SRC/tools/btmgmt" \
+      && -x "$SRC/tools/btgatt-client" ]]; then
+    echo "btvirt, btmgmt and btgatt-client already built in: $SRC"
     exit 0
 fi
 
@@ -67,10 +68,14 @@ echo "==> configuring (--enable-testing is what builds emulator/btvirt)"
     --disable-monitor \
     --disable-udev >/dev/null
 
-echo "==> building emulator/btvirt and tools/btmgmt"
-make -j"$(nproc)" emulator/btvirt tools/btmgmt
+echo "==> building emulator/btvirt, tools/btmgmt and tools/btgatt-client"
+# btgatt-client is the LE counterpart of the suite's raw-L2CAP FakeHost: it
+# speaks ATT over its own socket on hci1, so the BLE tests need no second
+# bluetoothd (tests/btvirt/README.md).
+make -j"$(nproc)" emulator/btvirt tools/btmgmt tools/btgatt-client
 
 echo
 echo "btvirt built: $SRC/emulator/btvirt"
 "$SRC/emulator/btvirt" --help 2>&1 | head -20 || true
 echo "btmgmt built: $SRC/tools/btmgmt"
+echo "btgatt-client built: $SRC/tools/btgatt-client"

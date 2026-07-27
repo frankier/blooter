@@ -9,20 +9,16 @@ use std::time::Duration;
 use bluer::l2cap::{SeqPacket, SeqPacketListener, SocketAddr};
 use bluer::{Adapter, Address, AddressType};
 use log::{debug, error, info, warn};
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until, timeout_at};
 
-use super::{Accept, Flow, Step, Transport, dispatch};
+use super::{Accept, DIAL_BACKOFF_MAX, DIAL_BACKOFF_START, Flow, Step, Transport, dispatch};
 use crate::report::{InputState, Outcome, RawEvent};
 use crate::{AppError, Ctx, Signals};
 
 const CONTROL_PSM: u16 = 0x11;
 const INTERRUPT_PSM: u16 = 0x13;
 const INTERRUPT_WAIT: Duration = Duration::from_secs(3);
-/// Backoff between failed reconnect-initiate dials (design/CONNECTION.md §3.2).
-const DIAL_BACKOFF_START: Duration = Duration::from_secs(1);
-const DIAL_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// HIDP `HID_CONTROL | VIRTUAL_CABLE_UNPLUG`: "forget this device". Sent to make
 /// a host drop its bond and its cached SDP record (design/CONNECTION.md §7).
 const VIRTUAL_CABLE_UNPLUG: u8 = 0x15;
@@ -233,29 +229,18 @@ impl Transport for Classic {
         let mut next_dial = target.map(|_| Instant::now());
         let mut backoff = DIAL_BACKOFF_START;
 
-        // Spawn this cycle's interactive menu (interactive mode only). It sends a
-        // pick over `pick_rx`; `cancel_tx` + the join let us preempt it and wait
-        // for the terminal restore on break. The adapter is cloned once here so
-        // no `self` field is borrowed inside the select loop (see the note above).
-        let mut pick_rx: Option<mpsc::Receiver<crate::menu::Pick>> = None;
-        let mut cancel_tx: Option<oneshot::Sender<()>> = None;
-        let mut menu_task: Option<JoinHandle<()>> = None;
-        if let (Some(adapter), true) = (&self.adapter, self.interactive) {
-            let (ptx, prx) = mpsc::channel::<crate::menu::Pick>(1);
-            let (ctx_c, crx) = oneshot::channel::<()>();
-            let adapter = adapter.clone();
-            let coord = self.term_coord.clone();
-            // Hosts bonded under a different descriptor: flagged in the list and
-            // fixable with `[f]` (§7).
-            let stale = self.hosts.lock().unwrap().stale(self.descriptor_fp);
-            menu_task = Some(tokio::spawn(async move {
-                if let Some(pick) = crate::menu::run(adapter, stale, coord, crx).await {
-                    let _ = ptx.send(pick).await;
-                }
-            }));
-            pick_rx = Some(prx);
-            cancel_tx = Some(ctx_c);
-        }
+        // Spawn this cycle's interactive menu (interactive mode only); it is a
+        // local so no `self` field is borrowed inside the select loop (see the
+        // note above). Hosts bonded under a different descriptor are flagged in
+        // the list and fixable with `[f]` (§7).
+        let stale = self.hosts.lock().unwrap().stale(self.descriptor_fp);
+        let mut menu = crate::menu::Session::spawn(
+            self.adapter.as_ref(),
+            self.interactive,
+            crate::menu::Kind::Classic,
+            stale,
+            &self.term_coord,
+        );
 
         let done = loop {
             // Shared borrow for the concurrent accept/dial futures; per-iteration
@@ -279,7 +264,7 @@ impl Transport for Classic {
                     Ok((ctrl, sa)) => {
                         match self.await_interrupt(rx, state, ctx, signals, sa.addr).await {
                             Interrupt::Got(intr) => {
-                                if pick_rx.is_some() {
+                                if menu.is_open() {
                                     info!("incoming connection from {}; using it and \
                                            closing the menu", sa.addr);
                                 }
@@ -305,7 +290,7 @@ impl Transport for Classic {
                     }
                 },
                 // Menu pick: start dialing the chosen host (still racing inbound).
-                picked = recv_menu(&mut pick_rx) => {
+                picked = menu.recv() => {
                     match picked {
                         // A fix tears the bond down rather than connecting, so it
                         // must not become a dial target (§7).
@@ -323,7 +308,6 @@ impl Transport for Classic {
                         }
                         None => {}
                     }
-                    pick_rx = None; // menu resolved (picked, skipped, or gone)
                     // A fix needs `&mut self`, which the accept/dial futures
                     // borrow; leave the loop and perform it after they are gone.
                     if fix.is_some() {
@@ -343,12 +327,7 @@ impl Transport for Classic {
 
         // Preempt this cycle's menu and wait for it to restore the terminal
         // before returning — ordered ahead of any further output (§6).
-        if let Some(tx) = cancel_tx.take() {
-            let _ = tx.send(());
-        }
-        if let Some(task) = menu_task.take() {
-            let _ = task.await;
-        }
+        menu.finish().await;
 
         match done {
             Done::Shutdown => Accept::Shutdown,
@@ -441,18 +420,6 @@ impl Transport for Classic {
             self.unbond(addr).await;
         }
         flow
-    }
-}
-
-/// Await the interactive menu's pick if a receiver is present, else never
-/// resolve. Returns `None` when the menu was skipped or its sender was dropped
-/// (design/CONNECTION.md §6).
-async fn recv_menu(
-    rx: &mut Option<mpsc::Receiver<crate::menu::Pick>>,
-) -> Option<crate::menu::Pick> {
-    match rx {
-        Some(r) => r.recv().await,
-        None => future::pending().await,
     }
 }
 

@@ -16,6 +16,7 @@ FILTER="${1:-}"
 BLUEZ_VERSION="${BLUEZ_VERSION:-5.87}"
 BTVIRT="$HERE/build/bluez-$BLUEZ_VERSION/emulator/btvirt"
 BTMGMT="$HERE/build/bluez-$BLUEZ_VERSION/tools/btmgmt"
+BTGATT_CLIENT="$HERE/build/bluez-$BLUEZ_VERSION/tools/btgatt-client"
 
 if ! command -v vng >/dev/null 2>&1; then
     cat >&2 <<'EOF'
@@ -36,7 +37,7 @@ BLOOTER="$ROOT/target/debug/blooter"
 [[ -x "$BLOOTER" ]] || { echo "blooter binary missing: $BLOOTER" >&2; exit 2; }
 
 echo
-echo "##### 2/3  building btvirt + btmgmt #####"
+echo "##### 2/3  building btvirt + btmgmt + btgatt-client #####"
 # Neither is usable as packaged (btvirt is absent on Fedora, btmgmt hangs
 # non-interactively on older bluez), so both come from a bluez source tree in
 # build/ here. Nothing is installed system-wide; the build is skipped once the
@@ -44,6 +45,7 @@ echo "##### 2/3  building btvirt + btmgmt #####"
 "$HERE/build-btvirt.sh"
 [[ -x "$BTVIRT" ]] || { echo "btvirt missing: $BTVIRT" >&2; exit 2; }
 [[ -x "$BTMGMT" ]] || { echo "btmgmt missing: $BTMGMT" >&2; exit 2; }
+[[ -x "$BTGATT_CLIENT" ]] || { echo "btgatt-client missing: $BTGATT_CLIENT" >&2; exit 2; }
 
 echo
 echo "##### 3/3  running tests in VM #####"
@@ -51,5 +53,6 @@ echo "##### 3/3  running tests in VM #####"
 #             /boot, for hosts whose own kernel lacks hci_vhci -- see CI)
 # --user root guest commands run as root, so /dev/vhci opens and the low PSMs bind
 vng -r ${VNG_KERNEL:+"$VNG_KERNEL"} --user root \
-    -e "BTVIRT='$BTVIRT' BTMGMT='$BTMGMT' BLOOTER='$BLOOTER' FILTER='$FILTER' \
+    -e "BTVIRT='$BTVIRT' BTMGMT='$BTMGMT' BTGATT_CLIENT='$BTGATT_CLIENT' \
+        BLOOTER='$BLOOTER' FILTER='$FILTER' \
         $HERE/guest/run-tests.sh"

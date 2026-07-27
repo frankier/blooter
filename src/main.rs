@@ -288,7 +288,21 @@ async fn run(args: cli::Args) -> Result<(), AppError> {
                 .await
                 .map_err(|e| AppError::new(1, format!("no default adapter for LE: {e}")))?;
             let _ = adapter.set_pairable(true).await;
-            AnyTransport::Le(Le::new(adapter, n_gamepads).await?)
+            // As on Classic, keep a configured reconnect target only if it is
+            // already bonded; the menu supplies one at runtime otherwise
+            // (design/CONNECTION.md §4, §6). The adapter is needed for the GATT
+            // server either way, so `-n` gates only the menu here.
+            let target = initiate_target(Some(&adapter), configured_target).await;
+            AnyTransport::Le(
+                Le::new(
+                    adapter,
+                    n_gamepads,
+                    target,
+                    interactive && !args.nosetup,
+                    term_coord.clone(),
+                )
+                .await?,
+            )
         }
     };
 

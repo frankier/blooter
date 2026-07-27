@@ -21,8 +21,11 @@ Options:
                      $XDG_CONFIG_HOME/blooter/config.toml (falling back to
                      ~/.config/blooter/config.toml), /etc/blooter/config.toml.
   -s, --skipsdp      Skip the D-Bus profile/SDP registration (debugging).
-  -n, --nosetup      Skip adapter setup (device class 0x0540, name \"blooter\",
-                     SSP pairing mode) and the host (re)connection menu.
+                     Classic only.
+  -n, --nosetup      Skip the host (re)connection menu and, on Classic, adapter
+                     setup (device class 0x0540, name \"blooter\", SSP pairing
+                     mode). BLE needs the adapter for its GATT server, so only
+                     the menu is skipped there.
   -d                 Enable debug logging of input events and socket traffic.
 
 Local hotkeys (configurable, see config.example.toml):

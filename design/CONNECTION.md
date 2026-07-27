@@ -24,7 +24,7 @@ into one shared `Connected` state.
 
 | Axis | Values | Chosen by |
 |---|---|---|
-| **Transport** | Classic (BR/EDR HID) · BLE (HOGP) | `[connection] protocol` |
+| **Transport** | BLE (HOGP, the default) · Classic (BR/EDR HID) | `[connection] protocol` |
 | **Role** | Acceptor (host dials us) · Initiator (we dial a known host) | whether a reconnect target is set |
 | **Mode** | Interactive (stdin is a TTY) · Non-interactive | `isatty`, `-n` |
 
@@ -170,10 +170,22 @@ stateDiagram-v2
     Advertising --> Shutdown: signal / exit hotkey
 ```
 
-Active **reconnect-initiate is Classic-only.** On BLE it is the controller's job:
-BlueZ reconnects a bonded central when it reappears, and advertising invites a
-known host back. blooter keeps relying on advertising + bond persistence. (A
-future extension could page a known central; not needed now.)
+BLE also has an **initiator path**, the analogue of §3.2: when a target is set
+(from the menu, §6, or `[connection] reconnect`), `wait_connected` races
+`Device::connect()` against the subscribe. GATT server/client roles are
+independent of the link role, so blooter still serves its HOGP tree to a host it
+dialled itself. The differences from Classic:
+
+- **Connecting is not a session.** A successful `Device::connect()` only brings
+  the link up; blooter keeps waiting for the host to subscribe to a Report CCCD,
+  which is what actually starts a session. On success it stops connecting rather
+  than returning.
+- **Failures back off** on the same 1 s → 30 s schedule (shared with Classic in
+  `transport/mod.rs`), and the target is likewise **one-shot**: cleared once a
+  host subscribes, so an intentional drop does not immediately redial.
+
+Beyond that, a bonded central reconnecting is still the controller's job — BlueZ
+reconnects it when it reappears, and advertising invites a known host back.
 
 ## 5. Pairing / agent handling
 
@@ -247,13 +259,30 @@ Bluetooth audio/headsets and devices with no real name (only a hex identifier)
 are moved to an **"Other devices"** submenu so the main list shows just plausible
 HID hosts.
 
+**Both transports run the same menu.** `menu::Kind` carries the only two
+differences: the discovery filter (`bredr` vs `le`, so the list only offers
+devices reachable over the transport in use) and whether `[f] Fix connection`
+applies at all — it does not on BLE, which has no cached SDP record to
+invalidate (§7). Classification handles both worlds: a device is "Other" if it
+has no real name, if its **Class of Device** is audio (BR/EDR), or if its **GAP
+Appearance** category is HID or audio (LE); each property check simply falls
+through when the peer does not carry that property. `menu::Session` wraps the
+spawn/cancel/join plumbing so each transport's `wait_connected` drives the menu
+identically — it must be a *local* of `wait_connected`, since its `&mut` borrow
+in a `select!` arm would otherwise conflict with the shared `&self` the
+concurrent accept/dial futures take.
+
 **Startup (Classic):** blooter makes the adapter discoverable (restoring the
 prior state on exit) and prints that it is now visible, so a host can find and
 connect to it. A configured `[connection] reconnect` address is kept as an
 initial target **only if it is already bonded** (`initiate_target` in `main.rs`);
 an unbonded or unset value leaves blooter accept-only.
 
-**Per accept cycle (Classic `wait_connected`):** in interactive mode the menu is
+**Startup (BLE):** the LE advertisement makes blooter visible instead, so there
+is nothing to make discoverable. A configured `[connection] reconnect` address is
+resolved by the same bonded-only `initiate_target` check.
+
+**Per accept cycle (`wait_connected`, either transport):** in interactive mode the menu is
 (re)spawned as a task at the top of every `wait_connected` call, so it **re-opens
 after a disconnect**. It feeds its pick to the transport over a channel; the menu
 pick, the inbound accept, and any outbound dial all race in one `select!`. A
@@ -376,8 +405,9 @@ change it from run to run.
 | Classic | Interactive | `confirm` (inferred) | Accept + Initiate (menu pick) |
 | Classic | Non-interactive | `auto` (inferred) | Accept + Initiate (`reconnect` if set) |
 | Classic | Non-interactive, `-n` | `auto` | Accept-only (menu skipped) |
-| BLE | Interactive | `confirm` (inferred) | Accept-only |
-| BLE | Non-interactive | `auto` (inferred) | Accept-only |
+| BLE | Interactive | `confirm` (inferred) | Accept + Initiate (menu pick) |
+| BLE | Non-interactive | `auto` (inferred) | Accept + Initiate (`reconnect` if set) |
+| BLE | Interactive, `-n` | `confirm` | Accept-only (menu skipped) |
 
 Any inferred pairing default can be overridden by setting `[connection]
 pairing` explicitly.
@@ -394,16 +424,25 @@ pairing` explicitly.
   pick in one `select!`, with dial backoff; on break it cancels and joins the
   menu (restoring the terminal). The target is cleared on the first successful
   link, and an incoming connection preempts an open menu.
-- **`transport/le.rs`** — drop its private agent; rely on the shared one.
-- **`menu.rs`** — the interactive `crossterm` TUI: `run` scans, lists eligible
-  hosts (audio/nameless devices under an "Other devices" submenu), navigates by
+- **`transport/le.rs`** — drop its private agent; rely on the shared one. Holds
+  an optional target, the interactive flag and the `TermCoord`; `wait_connected`
+  spawns the menu each cycle and races the CCCD subscribe, a backoff-gated
+  outgoing `Device::connect()` and the menu pick in one `select!` (§4).
+- **`menu.rs`** — the interactive `crossterm` TUI, shared by both transports:
+  `run` scans (filtered to the transport's `menu::Kind`), lists eligible hosts
+  (audio/nameless devices under an "Other devices" submenu), navigates by
   arrow/number/letter keys with a rescan action, pairs a newly-picked (unbonded)
   host from here, and returns a `Pick` (address + whether `[f]` asked for a fix,
-  §7). Marks stale hosts. Pre-emptable via a `oneshot` cancel; a pair attempt
-  against a device bluetoothd has since dropped rediscovers and retries once.
+  §7 — Classic only). Marks stale hosts. Pre-emptable via a `oneshot` cancel; a
+  pair attempt against a device bluetoothd has since dropped rediscovers and
+  retries once. `menu::Session` is the transport-facing spawn/cancel/join handle.
+- **`transport/mod.rs`** — the dial backoff constants, shared by both initiator
+  paths.
 - **`state.rs`** — the per-host descriptor-fingerprint file backing §7.1.
 - **`setup.rs`** — adapter class/name/SSP preparation only (the menu moved out).
 - **`main.rs`** — resolve pairing mode; register the agent; power/pairable the
-  adapter and make it discoverable (restored on exit); resolve a bonded
-  configured target; pass the adapter into the Classic transport for the menu.
+  adapter and (Classic) make it discoverable, restored on exit; resolve a bonded
+  configured target for either transport; pass the adapter, the interactive flag
+  and the `TermCoord` into the chosen transport for the menu. On BLE the adapter
+  is needed for the GATT server regardless, so `-n` gates only the menu there.
 </content>

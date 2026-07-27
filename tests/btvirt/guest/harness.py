@@ -126,7 +126,7 @@ class Process:
     """A child process with its output captured to a file, so a failure can
     show what the component actually said."""
 
-    def __init__(self, name, argv, env=None):
+    def __init__(self, name, argv, env=None, stdin_pipe=False):
         self.name = name
         self.argv = argv
         self.log_path = os.path.join(RUNDIR, f"{name}.log")
@@ -135,10 +135,17 @@ class Process:
             argv,
             stdout=self._log,
             stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE if stdin_pipe else subprocess.DEVNULL,
             env=env,
             start_new_session=True,
         )
+
+    def write_stdin(self, text):
+        """Feed a line to a process started with `stdin_pipe=True`."""
+        if self.proc.stdin is None:
+            raise HarnessError(f"{self.name} was not started with a stdin pipe")
+        self.proc.stdin.write(text.encode())
+        self.proc.stdin.flush()
 
     def output(self):
         try:
@@ -388,10 +395,12 @@ class Blooter:
     reports that come out the other end.
     """
 
-    def __init__(self, binary, extra_args=(), fifo=None):
+    def __init__(self, binary, extra_args=(), fifo=None, protocol="classic"):
         self.binary = binary
         self.fifo_path = fifo or os.path.join(RUNDIR, "blooter.fifo")
         self.extra_args = list(extra_args)
+        self.protocol = protocol
+        self.config_path = os.path.join(RUNDIR, "blooter.toml")
         self.proc = None
         self._fifo_fd = None
 
@@ -399,6 +408,10 @@ class Blooter:
         if os.path.exists(self.fifo_path):
             os.unlink(self.fifo_path)
         os.mkfifo(self.fifo_path, 0o600)
+        # The transport is always pinned rather than left to the default, so a
+        # change of default cannot silently move a test to the other transport.
+        with open(self.config_path, "w") as fh:
+            fh.write(f'[connection]\nprotocol = "{self.protocol}"\n')
 
         env = dict(os.environ, RUST_BACKTRACE="1")
         # Full adapter setup is deliberately left on (no `-n`): blooter making
@@ -406,7 +419,8 @@ class Blooter:
         # without it the host's dial page-times-out. The menu stays out of the
         # way regardless because stdin is /dev/null, so blooter infers
         # non-interactive. `-d` gives per-report debug logging for failures.
-        argv = [self.binary, "-f", self.fifo_path, "-d"] + self.extra_args
+        argv = [self.binary, "-f", self.fifo_path, "-c", self.config_path,
+                "-d"] + self.extra_args
         self.proc = Process("blooter", argv, env=env)
         self.proc.wait_for_output(
             r"ready to accept connections", 20.0, "blooter to be ready")
@@ -540,9 +554,119 @@ class FakeHost:
         self.intr = self.ctrl = None
 
 
+class LeHost:
+    """A host that connects to blooter over real LE, as a machine would.
+
+    The LE counterpart of `FakeHost`. Python's socket module cannot express an
+    ATT connection (no CID or address-type in its L2CAP sockaddr), so this
+    drives bluez's own `btgatt-client`, which opens its own ATT socket on hci1 —
+    just like FakeHost's raw L2CAP sockets, and for the same reason: no second
+    bluetoothd, so the shared-agent artifact (TODO.md) stays out of it.
+
+    Subscribing needs no bond: blooter's CCCDs are not encryption-gated (only
+    the Report *reads* and the Report Map are), and the CCCD subscribe is what
+    blooter treats as "connected" (design/ARCH.md §4.2).
+    """
+
+    ANSI = re.compile(r"\x1b\[[0-9;]*m")
+    HID_SERVICE_UUID = "00001812"
+    REPORT_UUID = "00002a4d"
+    DISCOVERY_DONE = r"GATT discovery procedures complete"
+    NOTIFICATION = r"Handle Value Not/Ind: (0x[0-9a-f]+) - \(\d+ bytes\): ([0-9a-f ]+)"
+
+    def __init__(self, binary, adapter, peer_addr):
+        self.binary = binary
+        self.adapter = adapter
+        self.peer_addr = peer_addr
+        self.proc = None
+
+    def output(self):
+        return self.ANSI.sub("", self.proc.output()) if self.proc else ""
+
+    def connect(self, timeout=20.0):
+        """Open the LE link and wait for GATT discovery to finish."""
+        self.proc = Process(
+            "btgatt-client",
+            [self.binary, "-i", self.adapter, "-d", self.peer_addr,
+             "-t", "public"],
+            stdin_pipe=True)
+        wait_for(lambda: re.search(self.DISCOVERY_DONE, self.output()),
+                 timeout, "btgatt-client to finish GATT discovery")
+        return self
+
+    def report_handles(self):
+        """Value handles of the HID service's Report characteristics.
+
+        Parsed rather than hardcoded: bluetoothd assigns handles at
+        registration time and neither the values nor the order of the two
+        characteristics is stable between runs.
+        """
+        handles, in_hid = [], False
+        for line in self.output().splitlines():
+            line = line.strip()
+            if line.startswith("service -"):
+                in_hid = self.HID_SERVICE_UUID in line
+            elif line.startswith("charac -") and in_hid \
+                    and self.REPORT_UUID in line:
+                handle = int(re.search(r"value: (0x[0-9a-f]+)", line).group(1), 16)
+                if handle not in handles:
+                    handles.append(handle)
+        return handles
+
+    def subscribe(self, timeout=10.0):
+        """Write every Report CCCD, which is what makes blooter "connected"."""
+        handles = self.report_handles()
+        if not handles:
+            raise AssertionError(
+                f"no Report characteristics in blooter's GATT tree:\n{self.output()}")
+        for handle in handles:
+            seen = len(re.findall(r"Registered notify handler", self.output()))
+            self.proc.write_stdin(f"register-notify {handle:#06x}\n")
+            self.proc.wait_for_output(
+                r"Registered notify handler", timeout,
+                f"the CCCD subscribe on {handle:#06x}", after=seen)
+        return self
+
+    def notifications(self):
+        """Every notification received so far, as (handle, payload) pairs."""
+        return [(int(h, 16), bytes.fromhex(payload.replace(" ", "")))
+                for h, payload in re.findall(self.NOTIFICATION, self.output())]
+
+    def wait_for_notification(self, payload, timeout=5.0):
+        """Wait for `payload` to arrive on any Report characteristic.
+
+        Matched on the payload rather than a specific handle: which of the two
+        Report characteristics is the mouse and which the keyboard depends on
+        the handle order bluetoothd happened to assign, and the point of the
+        assertion is that the report reached the host at all.
+        """
+        def check():
+            return any(got == payload for _handle, got in self.notifications())
+
+        try:
+            wait_for(check, timeout, f"a notification of {describe(payload)}")
+        except HarnessError:
+            got = [describe(p) for _h, p in self.notifications()]
+            raise AssertionError(
+                f"no notification of {describe(payload)} within {timeout}s"
+                f"\n  received: {got or '<none>'}") from None
+
+    def close(self):
+        if self.proc is not None:
+            self.proc.stop()
+            self.proc = None
+
+
 # --------------------------------------------------------------------------
 # Expected reports
 # --------------------------------------------------------------------------
+
+def le_payload(report):
+    """The notification value for a wire report: the LE transport strips the
+    0xA1 HIDP header and the report id, which route to a characteristic
+    instead (design/ARCH.md §4.2)."""
+    return report[2:]
+
 
 def keyboard_report(modifiers=0, keys=()):
     """An 11-byte keyboard report, as InputState::keyboard_report builds it."""
@@ -629,13 +753,20 @@ class TestContext:
         self.blooter = None
         self.hosts = []
 
-    def start_blooter(self, extra_args=()):
-        self.blooter = Blooter(self.binary, extra_args=extra_args).start()
+    def start_blooter(self, extra_args=(), protocol="classic"):
+        self.blooter = Blooter(self.binary, extra_args=extra_args,
+                               protocol=protocol).start()
         return self.blooter
 
     def host(self):
         """A fake host on hci1, dialing blooter on hci0."""
         h = FakeHost(self.stack.addresses[1], self.stack.addresses[0])
+        self.hosts.append(h)
+        return h
+
+    def le_host(self):
+        """An LE host on hci1, connecting to blooter on hci0."""
+        h = LeHost(os.environ["BTGATT_CLIENT"], "hci1", self.stack.addresses[0])
         self.hosts.append(h)
         return h
 
@@ -653,6 +784,16 @@ class TestContext:
         self.blooter.wait_for_output(
             self.CONNECTED_PATTERN, 10.0,
             "blooter to report the host connected", after=seen)
+        return host
+
+    def connected_le_host(self):
+        """The LE equivalent: a host that has opened the link and subscribed to
+        the Report CCCDs, which is what blooter counts as connected."""
+        seen = self.blooter.proc.match_count(self.CONNECTED_PATTERN)
+        host = self.le_host().connect().subscribe()
+        self.blooter.wait_for_output(
+            self.CONNECTED_PATTERN, 10.0,
+            "blooter to report the LE host connected", after=seen)
         return host
 
     def dump_diagnostics(self):
