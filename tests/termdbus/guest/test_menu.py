@@ -205,7 +205,7 @@ def test_incoming_pairing_prompt_interrupts_menu(t):
     from the same stdin -- otherwise the menu's EventStream swallows it and
     pairing stalls (design/CONNECTION.md §5.2)."""
     t.mock.add_device(LAPTOP, "my-laptop")
-    term = t.menu()
+    term = t.menu(pairing="prompt")
 
     call = t.mock.request_confirmation(LAPTOP, passkey=123456)
 
@@ -222,7 +222,7 @@ def test_incoming_pairing_prompt_interrupts_menu(t):
 @tests.test
 def test_pairing_prompt_rejects_on_no(t):
     """Answering 'n' rejects the pairing with org.bluez.Error.Rejected."""
-    term = t.menu()
+    term = t.menu(pairing="prompt")
 
     call = t.mock.request_authorization(LAPTOP)
 
@@ -242,7 +242,7 @@ def test_menu_resumes_after_pairing_prompt(t):
     EventStream (§5.2)."""
     t.mock.add_device(LAPTOP, "my-laptop")
     t.mock.add_device(HEADSET, "my-headset", cls=CLASS_HEADSET)
-    term = t.menu()
+    term = t.menu(pairing="prompt")
 
     call = t.mock.request_authorization(LAPTOP)
     term.wait_for_text("Allow pairing with")

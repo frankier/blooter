@@ -81,11 +81,14 @@
 #protocol = "ble"
 
 # How the pairing agent answers bonding requests (see design/CONNECTION.md §5).
-# When unset it is inferred: "confirm" if stdin is a TTY, else "auto".
 #
-#   "auto"     accept every pairing request silently ("Just Works")
-#   "confirm"  prompt on the terminal before bonding
-#pairing = "auto"
+#   "accept"              accept every pairing request silently ("Just Works"),
+#                         the default
+#   "prompt_if_possible"  prompt on the terminal when stdin is a TTY, else
+#                         accept silently
+#   "prompt"              always prompt on the terminal before bonding; blooter
+#                         refuses to start if stdin is not a TTY
+#pairing = "accept"
 
 # Address of a host to initiate an outgoing connection to on startup
 # (reconnect-initiate; see design/CONNECTION.md §3.2 for Classic, §4 for BLE).

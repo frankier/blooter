@@ -28,11 +28,11 @@ into one shared `Connected` state.
 | **Role** | Acceptor (host dials us) · Initiator (we dial a known host) | whether a reconnect target is set |
 | **Mode** | Interactive (stdin is a TTY) · Non-interactive | `isatty`, `-n` |
 
-Two config keys drive the new behaviour, each with an inferred default:
+Two config keys drive the new behaviour:
 
-- **`[connection] pairing`** — `"auto"` (accept silently, Just Works) or
-  `"confirm"` (prompt on the TTY). Absent → **inferred**: `confirm` when stdin is
-  a TTY, else `auto`.
+- **`[connection] pairing`** — `"accept"` (accept silently, Just Works; the
+  default), `"prompt"` (always prompt on the TTY — a startup error when stdin is
+  not a TTY) or `"prompt_if_possible"` (prompt when stdin is a TTY, else accept).
 - **`[connection] reconnect`** — a host address (`"AA:BB:CC:DD:EE:FF"`) to
   initiate an outgoing HID connection to. Absent → no configured target; in
   interactive mode the menu supplies one at runtime.
@@ -196,10 +196,11 @@ pairable. The agent's registered callbacks determine the negotiated IO
 capability, which decides Just Works vs passkey. Its behaviour follows
 `[connection] pairing` (§1).
 
-### 5.1 `auto` (default when non-interactive)
+### 5.1 `accept` (the default)
 
 Present `NoInputNoOutput` → **Just Works**; accept every request without a
-prompt. This is exactly the previous LE agent, now shared with Classic.
+prompt. This is exactly the previous LE agent, now shared with Classic. It is
+also what `prompt_if_possible` falls back to when stdin is not a TTY.
 
 ```mermaid
 stateDiagram-v2
@@ -210,7 +211,7 @@ stateDiagram-v2
     Bonding --> Idle: peer aborts
 ```
 
-### 5.2 `confirm` (default when interactive)
+### 5.2 `prompt` (and `prompt_if_possible` on a TTY)
 
 Prompt the user on the TTY before bonding, which also lets a keyboard-class host
 show a **passkey to display**.
@@ -231,7 +232,7 @@ stateDiagram-v2
     Bonded --> Idle
 ```
 
-The `confirm` prompt reads from the same stdin as the menu, so the two must not
+The prompt reads from the same stdin as the menu, so the two must not
 own the terminal at once. For a **user-initiated** pick this is naturally
 ordered: the menu drops raw mode (restoring cooked mode) before it pairs. But an
 **incoming** connection fires the agent's `request_confirmation` *while the menu
@@ -247,6 +248,11 @@ break away from the menu's last line). The returned guard resumes the menu — n
 (non-interactive, LE, or the menu already resolved) the borrow is a no-op.
 Passkey *entry* (host shows digits, we type them) stays out of scope — as the
 keyboard we only ever display / confirm.
+
+Because prompting needs a terminal, `pairing = "prompt"` with no TTY on stdin is
+rejected at **startup** (before any Bluetooth setup) rather than silently
+downgraded to accepting everything; `prompt_if_possible` is the mode for "prompt
+when you can".
 
 ## 6. Reconnect target & the concurrent menu
 
@@ -402,20 +408,23 @@ change it from run to run.
 
 | Transport | Mode | Pairing (§5) | Link role |
 |---|---|---|---|
-| Classic | Interactive | `confirm` (inferred) | Accept + Initiate (menu pick) |
-| Classic | Non-interactive | `auto` (inferred) | Accept + Initiate (`reconnect` if set) |
-| Classic | Non-interactive, `-n` | `auto` | Accept-only (menu skipped) |
-| BLE | Interactive | `confirm` (inferred) | Accept + Initiate (menu pick) |
-| BLE | Non-interactive | `auto` (inferred) | Accept + Initiate (`reconnect` if set) |
-| BLE | Interactive, `-n` | `confirm` | Accept-only (menu skipped) |
+| Classic | Interactive | `accept` (default) | Accept + Initiate (menu pick) |
+| Classic | Non-interactive | `accept` (default) | Accept + Initiate (`reconnect` if set) |
+| Classic | Non-interactive, `-n` | `accept` (default) | Accept-only (menu skipped) |
+| BLE | Interactive | `accept` (default) | Accept + Initiate (menu pick) |
+| BLE | Non-interactive | `accept` (default) | Accept + Initiate (`reconnect` if set) |
+| BLE | Interactive, `-n` | `accept` (default) | Accept-only (menu skipped) |
 
-Any inferred pairing default can be overridden by setting `[connection]
-pairing` explicitly.
+Pairing no longer varies with the mode: it is whatever `[connection] pairing`
+says, `accept` unless set. `prompt_if_possible` is the mode-sensitive value
+(prompt on the rows where stdin is a TTY, accept on the others), and `prompt`
+only starts at all on the interactive rows.
 
 ## 9. Implementation touch-points
 
-- **`config.rs`** — add `[connection] pairing` (`auto`/`confirm`, optional →
-  inferred) and `[connection] reconnect` (address string, optional).
+- **`config.rs`** — add `[connection] pairing`
+  (`accept`/`prompt_if_possible`/`prompt`, default `accept`) and
+  `[connection] reconnect` (address string, optional).
 - **`agent.rs`** (new) — the shared agent: `auto_accept_agent` (lifted out of
   `transport/le.rs`) and an interactive `confirm_agent`; registered in
   `main::run` for both protocols, keeping the handle alive for the process.
@@ -440,7 +449,8 @@ pairing` explicitly.
   paths.
 - **`state.rs`** — the per-host descriptor-fingerprint file backing §7.1.
 - **`setup.rs`** — adapter class/name/SSP preparation only (the menu moved out).
-- **`main.rs`** — resolve pairing mode; register the agent; power/pairable the
+- **`main.rs`** — resolve the pairing mode against the TTY right after loading
+  the config (so `prompt` without one exits early); register the agent; power/pairable the
   adapter and (Classic) make it discoverable, restored on exit; resolve a bonded
   configured target for either transport; pass the adapter, the interactive flag
   and the `TermCoord` into the chosen transport for the menu. On BLE the adapter

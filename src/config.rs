@@ -76,15 +76,17 @@ pub enum Protocol {
     Ble,
 }
 
-/// How the pairing agent handles bonding requests. When unset in the config
-/// (`None`) it is inferred at runtime: `Confirm` if stdin is a TTY, else `Auto`.
-/// See design/CONNECTION.md §5.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// How the pairing agent handles bonding requests. See design/CONNECTION.md §5.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum PairingMode {
-    /// Accept every request silently ("Just Works").
-    Auto,
-    /// Prompt the user on the TTY before bonding.
-    Confirm,
+    /// Accept every request silently ("Just Works") — the default.
+    #[default]
+    Accept,
+    /// Prompt on the TTY if there is one, else accept silently.
+    PromptIfPossible,
+    /// Prompt the user on the TTY before bonding. Errors at startup when stdin
+    /// is not a TTY, since there is nothing to prompt on.
+    Prompt,
 }
 
 /// What drives a flush of buffered pointer motion (design/ARCH.md §7.2c). A
@@ -163,8 +165,8 @@ pub struct Config {
     pub gamepad_slots: GamepadSlots,
     pub hotplug: Hotplug,
     pub protocol: Protocol,
-    /// Pairing agent behaviour; `None` means "infer from the TTY" (§5).
-    pub pairing: Option<PairingMode>,
+    /// Pairing agent behaviour (§5).
+    pub pairing: PairingMode,
     /// Address of a host to initiate an outgoing HID connection to (§3.2, §6).
     pub reconnect: Option<String>,
     /// Pointer batching (§7.2c).
@@ -181,7 +183,7 @@ impl Default for Config {
             gamepad_slots: GamepadSlots::default(),
             hotplug: Hotplug::default(),
             protocol: Protocol::default(),
-            pairing: None,
+            pairing: PairingMode::default(),
             reconnect: None,
             batch: Batch::default(),
             buffer: DEFAULT_BUFFER,
@@ -427,7 +429,7 @@ fn overflow_item(item: &Item<'_>) -> Result<Overflow, toml_spanner::Error> {
 #[derive(Default)]
 struct Connection {
     protocol: Protocol,
-    pairing: Option<PairingMode>,
+    pairing: PairingMode,
     reconnect: Option<String>,
 }
 
@@ -437,7 +439,9 @@ impl<'de> FromToml<'de> for Connection {
         let protocol = th
             .optional_mapped("protocol", protocol_item)
             .unwrap_or_default();
-        let pairing = th.optional_mapped("pairing", pairing_item);
+        let pairing = th
+            .optional_mapped("pairing", pairing_item)
+            .unwrap_or_default();
         let reconnect = th.optional_mapped("reconnect", reconnect_item);
         th.require_empty()?;
         Ok(Connection {
@@ -457,12 +461,13 @@ fn protocol_item(item: &Item<'_>) -> Result<Protocol, toml_spanner::Error> {
     }
 }
 
-/// Parse the `pairing` value: one of the strings `"auto"` or `"confirm"`.
+/// Parse the `pairing` value: `"accept"`, `"prompt_if_possible"` or `"prompt"`.
 fn pairing_item(item: &Item<'_>) -> Result<PairingMode, toml_spanner::Error> {
     match item.as_str() {
-        Some("auto") => Ok(PairingMode::Auto),
-        Some("confirm") => Ok(PairingMode::Confirm),
-        _ => Err(item.expected(&"\"auto\" or \"confirm\"")),
+        Some("accept") => Ok(PairingMode::Accept),
+        Some("prompt_if_possible") => Ok(PairingMode::PromptIfPossible),
+        Some("prompt") => Ok(PairingMode::Prompt),
+        _ => Err(item.expected(&"\"accept\", \"prompt_if_possible\" or \"prompt\"")),
     }
 }
 
@@ -636,7 +641,7 @@ mod tests {
         assert_eq!(cfg.gamepad_slots, GamepadSlots::Initial);
         assert_eq!(cfg.hotplug, Hotplug::Auto);
         assert_eq!(cfg.protocol, Protocol::Ble);
-        assert_eq!(cfg.pairing, None);
+        assert_eq!(cfg.pairing, PairingMode::Accept);
         assert_eq!(cfg.reconnect, None);
         assert_eq!(cfg.batch, Batch::Auto);
         assert_eq!(cfg.buffer, DEFAULT_BUFFER);
@@ -690,21 +695,26 @@ mod tests {
 
     #[test]
     fn pairing_and_reconnect_parse() {
-        // Absent → None (inferred at runtime).
-        assert_eq!(parse("").unwrap().pairing, None);
+        // Absent → accept.
+        assert_eq!(parse("").unwrap().pairing, PairingMode::Accept);
+        assert_eq!(
+            parse("[connection]\n").unwrap().pairing,
+            PairingMode::Accept
+        );
         assert_eq!(parse("[connection]\n").unwrap().reconnect, None);
         // Explicit pairing values.
-        assert_eq!(
-            parse("[connection]\npairing = \"auto\"\n").unwrap().pairing,
-            Some(PairingMode::Auto)
-        );
-        assert_eq!(
-            parse("[connection]\npairing = \"confirm\"\n")
-                .unwrap()
-                .pairing,
-            Some(PairingMode::Confirm)
-        );
+        for (text, want) in [
+            ("accept", PairingMode::Accept),
+            ("prompt_if_possible", PairingMode::PromptIfPossible),
+            ("prompt", PairingMode::Prompt),
+        ] {
+            let cfg = parse(&format!("[connection]\npairing = \"{text}\"\n")).unwrap();
+            assert_eq!(cfg.pairing, want, "pairing = {text}");
+        }
         assert!(parse("[connection]\npairing = \"maybe\"\n").is_err());
+        // The old spellings are gone.
+        assert!(parse("[connection]\npairing = \"auto\"\n").is_err());
+        assert!(parse("[connection]\npairing = \"confirm\"\n").is_err());
         // Reconnect address.
         assert_eq!(
             parse("[connection]\nreconnect = \"AA:BB:CC:DD:EE:FF\"\n")

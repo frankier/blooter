@@ -77,10 +77,6 @@ Roughly in order of how much risk they carry.
   controller model built for multi-device emulation. It speaks HCI over TCP, so
   it would still need the VM to bridge into `/dev/vhci`.
 
-## UI problems
-
- - Pairing => "auto"/"accept"/"prompt"
-
 ## To investigate (continued)
 
 - **`SYN_DROPPED` is invisible through the evdev crate's synced stream.** When

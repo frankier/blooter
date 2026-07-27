@@ -2,7 +2,8 @@
 //! transport is active. HID bonding needs an agent to answer pairing requests
 //! (BLE HOGP requires an encrypted, bonded link; on Classic an incoming pair
 //! stalls with no agent registered). Behaviour follows `[connection] pairing`:
-//! `Auto` accepts silently ("Just Works"), `Confirm` prompts on the TTY. See
+//! `Accept` bonds silently ("Just Works"), `Prompt` asks on the TTY, and
+//! `PromptIfPossible` picks between the two by whether stdin is a TTY. See
 //! design/CONNECTION.md §5.
 
 use std::io::{self, Write};
@@ -18,13 +19,23 @@ use crate::menu::TermCoord;
 
 type ReqFuture = Pin<Box<dyn std::future::Future<Output = ReqResult<()>> + Send>>;
 
-/// Build the agent for the given pairing mode. `coord` lets the confirm-mode
-/// prompt borrow the terminal from a running interactive menu before reading on
-/// the TTY (design/CONNECTION.md §5/§6).
-pub fn agent(mode: PairingMode, coord: TermCoord) -> Agent {
+/// What the agent actually does once the TTY question is settled, i.e. the
+/// result of [`resolve_mode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resolved {
+    /// Accept silently ("Just Works").
+    Accept,
+    /// Ask on the TTY before bonding.
+    Prompt,
+}
+
+/// Build the agent for the resolved pairing behaviour. `coord` lets the prompt
+/// borrow the terminal from a running interactive menu before reading on the
+/// TTY (design/CONNECTION.md §5/§6).
+pub fn agent(mode: Resolved, coord: TermCoord) -> Agent {
     match mode {
-        PairingMode::Auto => auto_accept_agent(),
-        PairingMode::Confirm => confirm_agent(coord),
+        Resolved::Accept => auto_accept_agent(),
+        Resolved::Prompt => confirm_agent(coord),
     }
 }
 
@@ -97,14 +108,21 @@ fn prompt(coord: TermCoord, msg: String) -> ReqFuture {
     .boxed()
 }
 
-/// Resolve the effective pairing mode: the explicit config value, else inferred
-/// from whether stdin is a TTY (`Confirm` interactively, `Auto` otherwise).
-pub fn resolve_mode(configured: Option<PairingMode>, interactive: bool) -> PairingMode {
-    configured.unwrap_or(if interactive {
-        PairingMode::Confirm
-    } else {
-        PairingMode::Auto
-    })
+/// Resolve the configured pairing mode against whether stdin is a TTY.
+/// `Prompt` without a TTY has no way to ask, so it is an error (reported at
+/// startup) rather than a silent downgrade to accepting everything.
+pub fn resolve_mode(configured: PairingMode, interactive: bool) -> Result<Resolved, String> {
+    match configured {
+        PairingMode::Accept => Ok(Resolved::Accept),
+        PairingMode::PromptIfPossible if interactive => Ok(Resolved::Prompt),
+        PairingMode::PromptIfPossible => Ok(Resolved::Accept),
+        PairingMode::Prompt if interactive => Ok(Resolved::Prompt),
+        PairingMode::Prompt => Err(
+            "[connection] pairing = \"prompt\" needs a terminal to prompt on, but stdin is not a \
+             TTY; use \"prompt_if_possible\" or \"accept\""
+                .to_string(),
+        ),
+    }
 }
 
 /// Parse a config reconnect address string into an [`Address`]. The string was
@@ -112,4 +130,32 @@ pub fn resolve_mode(configured: Option<PairingMode>, interactive: bool) -> Pairi
 /// malformed value.
 pub fn parse_address(s: &str) -> Option<Address> {
     s.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_mode_needs_a_tty_only_for_prompt() {
+        for interactive in [true, false] {
+            assert_eq!(
+                resolve_mode(PairingMode::Accept, interactive),
+                Ok(Resolved::Accept)
+            );
+        }
+        assert_eq!(
+            resolve_mode(PairingMode::PromptIfPossible, true),
+            Ok(Resolved::Prompt)
+        );
+        assert_eq!(
+            resolve_mode(PairingMode::PromptIfPossible, false),
+            Ok(Resolved::Accept)
+        );
+        assert_eq!(
+            resolve_mode(PairingMode::Prompt, true),
+            Ok(Resolved::Prompt)
+        );
+        assert!(resolve_mode(PairingMode::Prompt, false).is_err());
+    }
 }

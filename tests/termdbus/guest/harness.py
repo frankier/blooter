@@ -517,10 +517,11 @@ class Blooter:
 
     The transport is always pinned with a written config file rather than left
     to the default, so a change of default cannot silently move a test from one
-    transport to the other.
+    transport to the other. `pairing` is written the same way when a test needs
+    the TTY prompt (the default is "accept", which never prompts).
     """
 
-    def __init__(self, extra_args=(), protocol="classic"):
+    def __init__(self, extra_args=(), protocol="classic", pairing=None):
         self.fifo_path = os.path.join(RUNDIR, "blooter.fifo")
         if os.path.exists(self.fifo_path):
             os.unlink(self.fifo_path)
@@ -528,6 +529,8 @@ class Blooter:
         self.config_path = os.path.join(RUNDIR, "blooter.toml")
         with open(self.config_path, "w") as fh:
             fh.write(f'[connection]\nprotocol = "{protocol}"\n')
+            if pairing is not None:
+                fh.write(f'pairing = "{pairing}"\n')
         env = dict(os.environ,
                    DBUS_SYSTEM_BUS_ADDRESS=BUS_ADDRESS,
                    RUST_BACKTRACE="1")
@@ -724,13 +727,15 @@ class TestContext:
         self.mock = mock
         self.blooter = None
 
-    def start_blooter(self, extra_args=(), protocol="classic"):
-        self.blooter = Blooter(extra_args=extra_args, protocol=protocol)
+    def start_blooter(self, extra_args=(), protocol="classic", pairing=None):
+        self.blooter = Blooter(extra_args=extra_args, protocol=protocol,
+                               pairing=pairing)
         return self.blooter
 
-    def menu(self, extra_args=(), protocol="classic"):
+    def menu(self, extra_args=(), protocol="classic", pairing=None):
         """Start blooter and wait for the host menu to be on screen."""
-        blooter = self.start_blooter(extra_args, protocol=protocol)
+        blooter = self.start_blooter(extra_args, protocol=protocol,
+                                     pairing=pairing)
         blooter.term.wait_for_text("Bluetooth hosts:")
         blooter.term.wait_for_idle()
         return blooter.term

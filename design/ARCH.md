@@ -688,9 +688,9 @@ default value commented out.
   > 0), `"on"` (always monitor), or `"off"` (§6.4).
 - **`[connection] protocol`** — `"ble"` (default, Bluetooth Low Energy / HOGP)
   or `"classic"` (BR/EDR HID). Selects the transport (§4).
-- **`[connection] pairing`** — `"auto"` (silent "Just Works") or `"confirm"`
-  (prompt on the TTY). Absent → inferred: `confirm` interactively, else `auto`
-  (CONNECTION.md §5).
+- **`[connection] pairing`** — `"accept"` (default; silent "Just Works"),
+  `"prompt_if_possible"` (prompt on the TTY when there is one, else accept) or
+  `"prompt"` (always prompt; a startup error with no TTY) (CONNECTION.md §5).
 - **`[connection] reconnect`** — an already-bonded host address
   `"AA:BB:CC:DD:EE:FF"` to initiate an outgoing connection to (CONNECTION.md
   §3.2 on Classic, §4 on BLE). Absent → accept-only unless the host menu
@@ -725,7 +725,7 @@ a warning.
 A shared BlueZ **pairing agent** is registered as the default agent for both
 transports (previously LE-only; Classic had none, so an incoming pair could
 stall) and the adapter is set pairable. Its behaviour follows `[connection]
-pairing`: auto-accept or TTY confirm (CONNECTION.md §5). In Classic mode the
+pairing`: silent accept (the default) or a TTY prompt (CONNECTION.md §5). In Classic mode the
 adapter is also made **discoverable** (its prior state restored on exit), and
 blooter prints that it is now visible, so a host can find and connect to it.
 

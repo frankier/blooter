@@ -113,6 +113,13 @@ async fn run(args: cli::Args) -> Result<(), AppError> {
     };
     let hotkeys = cfg.hotkeys;
 
+    // Resolved before anything is set up, so a `pairing = "prompt"` with no TTY
+    // to prompt on fails at startup rather than at the first bonding attempt
+    // (design/CONNECTION.md §5).
+    let interactive = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+    let pairing_mode =
+        agent::resolve_mode(cfg.pairing, interactive).map_err(|e| AppError::new(1, e))?;
+
     // How many gamepad controllers to advertise (report IDs 3, 4, …). FIFO mode
     // has no evdev gamepads, so none are advertised there.
     let n_gamepads = if args.fifo.is_some() {
@@ -198,11 +205,9 @@ async fn run(args: cli::Args) -> Result<(), AppError> {
 
     // --- Shared pairing agent (design/CONNECTION.md §5) ---
     // One agent serves both transports (HID bonding needs one; without it a
-    // Classic incoming pair stalls). Its mode is the config value, or inferred
-    // from the TTY. The handle is kept alive for the program's lifetime.
-    let interactive = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
-    let pairing_mode = agent::resolve_mode(cfg.pairing, interactive);
-    // Shared terminal-ownership coordinator: lets a confirm-mode pairing prompt
+    // Classic incoming pair stalls). Its behaviour was resolved from the config
+    // and the TTY above. The handle is kept alive for the program's lifetime.
+    // Shared terminal-ownership coordinator: lets a prompting pairing agent
     // suspend the interactive menu (which owns the terminal in raw mode) before
     // reading the reply on the TTY (design/CONNECTION.md §5/§6). A no-op when no
     // menu is running (LE, non-interactive, or after the menu resolves).
