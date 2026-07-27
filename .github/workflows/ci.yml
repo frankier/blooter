@@ -107,15 +107,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             virtme-ng qemu-system-x86 linux-image-generic \
-            dbus-daemon python3-dbus python3-dbusmock \
+            dbus-daemon python3-dbus \
             libfontconfig1-dev libdbus-1-dev libudev-dev pkg-config
+          # Not python3-dbusmock: noble ships 0.31, whose bluez5 template has no
+          # LEAdvertisingManager1, so blooter's (now default) LE transport cannot
+          # register an advertisement. Take it from PyPI instead -- it is pure
+          # Python, and run.sh forwards the --user site dir into the guest.
+          pip install --user --break-system-packages 'python-dbusmock>=0.38'
           KVER=$(ls -1 /lib/modules | grep -- -generic | sort -V | tail -1)
           sudo chmod 0644 "/boot/vmlinuz-$KVER"
           echo "VNG_KERNEL=$KVER" >> "$GITHUB_ENV"
       - name: Preflight
         run: |
           ls -l /dev/kvm; echo "guest kernel: $VNG_KERNEL"
-          python3 -c "import dbusmock; print('dbusmock', dbusmock.__file__)"
+          python3 -c "import dbusmock; print('dbusmock', dbusmock.__version__, dbusmock.__file__)"
           vng -r "$VNG_KERNEL" --user root -e /bin/uname
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

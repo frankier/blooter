@@ -29,11 +29,18 @@ not use):  sudo dnf install fontconfig-devel
 EOF
     missing=1
 fi
-if ! python3 -c "import dbusmock" 2>/dev/null; then
+# 0.38 is the floor: older bluez5 templates (e.g. Ubuntu noble's 0.31) do not
+# expose LEAdvertisingManager1, so the LE transport cannot advertise and every
+# test times out waiting for the menu.
+if ! python3 -c "
+import sys, dbusmock
+v = tuple(int(p) for p in dbusmock.__version__.split('.')[:2])
+sys.exit(0 if v >= (0, 38) else 1)
+" 2>/dev/null; then
     cat >&2 <<'EOF'
-python-dbusmock not found. It provides the mocked org.bluez.
+python-dbusmock >= 0.38 not found. It provides the mocked org.bluez.
 
-  pip install --user python-dbusmock
+  pip install --user 'python-dbusmock>=0.38'
   # or: sudo dnf install python3-dbusmock
 EOF
     missing=1
