@@ -31,7 +31,7 @@ fn uuid16(v: u16) -> Uuid {
 }
 
 use super::{Accept, DIAL_BACKOFF_MAX, DIAL_BACKOFF_START, Flow, Outbox, Step, Transport, step};
-use crate::report::{InputState, Outcome, RawEvent};
+use crate::report::{InputState, RawEvent};
 use crate::sdp::{self, GAMEPAD_REPORT_ID_BASE};
 use crate::{AppError, Ctx, Signals};
 
@@ -451,7 +451,7 @@ impl Transport for Le {
                     }
                 }
                 Some(ev) = rx.recv() => {
-                    if matches!(ctx.translate(state, ev), Outcome::Exit) {
+                    if ctx.translate_exits(state, ev) {
                         break Done::Accept(Accept::Shutdown);
                     }
                 }

@@ -590,20 +590,46 @@ All other event types (`EV_MSC`, `EV_LED`, …) are ignored.
 
 Hotkeys are configurable chords (§10); the built-in defaults are:
 
-- **Scroll Lock** — drop the current host connection (return to accepting).
-- **Ctrl + Alt + Scroll Lock** — terminate blooter cleanly (§9).
-- **Shift + Scroll Lock** — toggle input capture. While capture is off, nothing
+- **Left Ctrl, Left Alt, Right Shift** — terminate blooter cleanly (§9).
+- **Left Shift, Right Shift** — toggle input capture. While capture is off, nothing
   is forwarded (an all-keys-up report and neutral gamepad reports are sent
   first so nothing stays latched host-side), and `-x` exclusive grabs are
   released so input reaches the local session again. A new host connection
-  re-enables capture. Separate `capture_on`/`capture_off` chords exist but are
-  disabled by default.
+  re-enables capture. `drop_connection` (drop the current host connection and
+  return to accepting) and the separate `capture_on`/`capture_off` chords exist
+  but are disabled by default.
 
-A chord fires when its trigger key is **released** while the required modifiers
-are held; trigger keys are consumed locally and never forwarded. When several
-chords share a trigger, the most specific (most modifiers) wins. Dropping the
-connection first sends an all-keys-up keyboard report and neutral gamepad
-reports.
+**Order.** The **first** key a chord names must be pressed first — that is what
+starts matching the chord — after which its remaining keys may be pressed in any
+order. A chord fires the moment its last key goes **down**.
+
+**The chord buffer.** A key that starts some chord is not forwarded when it is
+pressed: it goes into the chord buffer, along with the chords it might still
+complete. Further presses that keep at least one of those alive extend the
+buffer, still forwarding nothing. Then either:
+
+- **The chord completes** — the action fires and the whole buffer is consumed.
+  Those keys are recorded as held: the host never saw them go down, so their
+  autorepeats and eventual releases are swallowed too, and nothing can stay
+  latched host-side.
+- **No chord can follow** — an unrelated key goes down, or any of the buffered
+  keys is released or repeats. The buffer is replayed: the keys held back are
+  forwarded in press order, then the event that broke the chord, so the host
+  sees the same sequence it would have without the delay. This is why
+  translating one event can yield several reports (`report::Outcomes`).
+
+So a key is only ever withheld while it might still be part of a chord, and only
+from the moment it is pressed until the next key event. A key that starts no
+chord — Right Shift under the defaults — is forwarded immediately, as usual.
+Pointer motion, mouse buttons, touch and gamepad events never take part in
+chords and leave a buffered prefix alone.
+
+When several chords complete at once the longest wins (ties go to config order).
+A chord whose keys are a subset of another's therefore shadows the longer one:
+it fires first, so the longer chord can never be reached.
+
+Dropping the connection first sends an all-keys-up keyboard report and neutral
+gamepad reports.
 
 ### 7.4 Key mapping (Linux keycode → HID usage)
 
@@ -618,15 +644,16 @@ range (Keyboard/Keypad page, usages 4–99):
 | `KEY_MINUS`, `KEY_EQUAL`, `KEY_LEFTBRACE`, `KEY_RIGHTBRACE`, `KEY_BACKSLASH`, `KEY_102ND` | 45, 46, 47, 48, 49, 50 |
 | `KEY_SEMICOLON`, `KEY_APOSTROPHE`, `KEY_GRAVE`, `KEY_COMMA`, `KEY_DOT`, `KEY_SLASH`, `KEY_CAPSLOCK` | 51, 52, 53, 54, 55, 56, 57 |
 | `KEY_F1` … `KEY_F12` | 58 … 69 |
-| `KEY_SYSRQ` (PrintScreen), `KEY_PAUSE` | 70, 72 *(71 = Scroll Lock, the default hotkey trigger)* |
+| `KEY_SYSRQ` (PrintScreen), `KEY_SCROLLLOCK`, `KEY_PAUSE` | 70, 71, 72 |
 | `KEY_INSERT`, `KEY_HOME`, `KEY_PAGEUP`, `KEY_DELETE`, `KEY_END`, `KEY_PAGEDOWN` | 73, 74, 75, 76, 77, 78 |
 | `KEY_RIGHT`, `KEY_LEFT`, `KEY_DOWN`, `KEY_UP` | 79, 80, 81, 82 |
 | `KEY_NUMLOCK`, `KEY_KPSLASH`, `KEY_KPASTERISK`, `KEY_KPMINUS`, `KEY_KPPLUS`, `KEY_KPENTER` | 83, 84, 85, 86, 87, 88 |
 | `KEY_KP1` … `KEY_KP9`, `KEY_KP0`, `KEY_KPDOT` | 89 … 97, 98, 99 |
 
 Everything else (media keys, `KEY_MENU`, …) is unmapped/ignored, matching the
-usage range 0–0x65 declared in the report descriptor. A hotkey trigger is never
-forwarded regardless of its mapping.
+usage range 0–0x65 declared in the report descriptor. A key taking part in a
+chord is mapped no differently; whether it reaches the host is decided earlier,
+by the chord buffer (§7.3).
 
 ### 7.5 Gamepad events
 
@@ -690,8 +717,9 @@ default value commented out.
 
 - **`[hotkeys]`** — `drop_connection`, `exit`, `capture_toggle`, `capture_on`,
   `capture_off`. Each value is a chord: zero or more modifiers plus a final
-  trigger key, joined with `+` (e.g. `"leftcontrol+leftalt+scrolllock"`), fired
-  when the trigger is released while the modifiers are held. Key names follow
+  trigger key, joined with `+` (e.g. `"leftcontrol+leftalt+rightshift"`). The
+  first key listed must be pressed first; the rest follow in any order, and the
+  chord fires on the last keydown (§7.3). Key names follow
   [keyd](https://github.com/rvaiya/keyd) (`scrolllock`, `pause`, `f12`,
   `kpenter`, `leftmeta`, …); the side-agnostic aliases `control`/`ctrl`,
   `shift`, `alt`, `meta`/`super` match either side. `""` disables a hotkey.

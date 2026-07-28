@@ -1,7 +1,7 @@
 //! Session input state and translation of Linux input events into HID Boot
 //! input reports. See design/ARCH.md §5 and §7.
 
-use crate::config::{Action, AxisBits, Hotkeys, Overflow};
+use crate::config::{Action, AxisBits, Chord, Hotkeys, MAX_CHORD_KEYS, Overflow};
 use crate::keymap;
 
 // Linux event types (from <linux/input-event-codes.h>).
@@ -152,6 +152,86 @@ impl MouseAccum {
     }
 }
 
+/// A fixed-capacity set of keycodes in press order: the chord keys currently
+/// held back, or those a fired chord consumed. Chords are capped at
+/// [`MAX_CHORD_KEYS`] keys, so this never overflows and never allocates.
+#[derive(Clone, Copy, Default)]
+struct KeyVec {
+    keys: [u16; MAX_CHORD_KEYS],
+    len: u8,
+}
+
+impl KeyVec {
+    fn as_slice(&self) -> &[u16] {
+        &self.keys[..self.len as usize]
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn contains(&self, code: u16) -> bool {
+        self.as_slice().contains(&code)
+    }
+
+    fn push(&mut self, code: u16) {
+        if (self.len as usize) < MAX_CHORD_KEYS {
+            self.keys[self.len as usize] = code;
+            self.len += 1;
+        }
+    }
+
+    fn remove(&mut self, code: u16) {
+        if let Some(i) = self.as_slice().iter().position(|k| *k == code) {
+            self.keys.copy_within(i + 1..self.len as usize, i);
+            self.len -= 1;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+}
+
+/// A chord still consistent with what has been pressed: its index in
+/// `Hotkeys::chords`, and a bit per step already satisfied.
+#[derive(Clone, Copy, Default)]
+struct Cand {
+    chord: u8,
+    matched: u8,
+}
+
+/// Keys held back because they may yet complete a chord, plus the chords they
+/// can still complete (design/ARCH.md §7.3). Empty when no chord is in progress.
+#[derive(Clone, Copy, Default)]
+struct ChordBuf {
+    keys: KeyVec,
+    cands: [Cand; crate::config::MAX_CHORDS],
+    n_cands: u8,
+}
+
+impl ChordBuf {
+    fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.keys.clear();
+        self.n_cands = 0;
+    }
+
+    fn cands(&self) -> &[Cand] {
+        &self.cands[..self.n_cands as usize]
+    }
+
+    fn push_cand(&mut self, chord: u8, matched: u8) {
+        if (self.n_cands as usize) < self.cands.len() {
+            self.cands[self.n_cands as usize] = Cand { chord, matched };
+            self.n_cands += 1;
+        }
+    }
+}
+
 /// The per-session state, reset on every new host connection (design/ARCH.md §7).
 pub struct InputState {
     pub mouse_buttons: u8,
@@ -160,6 +240,12 @@ pub struct InputState {
     /// Whether input is currently forwarded to the host. Key/button state is
     /// still tracked while off, so hotkey chords keep working.
     pub capture: bool,
+    /// Keys held back while they might still complete a chord (§7.3).
+    chord: ChordBuf,
+    /// Keys a fired chord consumed. Their downs were never forwarded, so their
+    /// autorepeats and release are swallowed too: the host must not see a
+    /// key-up it has no matching key-down for.
+    chord_held: KeyVec,
     /// Touchpad state: finger down (BTN_TOUCH), and the last absolute
     /// position per axis, from which relative motion is derived.
     touching: bool,
@@ -191,6 +277,8 @@ impl InputState {
             modifiers: 0,
             pressed_keys: [0; 8],
             capture: true,
+            chord: ChordBuf::default(),
+            chord_held: KeyVec::default(),
             touching: false,
             last_abs: [None; 2],
             gamepads: vec![GamepadState::neutral(); n_gamepads].into_boxed_slice(),
@@ -248,6 +336,7 @@ impl InputState {
 }
 
 /// Result of translating one event.
+#[derive(Clone, Copy)]
 pub enum Outcome {
     /// Nothing to send.
     Nothing,
@@ -269,12 +358,68 @@ pub enum Outcome {
     CaptureOff,
 }
 
+/// The outcomes of translating one event, in the order they must be sent. More
+/// than one arises when a broken chord prefix is replayed: the keys held back
+/// are forwarded in press order, then the event that broke the chord (§7.3).
+#[derive(Clone, Copy)]
+pub struct Outcomes {
+    buf: [Outcome; MAX_CHORD_KEYS + 1],
+    len: usize,
+}
+
+impl Default for Outcomes {
+    fn default() -> Self {
+        Self {
+            buf: [Outcome::Nothing; MAX_CHORD_KEYS + 1],
+            len: 0,
+        }
+    }
+}
+
+impl Outcomes {
+    /// Queue an outcome. `Nothing` is dropped, so callers can push the result
+    /// of a translation step without checking it first.
+    fn push(&mut self, out: Outcome) {
+        if matches!(out, Outcome::Nothing) {
+            return;
+        }
+        debug_assert!(self.len < self.buf.len(), "outcome buffer overflow");
+        if self.len < self.buf.len() {
+            self.buf[self.len] = out;
+            self.len += 1;
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The `i`th queued outcome (`Nothing` past the end).
+    pub fn get(&self, i: usize) -> Outcome {
+        if i < self.len {
+            self.buf[i]
+        } else {
+            Outcome::Nothing
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Outcome> {
+        self.buf[..self.len].iter()
+    }
+}
+
 impl InputState {
     pub fn reset(&mut self) {
         self.mouse_buttons = 0;
         self.modifiers = 0;
         self.pressed_keys = [0; 8];
         self.capture = true;
+        self.chord.clear();
+        self.chord_held.clear();
         self.touching = false;
         self.last_abs = [None; 2];
         self.accum = MouseAccum::default();
@@ -350,26 +495,27 @@ impl InputState {
     }
 }
 
-/// Translate one raw input event, updating `state`. Returns the report (if any)
-/// to transmit, or a hotkey action.
-pub fn translate(hotkeys: &Hotkeys, state: &mut InputState, ev: RawEvent) -> Outcome {
+/// Translate one raw input event, updating `state` and queuing what to transmit
+/// (or the hotkey action that fired) in `out`, which is cleared first.
+pub fn translate(hotkeys: &Hotkeys, state: &mut InputState, ev: RawEvent, out: &mut Outcomes) {
+    out.clear();
     // Frame boundaries are checked ahead of the gamepad dispatch: every device
     // shares one channel, and a SYN from any of them is a valid flush point.
     if ev.type_ == EV_SYN {
-        return if ev.code == SYN_REPORT {
-            Outcome::Sync
-        } else {
-            Outcome::Nothing
-        };
+        if ev.code == SYN_REPORT {
+            out.push(Outcome::Sync);
+        }
+        return;
     }
     if let Some(slot) = ev.gamepad {
-        return translate_gamepad(state, slot, ev.type_, ev.code, ev.value);
+        out.push(translate_gamepad(state, slot, ev.type_, ev.code, ev.value));
+        return;
     }
     match ev.type_ {
-        EV_KEY => translate_key(hotkeys, state, ev.code, ev.value),
-        EV_REL => translate_rel(state, ev.code, ev.value),
-        EV_ABS => translate_abs(state, ev.code, ev.value),
-        _ => Outcome::Nothing,
+        EV_KEY => translate_key(hotkeys, state, ev.code, ev.value, out),
+        EV_REL => out.push(translate_rel(state, ev.code, ev.value)),
+        EV_ABS => out.push(translate_abs(state, ev.code, ev.value)),
+        _ => {}
     }
 }
 
@@ -423,7 +569,186 @@ fn translate_gamepad(
     }
 }
 
-fn translate_key(hotkeys: &Hotkeys, state: &mut InputState, code: u16, value: i32) -> Outcome {
+fn translate_key(
+    hotkeys: &Hotkeys,
+    state: &mut InputState,
+    code: u16,
+    value: i32,
+    out: &mut Outcomes,
+) {
+    use keymap::*;
+    match code {
+        BTN_LEFT | BTN_RIGHT | BTN_MIDDLE | BTN_TOUCH => {
+            out.push(translate_mouse_key(state, code, value));
+            return;
+        }
+        _ => {}
+    }
+    // Keys a fired chord consumed: swallow everything until they are released,
+    // since the host never saw them go down.
+    if state.chord_held.contains(code) {
+        if value != 1 {
+            if value == 0 {
+                state.chord_held.remove(code);
+            }
+            return;
+        }
+        state.chord_held.remove(code);
+    }
+    if !state.chord.is_empty() {
+        // A press that keeps some chord alive extends the buffer; a chord that
+        // completes fires and consumes every key it swallowed. Anything else —
+        // an unrelated press, or any release or autorepeat — settles it: no
+        // chord is coming, so replay what was held back, in press order.
+        if value == 1 && chord_advance(hotkeys, state, code) {
+            if let Some(action) = chord_fire(hotkeys, state) {
+                state.chord_held.push(code);
+                out.push(apply_action(state, action));
+            }
+            return;
+        }
+        chord_replay(state, out);
+    }
+    // A key that starts some chord is held back rather than forwarded; a
+    // single-key chord is complete at once.
+    if value == 1 && chord_open(hotkeys, state, code) {
+        if let Some(action) = chord_fire(hotkeys, state) {
+            out.push(apply_action(state, action));
+        }
+        return;
+    }
+    out.push(plain_key(state, code, value));
+}
+
+/// Open a chord buffer on `code` if it starts any chord. `false` if none does,
+/// leaving the buffer untouched and the key to be forwarded as usual.
+fn chord_open(hotkeys: &Hotkeys, state: &mut InputState, code: u16) -> bool {
+    if !hotkeys.starts(code) {
+        return false;
+    }
+    for (i, chord) in hotkeys.chords().iter().enumerate() {
+        if chord.steps[0].matches(code) {
+            state.chord.push_cand(i as u8, 1);
+        }
+    }
+    state.chord.keys.push(code);
+    true
+}
+
+/// Fold a further press into the live buffer, dropping the candidates it rules
+/// out. `false` if no candidate accepts `code`, i.e. the chord is broken.
+fn chord_advance(hotkeys: &Hotkeys, state: &mut InputState, code: u16) -> bool {
+    let mut kept = 0;
+    for i in 0..state.chord.n_cands as usize {
+        let cand = state.chord.cands[i];
+        let steps = &hotkeys.chords()[cand.chord as usize].steps;
+        // Only the first key of a chord is ordered; the rest may arrive in any
+        // order, so any not-yet-matched step will do.
+        let Some(step) = (1..steps.len())
+            .find(|&s| cand.matched & (1 << s) == 0 && steps[s].matches(code))
+        else {
+            continue;
+        };
+        state.chord.cands[kept] = Cand {
+            chord: cand.chord,
+            matched: cand.matched | (1 << step),
+        };
+        kept += 1;
+    }
+    state.chord.n_cands = kept as u8;
+    if kept > 0 {
+        state.chord.keys.push(code);
+    }
+    kept > 0
+}
+
+/// The action of the completed chord, if the buffer now satisfies one. The
+/// longest match wins (ties go to config order), and firing consumes the whole
+/// buffer: its keys move to `chord_held` so their releases stay local.
+fn chord_fire(hotkeys: &Hotkeys, state: &mut InputState) -> Option<Action> {
+    let chords = hotkeys.chords();
+    let complete = |c: &Cand| -> Option<&Chord> {
+        let chord = &chords[c.chord as usize];
+        let all = (1u8 << chord.steps.len()) - 1;
+        (c.matched == all).then_some(chord)
+    };
+    let action = state
+        .chord
+        .cands()
+        .iter()
+        .filter_map(complete)
+        .max_by_key(|chord| chord.steps.len())?
+        .action;
+    for &code in state.chord.keys.as_slice() {
+        state.chord_held.push(code);
+    }
+    state.chord.clear();
+    Some(action)
+}
+
+/// Give up on the buffered prefix: forward the keys held back, in press order,
+/// as if they had never been delayed.
+fn chord_replay(state: &mut InputState, out: &mut Outcomes) {
+    let keys = state.chord.keys;
+    state.chord.clear();
+    for &code in keys.as_slice() {
+        out.push(plain_key(state, code, 1));
+    }
+}
+
+/// Apply a fired hotkey to the session state and report what it did.
+fn apply_action(state: &mut InputState, action: Action) -> Outcome {
+    match action {
+        Action::Exit => Outcome::Exit,
+        Action::DropConnection => Outcome::DropSession,
+        Action::CaptureOn => {
+            state.capture = true;
+            Outcome::CaptureOn
+        }
+        Action::CaptureOff => {
+            state.capture = false;
+            Outcome::CaptureOff
+        }
+        Action::CaptureToggle => {
+            state.capture = !state.capture;
+            if state.capture {
+                Outcome::CaptureOn
+            } else {
+                Outcome::CaptureOff
+            }
+        }
+    }
+}
+
+/// Track a key that is not part of any chord in progress and, while capturing,
+/// emit the resulting keyboard report.
+fn plain_key(state: &mut InputState, code: u16, value: i32) -> Outcome {
+    use keymap::*;
+    if let Some(bit) = modifier_bit(code) {
+        if value >= 1 {
+            state.modifiers |= 1 << bit;
+        } else {
+            state.modifiers &= !(1 << bit);
+        }
+    } else if let Some(usage) = hid_usage(code) {
+        match value {
+            1 => state.press(usage),
+            0 => state.release(usage),
+            _ => {} // autorepeat (value 2): no list change, still report
+        }
+    } else {
+        return Outcome::Nothing;
+    }
+    if state.capture {
+        Outcome::Keyboard(state.keyboard_report())
+    } else {
+        Outcome::Nothing
+    }
+}
+
+/// Mouse buttons and touchpad contact. Neither takes part in chords, so they
+/// never disturb a buffered prefix.
+fn translate_mouse_key(state: &mut InputState, code: u16, value: i32) -> Outcome {
     use keymap::*;
     match code {
         BTN_LEFT | BTN_RIGHT | BTN_MIDDLE => {
@@ -445,60 +770,10 @@ fn translate_key(hotkeys: &Hotkeys, state: &mut InputState, code: u16, value: i3
             }
             Outcome::Nothing
         }
-        BTN_TOUCH => {
+        _ => {
             state.touching = value != 0;
             state.last_abs = [None; 2];
             Outcome::Nothing
-        }
-        // Hotkey trigger keys are consumed locally, never forwarded, and act
-        // only on release (value 0).
-        _ if hotkeys.is_trigger(code) => {
-            if value != 0 {
-                return Outcome::Nothing;
-            }
-            match hotkeys.action(code, state.modifiers) {
-                Some(Action::Exit) => Outcome::Exit,
-                Some(Action::DropConnection) => Outcome::DropSession,
-                Some(Action::CaptureOn) => {
-                    state.capture = true;
-                    Outcome::CaptureOn
-                }
-                Some(Action::CaptureOff) => {
-                    state.capture = false;
-                    Outcome::CaptureOff
-                }
-                Some(Action::CaptureToggle) => {
-                    state.capture = !state.capture;
-                    if state.capture {
-                        Outcome::CaptureOn
-                    } else {
-                        Outcome::CaptureOff
-                    }
-                }
-                None => Outcome::Nothing,
-            }
-        }
-        _ => {
-            if let Some(bit) = modifier_bit(code) {
-                if value >= 1 {
-                    state.modifiers |= 1 << bit;
-                } else {
-                    state.modifiers &= !(1 << bit);
-                }
-            } else if let Some(usage) = hid_usage(code) {
-                match value {
-                    1 => state.press(usage),
-                    0 => state.release(usage),
-                    _ => {} // autorepeat (value 2): no list change, still report
-                }
-            } else {
-                return Outcome::Nothing;
-            }
-            if state.capture {
-                Outcome::Keyboard(state.keyboard_report())
-            } else {
-                Outcome::Nothing
-            }
         }
     }
 }
@@ -582,20 +857,43 @@ mod tests {
         }
     }
 
+    /// Translate one event and collect everything it produced, in order. Most
+    /// events yield one outcome; a broken chord prefix yields several.
+    fn tr(hk: &Hotkeys, s: &mut InputState, ev: RawEvent) -> Vec<Outcome> {
+        let mut out = Outcomes::default();
+        translate(hk, s, ev, &mut out);
+        out.iter().copied().collect()
+    }
+
+    /// The single outcome of an event, or `Nothing` if it produced none.
+    fn one(hk: &Hotkeys, s: &mut InputState, ev: RawEvent) -> Outcome {
+        let outs = tr(hk, s, ev);
+        assert!(outs.len() <= 1, "expected at most one outcome");
+        outs.first().copied().unwrap_or(Outcome::Nothing)
+    }
+
+    /// The modifier byte of a keyboard outcome.
+    fn mods(out: &Outcome) -> u8 {
+        match out {
+            Outcome::Keyboard(r) => r[2],
+            _ => panic!("expected a keyboard report"),
+        }
+    }
+
     #[test]
     fn press_release_key() {
         let hk = Hotkeys::default();
         let mut s = InputState::default();
         // Press 'a' → usage 4 in slot 0.
-        match translate(&hk, &mut s, key(keymap::KEY_A, 1)) {
+        match one(&hk, &mut s, key(keymap::KEY_A, 1)) {
             Outcome::Keyboard(r) => assert_eq!(&r[..5], &[0xA1, 0x02, 0x00, 4, 0]),
             _ => panic!(),
         }
         // Press 'b' → usage 5 appended.
-        translate(&hk, &mut s, key(keymap::KEY_B, 1));
+        tr(&hk, &mut s, key(keymap::KEY_B, 1));
         assert_eq!(&s.pressed_keys[..2], &[4, 5]);
         // Release 'a' → shift left.
-        translate(&hk, &mut s, key(keymap::KEY_A, 0));
+        tr(&hk, &mut s, key(keymap::KEY_A, 0));
         assert_eq!(&s.pressed_keys[..2], &[5, 0]);
     }
 
@@ -603,28 +901,107 @@ mod tests {
     fn autorepeat_no_change() {
         let hk = Hotkeys::default();
         let mut s = InputState::default();
-        translate(&hk, &mut s, key(keymap::KEY_A, 1));
-        translate(&hk, &mut s, key(keymap::KEY_A, 2));
+        tr(&hk, &mut s, key(keymap::KEY_A, 1));
+        tr(&hk, &mut s, key(keymap::KEY_A, 2));
         assert_eq!(&s.pressed_keys[..2], &[4, 0]);
     }
 
+    /// Right Shift completes the default chords but starts none of them, so it
+    /// is forwarded like any other modifier — the host must see it.
     #[test]
-    fn modifiers_and_hotkeys() {
+    fn bare_trigger_key_is_forwarded() {
         let hk = Hotkeys::default();
         let mut s = InputState::default();
-        translate(&hk, &mut s, key(keymap::KEY_LEFTCTRL, 1));
-        translate(&hk, &mut s, key(keymap::KEY_LEFTALT, 1));
-        assert_eq!(s.modifiers, 0x05);
-        // Ctrl+Alt held → Right Shift release exits.
+        assert_eq!(mods(&one(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 1))), 0x20);
+        // Shifted letter reaches the host with the modifier set.
+        assert_eq!(
+            mods(&one(&hk, &mut s, key(keymap::KEY_A, 1))),
+            0x20,
+            "Right Shift + 'a' must arrive shifted"
+        );
+        tr(&hk, &mut s, key(keymap::KEY_A, 0));
+        assert_eq!(mods(&one(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 0))), 0x00);
+    }
+
+    /// A chord prefix is held back, then replayed in press order once it is
+    /// clear no chord is coming.
+    #[test]
+    fn broken_prefix_is_replayed_in_order() {
+        let hk = Hotkeys::default();
+        let mut s = InputState::default();
+        // Left Shift starts the capture toggle: nothing goes out yet.
+        assert!(tr(&hk, &mut s, key(keymap::KEY_LEFTSHIFT, 1)).is_empty());
+        assert_eq!(s.modifiers, 0x00);
+        // 'a' cannot continue it: the shift is replayed, then 'a' follows.
+        let outs = tr(&hk, &mut s, key(keymap::KEY_A, 1));
+        assert_eq!(outs.len(), 2);
+        assert_eq!(mods(&outs[0]), 0x02);
+        match outs[1] {
+            Outcome::Keyboard(r) => assert_eq!(&r[..5], &[0xA1, 0x02, 0x02, 4, 0]),
+            _ => panic!("expected the shifted 'a'"),
+        }
+        // Releasing a lone prefix key replays it too, then releases it.
+        s.reset();
+        assert!(tr(&hk, &mut s, key(keymap::KEY_LEFTCTRL, 1)).is_empty());
+        let outs = tr(&hk, &mut s, key(keymap::KEY_LEFTCTRL, 0));
+        assert_eq!(outs.len(), 2);
+        assert_eq!(mods(&outs[0]), 0x01);
+        assert_eq!(mods(&outs[1]), 0x00);
+        assert_eq!(s.modifiers, 0x00);
+    }
+
+    /// Only the first key of a chord is ordered; the rest may come in any order.
+    #[test]
+    fn rest_of_chord_is_unordered() {
+        let hk = Hotkeys::default();
+        let mut s = InputState::default();
+        // Left Ctrl first, then Right Shift before Left Alt.
+        assert!(tr(&hk, &mut s, key(keymap::KEY_LEFTCTRL, 1)).is_empty());
+        assert!(tr(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 1)).is_empty());
         assert!(matches!(
-            translate(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 0)),
+            one(&hk, &mut s, key(keymap::KEY_LEFTALT, 1)),
             Outcome::Exit
         ));
-        // Without both modifiers → nothing (drop_connection disabled by default).
+        // Starting with a key that is not first, though, forwards it: Right
+        // Shift then Left Shift is not the capture toggle.
         s.reset();
+        assert_eq!(mods(&one(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 1))), 0x20);
+        assert!(tr(&hk, &mut s, key(keymap::KEY_LEFTSHIFT, 1)).is_empty());
+        let outs = tr(&hk, &mut s, key(keymap::KEY_LEFTSHIFT, 0));
+        assert_eq!(outs.len(), 2);
+        assert_eq!(mods(&outs[0]), 0x22);
+        assert_eq!(mods(&outs[1]), 0x20);
+    }
+
+    /// A fired chord forwards none of its keys, and swallows their releases so
+    /// the host is never left with a stuck modifier.
+    #[test]
+    fn fired_chord_forwards_nothing() {
+        let hk = Hotkeys::default();
+        let mut s = InputState::default();
+        assert!(tr(&hk, &mut s, key(keymap::KEY_LEFTSHIFT, 1)).is_empty());
         assert!(matches!(
-            translate(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 0)),
-            Outcome::Nothing
+            one(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 1)),
+            Outcome::CaptureOff
+        ));
+        assert!(tr(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 0)).is_empty());
+        assert!(tr(&hk, &mut s, key(keymap::KEY_LEFTSHIFT, 0)).is_empty());
+        assert_eq!(s.modifiers, 0x00);
+        // Once released, those keys forward normally again.
+        s.capture = true;
+        assert_eq!(mods(&one(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 1))), 0x20);
+    }
+
+    /// Pointer activity passes through without disturbing a buffered prefix.
+    #[test]
+    fn motion_leaves_the_buffer_alone() {
+        let hk = Hotkeys::default();
+        let mut s = InputState::default();
+        assert!(tr(&hk, &mut s, key(keymap::KEY_LEFTSHIFT, 1)).is_empty());
+        tr(&hk, &mut s, rel(keymap::REL_X, 5));
+        assert!(matches!(
+            one(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 1)),
+            Outcome::CaptureOff
         ));
     }
 
@@ -632,40 +1009,39 @@ mod tests {
     fn capture_toggle() {
         let hk = Hotkeys::default();
         let mut s = InputState::default();
-        // Shift+Right Shift → capture off.
-        translate(&hk, &mut s, key(keymap::KEY_LEFTSHIFT, 1));
+        // Left Shift then Right Shift → capture off.
+        tr(&hk, &mut s, key(keymap::KEY_LEFTSHIFT, 1));
         assert!(matches!(
-            translate(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 0)),
+            one(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 1)),
             Outcome::CaptureOff
         ));
-        translate(&hk, &mut s, key(keymap::KEY_LEFTSHIFT, 0));
+        tr(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 0));
+        tr(&hk, &mut s, key(keymap::KEY_LEFTSHIFT, 0));
         assert!(!s.capture);
         // While off: keys and motion are tracked but not forwarded.
         assert!(matches!(
-            translate(&hk, &mut s, key(keymap::KEY_A, 1)),
+            one(&hk, &mut s, key(keymap::KEY_A, 1)),
             Outcome::Nothing
         ));
         assert_eq!(s.pressed_keys[0], 4);
-        let rel = RawEvent {
-            type_: EV_REL,
-            code: keymap::REL_X,
-            value: 5,
-            gamepad: None,
-        };
-        assert!(matches!(translate(&hk, &mut s, rel), Outcome::Nothing));
-        // Exit hotkey still works while off.
-        translate(&hk, &mut s, key(keymap::KEY_LEFTCTRL, 1));
-        translate(&hk, &mut s, key(keymap::KEY_LEFTALT, 1));
         assert!(matches!(
-            translate(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 0)),
+            one(&hk, &mut s, rel(keymap::REL_X, 5)),
+            Outcome::Nothing
+        ));
+        // Exit hotkey still works while off.
+        tr(&hk, &mut s, key(keymap::KEY_LEFTCTRL, 1));
+        tr(&hk, &mut s, key(keymap::KEY_LEFTALT, 1));
+        assert!(matches!(
+            one(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 1)),
             Outcome::Exit
         ));
-        translate(&hk, &mut s, key(keymap::KEY_LEFTCTRL, 0));
-        translate(&hk, &mut s, key(keymap::KEY_LEFTALT, 0));
-        // Shift+Right Shift again → capture back on.
-        translate(&hk, &mut s, key(keymap::KEY_LEFTSHIFT, 1));
+        tr(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 0));
+        tr(&hk, &mut s, key(keymap::KEY_LEFTCTRL, 0));
+        tr(&hk, &mut s, key(keymap::KEY_LEFTALT, 0));
+        // Left Shift then Right Shift again → capture back on.
+        tr(&hk, &mut s, key(keymap::KEY_LEFTSHIFT, 1));
         assert!(matches!(
-            translate(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 0)),
+            one(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 1)),
             Outcome::CaptureOn
         ));
         assert!(s.capture);
@@ -683,39 +1059,39 @@ mod tests {
         };
         // Motion without a finger down is ignored.
         assert!(matches!(
-            translate(&hk, &mut s, abs(keymap::ABS_X, 500)),
+            one(&hk, &mut s, abs(keymap::ABS_X, 500)),
             Outcome::Nothing
         ));
         // Finger down: first position only seeds the reference.
-        translate(&hk, &mut s, key(keymap::BTN_TOUCH, 1));
+        one(&hk, &mut s, key(keymap::BTN_TOUCH, 1));
         assert!(matches!(
-            translate(&hk, &mut s, abs(keymap::ABS_X, 1000)),
+            one(&hk, &mut s, abs(keymap::ABS_X, 1000)),
             Outcome::Nothing
         ));
         assert!(matches!(
-            translate(&hk, &mut s, abs(keymap::ABS_Y, 800)),
+            one(&hk, &mut s, abs(keymap::ABS_Y, 800)),
             Outcome::Nothing
         ));
         // Subsequent positions accumulate relative motion; both axes of the
         // frame land in the one report the SYN drains.
         assert!(matches!(
-            translate(&hk, &mut s, abs(keymap::ABS_X, 1010)),
+            one(&hk, &mut s, abs(keymap::ABS_X, 1010)),
             Outcome::Nothing
         ));
         assert!(matches!(
-            translate(&hk, &mut s, abs(keymap::ABS_Y, 795)),
+            one(&hk, &mut s, abs(keymap::ABS_Y, 795)),
             Outcome::Nothing
         ));
-        assert!(matches!(translate(&hk, &mut s, syn()), Outcome::Sync));
+        assert!(matches!(one(&hk, &mut s, syn()), Outcome::Sync));
         assert_eq!(
             s.take_mouse_frame().unwrap().as_slice(),
             [0xA1, 0x01, 0x00, 10, -5i8 as u8, 0]
         );
         assert!(s.take_mouse_frame().is_none());
         // Lifting resets the reference: no jump on the next touch.
-        translate(&hk, &mut s, key(keymap::BTN_TOUCH, 0));
-        translate(&hk, &mut s, key(keymap::BTN_TOUCH, 1));
-        translate(&hk, &mut s, abs(keymap::ABS_X, 2000));
+        one(&hk, &mut s, key(keymap::BTN_TOUCH, 0));
+        one(&hk, &mut s, key(keymap::BTN_TOUCH, 1));
+        one(&hk, &mut s, abs(keymap::ABS_X, 2000));
         assert!(!s.mouse_pending());
     }
 
@@ -726,14 +1102,14 @@ mod tests {
         let hk = Hotkeys::default();
         let mut s = InputState::default();
         assert!(matches!(
-            translate(&hk, &mut s, rel(keymap::REL_X, 3)),
+            one(&hk, &mut s, rel(keymap::REL_X, 3)),
             Outcome::Nothing
         ));
         assert!(matches!(
-            translate(&hk, &mut s, rel(keymap::REL_Y, -4)),
+            one(&hk, &mut s, rel(keymap::REL_Y, -4)),
             Outcome::Nothing
         ));
-        assert!(matches!(translate(&hk, &mut s, syn()), Outcome::Sync));
+        assert!(matches!(one(&hk, &mut s, syn()), Outcome::Sync));
         assert_eq!(
             s.take_mouse_frame().unwrap().as_slice(),
             [0xA1, 0x01, 0x00, 3, -4i8 as u8, 0]
@@ -747,8 +1123,8 @@ mod tests {
     fn mouse_rel_saturates_a_report_at_a_time() {
         let hk = Hotkeys::default();
         let mut s = InputState::default();
-        translate(&hk, &mut s, rel(keymap::REL_X, 300));
-        translate(&hk, &mut s, syn());
+        one(&hk, &mut s, rel(keymap::REL_X, 300));
+        one(&hk, &mut s, syn());
         assert_eq!(
             s.take_mouse_frame().unwrap().as_slice(),
             [0xA1, 0x01, 0x00, 127, 0, 0]
@@ -769,9 +1145,9 @@ mod tests {
     fn mouse_rel_16_bit() {
         let hk = Hotkeys::default();
         let mut s = InputState::default().with_pointer(AxisBits::Sixteen, Overflow::Burst);
-        translate(&hk, &mut s, rel(keymap::REL_X, 300));
-        translate(&hk, &mut s, rel(keymap::REL_Y, -300));
-        translate(&hk, &mut s, syn());
+        one(&hk, &mut s, rel(keymap::REL_X, 300));
+        one(&hk, &mut s, rel(keymap::REL_Y, -300));
+        one(&hk, &mut s, syn());
         assert_eq!(
             s.take_mouse_frame().unwrap().as_slice(),
             [0xA1, 0x01, 0x00, 0x2C, 0x01, 0xD4, 0xFE, 0]
@@ -785,19 +1161,19 @@ mod tests {
     fn button_change_joins_the_frame() {
         let hk = Hotkeys::default();
         let mut s = InputState::default();
-        translate(&hk, &mut s, rel(keymap::REL_X, 2));
+        one(&hk, &mut s, rel(keymap::REL_X, 2));
         assert!(matches!(
-            translate(&hk, &mut s, key(keymap::BTN_LEFT, 1)),
+            one(&hk, &mut s, key(keymap::BTN_LEFT, 1)),
             Outcome::Nothing
         ));
-        translate(&hk, &mut s, syn());
+        one(&hk, &mut s, syn());
         assert_eq!(
             s.take_mouse_frame().unwrap().as_slice(),
             [0xA1, 0x01, 0x01, 2, 0, 0]
         );
         // Release with no motion: still a report, so the host sees the button up.
-        translate(&hk, &mut s, key(keymap::BTN_LEFT, 0));
-        translate(&hk, &mut s, syn());
+        one(&hk, &mut s, key(keymap::BTN_LEFT, 0));
+        one(&hk, &mut s, syn());
         assert_eq!(
             s.take_mouse_frame().unwrap().as_slice(),
             [0xA1, 0x01, 0x00, 0, 0, 0]
@@ -810,12 +1186,12 @@ mod tests {
     fn pending_motion_is_discarded_on_reset() {
         let hk = Hotkeys::default();
         let mut s = InputState::default();
-        translate(&hk, &mut s, rel(keymap::REL_X, 40));
+        one(&hk, &mut s, rel(keymap::REL_X, 40));
         assert!(s.mouse_pending());
         s.clear_mouse();
         assert!(!s.mouse_pending());
 
-        translate(&hk, &mut s, rel(keymap::REL_X, 40));
+        one(&hk, &mut s, rel(keymap::REL_X, 40));
         s.reset();
         assert!(!s.mouse_pending());
     }
@@ -828,8 +1204,8 @@ mod tests {
             capture: false,
             ..Default::default()
         };
-        translate(&hk, &mut s, rel(keymap::REL_X, 40));
-        translate(&hk, &mut s, syn());
+        one(&hk, &mut s, rel(keymap::REL_X, 40));
+        one(&hk, &mut s, syn());
         assert!(!s.mouse_pending());
     }
 
@@ -848,7 +1224,7 @@ mod tests {
             keymap::KEY_H,
             keymap::KEY_I, // 9th, should be dropped
         ] {
-            translate(&hk, &mut s, key(code, 1));
+            one(&hk, &mut s, key(code, 1));
         }
         assert_eq!(s.pressed_keys, [4, 5, 6, 7, 8, 9, 10, 11]);
     }
@@ -867,7 +1243,7 @@ mod tests {
         let hk = Hotkeys::default();
         let mut s = InputState::with_gamepads(2);
         // Press BTN_SOUTH (bit 0) on slot 0 → report ID 3, buttons_lo bit 0.
-        match translate(&hk, &mut s, gp(0, EV_KEY, keymap::BTN_SOUTH, 1)) {
+        match one(&hk, &mut s, gp(0, EV_KEY, keymap::BTN_SOUTH, 1)) {
             // [header, id, b_lo, b_hi, hat, lx, ly, rx, ry, lt, rt]
             Outcome::Gamepad(r) => {
                 assert_eq!(r[..5], [0xA1, 0x03, 0x01, 0x00, 8]);
@@ -877,17 +1253,17 @@ mod tests {
             _ => panic!(),
         }
         // Left stick X (already normalized) on slot 0.
-        match translate(&hk, &mut s, gp(0, EV_ABS, keymap::ABS_X, 200)) {
+        match one(&hk, &mut s, gp(0, EV_ABS, keymap::ABS_X, 200)) {
             Outcome::Gamepad(r) => assert_eq!(r[5], 200),
             _ => panic!(),
         }
         // Release the button.
-        match translate(&hk, &mut s, gp(0, EV_KEY, keymap::BTN_SOUTH, 0)) {
+        match one(&hk, &mut s, gp(0, EV_KEY, keymap::BTN_SOUTH, 0)) {
             Outcome::Gamepad(r) => assert_eq!(r[2], 0x00),
             _ => panic!(),
         }
         // Slot 1 is independent and uses report ID 4.
-        match translate(&hk, &mut s, gp(1, EV_KEY, keymap::BTN_START, 1)) {
+        match one(&hk, &mut s, gp(1, EV_KEY, keymap::BTN_START, 1)) {
             Outcome::Gamepad(r) => assert_eq!(r[..4], [0xA1, 0x04, 0x00, 0x08]),
             _ => panic!(),
         }
@@ -898,14 +1274,14 @@ mod tests {
         let hk = Hotkeys::default();
         let mut s = InputState::with_gamepads(1);
         // Up-left → NW (7).
-        translate(&hk, &mut s, gp(0, EV_ABS, keymap::ABS_HAT0X, -1));
-        match translate(&hk, &mut s, gp(0, EV_ABS, keymap::ABS_HAT0Y, -1)) {
+        one(&hk, &mut s, gp(0, EV_ABS, keymap::ABS_HAT0X, -1));
+        match one(&hk, &mut s, gp(0, EV_ABS, keymap::ABS_HAT0Y, -1)) {
             Outcome::Gamepad(r) => assert_eq!(r[4], 7),
             _ => panic!(),
         }
         // Back to centre → 8.
-        translate(&hk, &mut s, gp(0, EV_ABS, keymap::ABS_HAT0X, 0));
-        match translate(&hk, &mut s, gp(0, EV_ABS, keymap::ABS_HAT0Y, 0)) {
+        one(&hk, &mut s, gp(0, EV_ABS, keymap::ABS_HAT0X, 0));
+        match one(&hk, &mut s, gp(0, EV_ABS, keymap::ABS_HAT0Y, 0)) {
             Outcome::Gamepad(r) => assert_eq!(r[4], 8),
             _ => panic!(),
         }
@@ -916,7 +1292,7 @@ mod tests {
         let hk = Hotkeys::default();
         let mut s = InputState::with_gamepads(1);
         assert!(matches!(
-            translate(&hk, &mut s, gp(5, EV_KEY, keymap::BTN_SOUTH, 1)),
+            one(&hk, &mut s, gp(5, EV_KEY, keymap::BTN_SOUTH, 1)),
             Outcome::Nothing
         ));
     }
@@ -928,12 +1304,12 @@ mod tests {
         s.capture = false;
         // State still tracked, but nothing forwarded.
         assert!(matches!(
-            translate(&hk, &mut s, gp(0, EV_KEY, keymap::BTN_SOUTH, 1)),
+            one(&hk, &mut s, gp(0, EV_KEY, keymap::BTN_SOUTH, 1)),
             Outcome::Nothing
         ));
         s.capture = true;
         // The tracked press is reflected once capturing resumes.
-        match translate(&hk, &mut s, gp(0, EV_KEY, keymap::BTN_EAST, 1)) {
+        match one(&hk, &mut s, gp(0, EV_KEY, keymap::BTN_EAST, 1)) {
             Outcome::Gamepad(r) => assert_eq!(r[2], 0b11), // south + east
             _ => panic!(),
         }

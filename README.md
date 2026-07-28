@@ -79,13 +79,20 @@ Devices you cannot read appear as `[permission denied]`.
 
 ### Local hotkeys
 
-- **Scroll Lock** — drop the current host connection (return to accepting).
-- **Ctrl + Alt + Scroll Lock** — terminate blooter cleanly.
-- **Shift + Scroll Lock** — toggle input capture: while off, nothing is
+- **Left Ctrl, Left Alt, Right Shift** — terminate blooter cleanly.
+- **Left Shift, Right Shift** — toggle input capture: while off, nothing is
   forwarded to the host (an all-keys-up report is sent first) and any `-x`
   exclusive grabs are released so input reaches the local session again.
+- Dropping the current host connection (returning to accepting) has no default
+  chord; bind `drop_connection` if you want one.
 
-(Historical builds used Pause instead of Scroll Lock.)
+The key listed first has to be pressed first — Left Shift *then* Right Shift
+toggles capture, the other way round does not — after which the rest of the
+chord can be pressed in any order. The chord fires as soon as its last key goes
+down, and none of its keys reach the host. Pressed on their own, those keys work
+normally: Right Shift starts neither default chord, so it types capitals as
+usual, and a Left Shift that turns out not to begin a chord is forwarded as soon
+as the next key arrives.
 
 All hotkeys are configurable — see below.
 
@@ -102,14 +109,18 @@ If none exists, the built-in defaults above apply. See
 [`config.example.toml`](config.example.toml) for a full annotated example
 whose (commented-out) values are exactly the defaults.
 
-Each hotkey is a chord such as `"leftcontrol+leftalt+scrolllock"`: zero or
-more modifiers plus a final trigger key, fired when the trigger is released
-while the modifiers are held. Key names follow
+Each hotkey is a chord such as `"leftcontrol+leftalt+rightshift"`: zero or
+more modifiers plus a final trigger key. The first key named must be pressed
+first, the rest may follow in any order, and the chord fires on the last
+keydown. Key names follow
 [keyd](https://github.com/rvaiya/keyd)'s naming (`scrolllock`, `pause`,
 `f12`, `kpenter`, `leftmeta`, …); the side-agnostic aliases
 `control`/`ctrl`, `shift`, `alt` and `meta`/`super` match either side.
-Trigger keys are consumed locally and never forwarded; when chords share a
-trigger, the most specific match wins. Setting a hotkey to `""` disables it.
+A chord's keys are consumed locally rather than forwarded — but only once they
+are actually part of a chord being made, so a key that begins no chord, or one
+whose chord turns out not to be coming, still reaches the host. When one chord's
+keys are a subset of another's, the shorter one fires first and shadows the
+longer. Setting a hotkey to `""` disables it.
 
 Available keys: `drop_connection`, `exit`, `capture_toggle`, `capture_on`,
 `capture_off` (the last two are disabled by default in favor of the toggle).

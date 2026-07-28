@@ -11,7 +11,7 @@ pub mod classic;
 pub mod le;
 
 use crate::config::{Batch, Overflow};
-use crate::report::{InputState, Outcome, RawEvent, Report};
+use crate::report::{InputState, Outcome, Outcomes, RawEvent, Report};
 use crate::{Ctx, Signals};
 use std::future;
 use std::time::Duration;
@@ -354,57 +354,63 @@ pub async fn step<T: Transport>(
         }
         Incoming::Event(ev) => ev,
     };
-    match ctx.translate(state, ev) {
-        Outcome::Keyboard(r) | Outcome::Gamepad(r) => {
-            // A full ring must not drop a keyboard or gamepad report: flush to
-            // make room, then queue.
-            if !out.push(r) {
-                if !out.flush(t).await {
+    let mut outs = Outcomes::default();
+    ctx.translate(state, ev, &mut outs);
+    // One event can yield several reports: a chord that turns out not to be
+    // coming replays the keys it held back, in press order (design/ARCH.md §7.3).
+    for i in 0..outs.len() {
+        match outs.get(i) {
+            Outcome::Keyboard(r) | Outcome::Gamepad(r) => {
+                // A full ring must not drop a keyboard or gamepad report: flush
+                // to make room, then queue.
+                if !out.push(r) {
+                    if !out.flush(t).await {
+                        return Step::Return(Flow::Continue);
+                    }
+                    out.push(r);
+                }
+            }
+            Outcome::Sync => {
+                out.drain_frame(state);
+                if out.len > 0 {
+                    out.armed = true;
+                }
+                // A frame boundary is necessary for a flush in every mode;
+                // whether it is sufficient depends on the batching policy (§7.2c).
+                let due = match out.interval {
+                    // Timed: send only once the interval has elapsed.
+                    Some(iv) => out.last_flush.elapsed() >= iv,
+                    // Untimed (`none` and `adaptive`) flush every frame. Under
+                    // `adaptive` the coalescing comes for free: while the previous
+                    // send had the loop suspended, arriving events piled up in the
+                    // channel and merged into the ring on the way here.
+                    None => true,
+                };
+                if (due || out.is_full()) && !out.flush(t).await {
                     return Step::Return(Flow::Continue);
                 }
-                out.push(r);
             }
-        }
-        Outcome::Sync => {
-            out.drain_frame(state);
-            if out.len > 0 {
-                out.armed = true;
-            }
-            // A frame boundary is necessary for a flush in every mode; whether
-            // it is sufficient depends on the batching policy (§7.2c).
-            let due = match out.interval {
-                // Timed: send only once the interval has elapsed.
-                Some(iv) => out.last_flush.elapsed() >= iv,
-                // Untimed (`none` and `adaptive`) flush every frame. Under
-                // `adaptive` the coalescing comes for free: while the previous
-                // send had the loop suspended, arriving events piled up in the
-                // channel and merged into the ring on the way here.
-                None => true,
-            };
-            if (due || out.is_full()) && !out.flush(t).await {
+            Outcome::DropSession => {
+                out.clear();
+                state.clear_mouse();
+                t.release_all(state).await;
                 return Step::Return(Flow::Continue);
             }
+            Outcome::Exit => {
+                out.clear();
+                state.clear_mouse();
+                t.release_all(state).await;
+                return Step::Return(Flow::Shutdown);
+            }
+            Outcome::CaptureOff => {
+                // Release everything host-side so nothing stays stuck while
+                // forwarding is paused.
+                out.clear();
+                state.clear_mouse();
+                t.release_all(state).await;
+            }
+            Outcome::CaptureOn | Outcome::Nothing => {}
         }
-        Outcome::DropSession => {
-            out.clear();
-            state.clear_mouse();
-            t.release_all(state).await;
-            return Step::Return(Flow::Continue);
-        }
-        Outcome::Exit => {
-            out.clear();
-            state.clear_mouse();
-            t.release_all(state).await;
-            return Step::Return(Flow::Shutdown);
-        }
-        Outcome::CaptureOff => {
-            // Release everything host-side so nothing stays stuck while
-            // forwarding is paused.
-            out.clear();
-            state.clear_mouse();
-            t.release_all(state).await;
-        }
-        Outcome::CaptureOn | Outcome::Nothing => {}
     }
     Step::Continue
 }
@@ -589,6 +595,7 @@ mod tests {
                     value: 300,
                     gamepad: None,
                 },
+                &mut Outcomes::default(),
             );
             let mut out = Outbox::new(8, Batch::None, Duration::from_millis(8), mode);
             out.drain_frame(&mut st);

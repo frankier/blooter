@@ -285,8 +285,8 @@ pub fn modifier_bit(code: u16) -> Option<u8> {
 }
 
 /// Translate a Linux keycode to a HID Keyboard/Keypad usage code (4..=99), or
-/// `None` if unmapped. Keys used as hotkey triggers (Scroll Lock by default)
-/// are consumed before this lookup and never forwarded (design/ARCH.md §7.3).
+/// `None` if unmapped. Keys taking part in a chord being made are consumed
+/// before this lookup and never forwarded (design/ARCH.md §7.3).
 pub fn hid_usage(code: u16) -> Option<u8> {
     Some(match code {
         // Letters, alphabetical → 4..=29.

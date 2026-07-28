@@ -28,7 +28,7 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{mpsc, watch};
 
 use config::{Batch, Hotkeys, Overflow};
-use report::{InputState, Outcome, RawEvent, translate};
+use report::{InputState, Outcome, Outcomes, RawEvent, translate};
 use transport::{Accept, AnyTransport, Classic, Flow, Le, Transport};
 
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
@@ -473,25 +473,35 @@ pub struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
-    /// Translate one event and apply capture-state side effects. Capture-hotkey
-    /// changes only drive the grab while a session is connected; toggling
-    /// capture while disconnected must not grab the keyboard.
-    pub fn translate(&self, state: &mut InputState, ev: RawEvent) -> Outcome {
-        let out = translate(self.hotkeys, state, ev);
+    /// Translate one event into `out` and apply capture-state side effects.
+    /// Capture-hotkey changes only drive the grab while a session is connected;
+    /// toggling capture while disconnected must not grab the keyboard.
+    pub fn translate(&self, state: &mut InputState, ev: RawEvent, out: &mut Outcomes) {
+        translate(self.hotkeys, state, ev, out);
         if self.connected.get() {
-            match out {
-                Outcome::CaptureOn => {
-                    info!("input capture enabled");
-                    self.capture_tx.send_replace(true);
+            for o in out.iter() {
+                match o {
+                    Outcome::CaptureOn => {
+                        info!("input capture enabled");
+                        self.capture_tx.send_replace(true);
+                    }
+                    Outcome::CaptureOff => {
+                        info!("input capture disabled");
+                        self.capture_tx.send_replace(false);
+                    }
+                    _ => {}
                 }
-                Outcome::CaptureOff => {
-                    info!("input capture disabled");
-                    self.capture_tx.send_replace(false);
-                }
-                _ => {}
             }
         }
-        out
+    }
+
+    /// Translate one event while no host is connected, where the only outcome
+    /// that matters is whether the exit hotkey fired: there is nothing to
+    /// forward reports to.
+    pub fn translate_exits(&self, state: &mut InputState, ev: RawEvent) -> bool {
+        let mut out = Outcomes::default();
+        self.translate(state, ev, &mut out);
+        out.iter().any(|o| matches!(o, Outcome::Exit))
     }
 }
 

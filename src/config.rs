@@ -16,17 +16,38 @@ pub enum Action {
     CaptureToggle,
 }
 
-/// A parsed hotkey: modifiers that must be held when `trigger` is released.
+/// The most keys one chord may name (the 8 HID modifiers plus a final key).
+/// Bounds the replay buffer in `report`, which is fixed-size.
+pub const MAX_CHORD_KEYS: usize = 8;
+
+/// One position in a chord: the keycode(s) that satisfy it. The side-agnostic
+/// aliases (`shift`, `ctrl`, …) are satisfied by either side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    One(u16),
+    Either(u16, u16),
+}
+
+impl Step {
+    pub fn matches(self, code: u16) -> bool {
+        match self {
+            Step::One(a) => code == a,
+            Step::Either(a, b) => code == a || code == b,
+        }
+    }
+}
+
+/// A parsed hotkey: the keys that must be pressed for it to fire. `steps[0]` is
+/// ordered — it must be pressed first, and pressing it is what starts matching
+/// this chord — while `steps[1..]` may be pressed in any order after it
+/// (design/ARCH.md §7.3).
 #[derive(Clone, Debug)]
 pub struct Chord {
-    pub trigger: u16,
-    /// One HID-modifier bitmask per listed modifier; each must intersect the
-    /// currently held modifiers (side-agnostic aliases set both side bits).
-    pub mod_masks: Vec<u8>,
+    pub steps: Vec<Step>,
     pub action: Action,
 }
 
-/// The full hotkey table. Falls back to the built-in scroll-lock defaults for
+/// The full hotkey table. Falls back to the built-in right-shift defaults for
 /// anything the config file does not override.
 #[derive(Clone, Debug)]
 pub struct Hotkeys {
@@ -193,6 +214,9 @@ impl Default for Config {
     }
 }
 
+/// The most chords a hotkey table can hold: one per recognized `[hotkeys]` key.
+pub const MAX_CHORDS: usize = DEFAULTS.len();
+
 /// The recognized `[hotkeys]` keys and their built-in defaults. An empty
 /// string means the hotkey is disabled.
 const DEFAULTS: [(&str, &str); 5] = [
@@ -219,14 +243,9 @@ impl Default for Hotkeys {
         let chords = DEFAULTS
             .iter()
             .filter(|(_, spec)| !spec.is_empty())
-            .map(|(key, spec)| {
-                let (trigger, mod_masks) =
-                    parse_chord_spec(spec).expect("built-in default chords parse");
-                Chord {
-                    trigger,
-                    mod_masks,
-                    action: action_for(key),
-                }
+            .map(|(key, spec)| Chord {
+                steps: parse_chord_spec(spec).expect("built-in default chords parse"),
+                action: action_for(key),
             })
             .collect();
         Hotkeys { chords }
@@ -234,20 +253,14 @@ impl Default for Hotkeys {
 }
 
 impl Hotkeys {
-    /// Whether `code` is the trigger key of any configured chord. Trigger keys
-    /// are consumed locally and never forwarded to the host.
-    pub fn is_trigger(&self, code: u16) -> bool {
-        self.chords.iter().any(|c| c.trigger == code)
+    pub fn chords(&self) -> &[Chord] {
+        &self.chords
     }
 
-    /// The action to fire when `code` is released with `modifiers` held, if
-    /// any. The most specific matching chord (most modifiers) wins.
-    pub fn action(&self, code: u16, modifiers: u8) -> Option<Action> {
-        self.chords
-            .iter()
-            .filter(|c| c.trigger == code && c.mod_masks.iter().all(|m| modifiers & m != 0))
-            .max_by_key(|c| c.mod_masks.len())
-            .map(|c| c.action)
+    /// Whether pressing `code` starts some chord, i.e. whether it opens a chord
+    /// buffer instead of being forwarded straight away (design/ARCH.md §7.3).
+    pub fn starts(&self, code: u16) -> bool {
+        self.chords.iter().any(|c| c.steps[0].matches(code))
     }
 }
 
@@ -540,23 +553,18 @@ impl<'de> FromToml<'de> for Hotkeys {
         let mut chords = Vec::new();
         for (key, default) in DEFAULTS {
             match th.optional_mapped(key, chord_item) {
-                Some(Some((trigger, mod_masks))) => {
-                    chords.push(Chord {
-                        trigger,
-                        mod_masks,
-                        action: action_for(key),
-                    });
-                }
+                Some(Some(steps)) => chords.push(Chord {
+                    steps,
+                    action: action_for(key),
+                }),
                 Some(None) => {} // explicitly disabled with ""
                 None => {
                     // Absent (or invalid, in which case the error is already
                     // recorded and the parse fails): fall back to the default.
                     if !default.is_empty() {
-                        let (trigger, mod_masks) =
-                            parse_chord_spec(default).expect("built-in default chords parse");
                         chords.push(Chord {
-                            trigger,
-                            mod_masks,
+                            steps: parse_chord_spec(default)
+                                .expect("built-in default chords parse"),
                             action: action_for(key),
                         });
                     }
@@ -569,7 +577,7 @@ impl<'de> FromToml<'de> for Hotkeys {
 }
 
 /// Extract one hotkey value: a chord string, or `""` (`None`) for disabled.
-fn chord_item(item: &Item<'_>) -> Result<Option<(u16, Vec<u8>)>, toml_spanner::Error> {
+fn chord_item(item: &Item<'_>) -> Result<Option<Vec<Step>>, toml_spanner::Error> {
     let spec = item.as_str().ok_or_else(|| item.expected(&"a string"))?;
     if spec.is_empty() {
         return Ok(None);
@@ -580,33 +588,37 @@ fn chord_item(item: &Item<'_>) -> Result<Option<(u16, Vec<u8>)>, toml_spanner::E
 }
 
 /// Parse a chord spec: zero or more modifier names and a final trigger key,
-/// joined with '+'. Key names follow keyd's keycode table. Returns the
-/// trigger keycode and the required-modifier masks.
-fn parse_chord_spec(spec: &str) -> Result<(u16, Vec<u8>), String> {
+/// joined with '+'. Key names follow keyd's keycode table. Returns one `Step`
+/// per named key, in the order written.
+fn parse_chord_spec(spec: &str) -> Result<Vec<Step>, String> {
     let parts: Vec<&str> = spec.split('+').map(str::trim).collect();
+    if parts.len() > MAX_CHORD_KEYS {
+        return Err(format!("a chord names at most {MAX_CHORD_KEYS} keys"));
+    }
     let (&trigger_name, mod_names) = parts.split_last().expect("split yields at least one part");
+    let mut steps: Vec<Step> = mod_names
+        .iter()
+        .map(|name| modifier_step(name).ok_or_else(|| format!("'{name}' is not a modifier key")))
+        .collect::<Result<_, _>>()?;
     let trigger = keymap::keycode_from_name(trigger_name)
         .ok_or_else(|| format!("unknown key name '{trigger_name}'"))?;
-    let mut mod_masks = Vec::new();
-    for name in mod_names {
-        mod_masks
-            .push(modifier_mask(name).ok_or_else(|| format!("'{name}' is not a modifier key"))?);
-    }
-    Ok((trigger, mod_masks))
+    steps.push(Step::One(trigger));
+    Ok(steps)
 }
 
-/// The HID-modifier bitmask a chord-modifier name requires. Side-specific
-/// names set one bit; the side-agnostic aliases set both, and match when
-/// either side is held.
-fn modifier_mask(name: &str) -> Option<u8> {
+/// The step a chord-modifier name stands for. Side-specific names match that
+/// side only; the side-agnostic aliases match whichever side is pressed.
+fn modifier_step(name: &str) -> Option<Step> {
+    use keymap::*;
     Some(match name {
-        "control" | "ctrl" => 0x11,
-        "shift" => 0x22,
-        "alt" => 0x44,
-        "meta" | "super" => 0x88,
+        "control" | "ctrl" => Step::Either(KEY_LEFTCTRL, KEY_RIGHTCTRL),
+        "shift" => Step::Either(KEY_LEFTSHIFT, KEY_RIGHTSHIFT),
+        "alt" => Step::Either(KEY_LEFTALT, KEY_RIGHTALT),
+        "meta" | "super" => Step::Either(KEY_LEFTMETA, KEY_RIGHTMETA),
         _ => {
             let code = keymap::keycode_from_name(name)?;
-            1u8 << keymap::modifier_bit(code)?
+            keymap::modifier_bit(code)?;
+            Step::One(code)
         }
     })
 }
@@ -616,19 +628,45 @@ mod tests {
     use super::*;
     use crate::keymap;
 
+    /// The steps of the chord bound to `action`, if it is enabled.
+    fn steps(hk: &Hotkeys, action: Action) -> Option<&[Step]> {
+        hk.chords()
+            .iter()
+            .find(|c| c.action == action)
+            .map(|c| c.steps.as_slice())
+    }
+
     #[test]
     fn defaults() {
         let hk = Hotkeys::default();
-        assert!(hk.is_trigger(keymap::KEY_RIGHTSHIFT));
-        assert!(!hk.is_trigger(keymap::KEY_A));
-        // Bare Right Shift → nothing (drop_connection is disabled by default).
-        assert_eq!(hk.action(keymap::KEY_RIGHTSHIFT, 0), None);
-        // Left Ctrl+Alt held → exit wins (most specific).
-        assert_eq!(hk.action(keymap::KEY_RIGHTSHIFT, 0x05), Some(Action::Exit));
-        // Left Shift held → capture toggle.
+        // Right Shift completes both default chords but starts neither, so a
+        // bare Right Shift is forwarded like any other key.
+        assert!(!hk.starts(keymap::KEY_RIGHTSHIFT));
+        assert!(!hk.starts(keymap::KEY_A));
+        assert!(hk.starts(keymap::KEY_LEFTCTRL));
+        assert!(hk.starts(keymap::KEY_LEFTSHIFT));
+        // drop_connection is disabled by default.
+        assert_eq!(steps(&hk, Action::DropConnection), None);
         assert_eq!(
-            hk.action(keymap::KEY_RIGHTSHIFT, 0x02),
-            Some(Action::CaptureToggle)
+            steps(&hk, Action::Exit),
+            Some(
+                [
+                    Step::One(keymap::KEY_LEFTCTRL),
+                    Step::One(keymap::KEY_LEFTALT),
+                    Step::One(keymap::KEY_RIGHTSHIFT),
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(
+            steps(&hk, Action::CaptureToggle),
+            Some(
+                [
+                    Step::One(keymap::KEY_LEFTSHIFT),
+                    Step::One(keymap::KEY_RIGHTSHIFT),
+                ]
+                .as_slice()
+            )
         );
     }
 
@@ -826,17 +864,26 @@ mod tests {
         )
         .unwrap()
         .hotkeys;
-        // Right Shift is still a trigger (default capture toggle), but bare
-        // Right Shift does nothing: drop_connection is disabled.
-        assert!(hk.is_trigger(keymap::KEY_RIGHTSHIFT));
-        assert_eq!(hk.action(keymap::KEY_RIGHTSHIFT, 0), None);
+        // The default capture toggle survives; drop_connection is disabled.
+        assert_eq!(steps(&hk, Action::DropConnection), None);
         assert_eq!(
-            hk.action(keymap::KEY_RIGHTSHIFT, 0x02),
-            Some(Action::CaptureToggle)
+            steps(&hk, Action::CaptureToggle),
+            Some(
+                [
+                    Step::One(keymap::KEY_LEFTSHIFT),
+                    Step::One(keymap::KEY_RIGHTSHIFT),
+                ]
+                .as_slice()
+            )
         );
-        // Right-side modifiers satisfy the side-agnostic aliases.
-        assert_eq!(hk.action(keymap::KEY_PAUSE, 0x50), Some(Action::Exit));
-        assert_eq!(hk.action(keymap::KEY_PAUSE, 0x10), None); // alt missing
+        // The side-agnostic aliases accept either side.
+        let exit = steps(&hk, Action::Exit).unwrap();
+        assert!(exit[0].matches(keymap::KEY_RIGHTCTRL));
+        assert!(exit[0].matches(keymap::KEY_LEFTCTRL));
+        assert!(exit[1].matches(keymap::KEY_RIGHTALT));
+        assert_eq!(exit[2], Step::One(keymap::KEY_PAUSE));
+        // Either-side aliases start a chord from either side.
+        assert!(hk.starts(keymap::KEY_RIGHTCTRL));
     }
 
     #[test]
@@ -848,6 +895,9 @@ mod tests {
         assert!(parse("[hotkeys]\nexit = \"a+scrolllock\"\n").is_err()); // 'a' not a modifier
         assert!(parse("[hotkeys]\nexit = \"pause\"\nexit = \"pause\"\n").is_err()); // duplicate
         assert!(parse("[other]\n").is_err());
+        // Longer than the fixed-size chord buffer can hold.
+        let long = ["leftshift"; MAX_CHORD_KEYS + 1].join("+");
+        assert!(parse(&format!("[hotkeys]\nexit = \"{long}\"\n")).is_err());
     }
 
     #[test]
@@ -855,6 +905,9 @@ mod tests {
         let hk = parse("[hotkeys] # table\nexit = \"pause\" # comment\n")
             .unwrap()
             .hotkeys;
-        assert_eq!(hk.action(keymap::KEY_PAUSE, 0), Some(Action::Exit));
+        assert_eq!(
+            steps(&hk, Action::Exit),
+            Some([Step::One(keymap::KEY_PAUSE)].as_slice())
+        );
     }
 }

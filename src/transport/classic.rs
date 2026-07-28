@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until, timeout_at};
 
 use super::{Accept, DIAL_BACKOFF_MAX, DIAL_BACKOFF_START, Flow, Outbox, Step, Transport, step};
-use crate::report::{InputState, Outcome, RawEvent};
+use crate::report::{InputState, RawEvent};
 use crate::{AppError, Ctx, Signals};
 
 const CONTROL_PSM: u16 = 0x11;
@@ -141,7 +141,7 @@ impl Classic {
                     }
                 },
                 Some(ev) = rx.recv() => {
-                    if matches!(ctx.translate(state, ev), Outcome::Exit) {
+                    if ctx.translate_exits(state, ev) {
                         return Interrupt::Shutdown;
                     }
                 }
@@ -315,7 +315,7 @@ impl Transport for Classic {
                     }
                 }
                 Some(ev) = rx.recv() => {
-                    if matches!(ctx.translate(state, ev), Outcome::Exit) {
+                    if ctx.translate_exits(state, ev) {
                         break Done::Shutdown;
                     }
                 }

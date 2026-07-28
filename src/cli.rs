@@ -29,8 +29,9 @@ Options:
   -d                 Enable debug logging of input events and socket traffic.
 
 Local hotkeys (configurable, see config.example.toml):
-Scroll Lock drops the connection, Ctrl+Alt+Scroll Lock exits, and
-Shift+Scroll Lock toggles input capture on and off.
+Left Ctrl, Left Alt, Right Shift exits; Left Shift, Right Shift toggles
+input capture on and off (press the first key of a chord first, the rest
+in any order). Dropping the connection has no default chord.
 ";
 
 #[derive(Debug, Default)]

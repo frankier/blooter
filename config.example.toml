@@ -5,10 +5,13 @@
 # ~/.config/blooter/config.toml), then /etc/blooter/config.toml.
 #
 # Each hotkey is a chord: zero or more modifier names followed by one trigger
-# key, joined with '+'. The chord fires when the trigger key is *released*
-# while all listed modifiers are held. Trigger keys are consumed locally and
-# never forwarded to the host. When several chords share a trigger, the most
-# specific match (most modifiers) wins.
+# key, joined with '+'. The first key listed must be pressed first — that is
+# what starts the chord — and the rest may then be pressed in any order. The
+# chord fires as soon as its last key goes down, and none of its keys are
+# forwarded to the host. A key is only held back while it may still be part of
+# a chord: one that begins no chord, or one whose chord turns out not to be
+# coming, is forwarded as usual. When one chord's keys are a subset of
+# another's, the shorter one fires first and shadows the longer.
 #
 # Key names follow keyd (https://github.com/rvaiya/keyd), e.g. "scrolllock",
 # "pause", "f12", "kpenter", "leftcontrol", "rightmeta". The side-agnostic
@@ -19,17 +22,18 @@
 
 [hotkeys]
 
-# Drop the current host connection and return to accepting new ones.
-#drop_connection = "scrolllock"
+# Drop the current host connection and return to accepting new ones. Disabled
+# by default; bind a chord here if you want it.
+#drop_connection = ""
 
 # Terminate blooter cleanly.
-#exit = "leftcontrol+leftalt+scrolllock"
+#exit = "leftcontrol+leftalt+rightshift"
 
 # Toggle input capture. While capture is off, events are not forwarded to the
 # host (an all-keys-up report is sent first), and devices grabbed exclusively
 # with -x are released so input reaches the local session again. Hotkeys stay
 # active while capture is off; a new host connection re-enables capture.
-#capture_toggle = "leftshift+scrolllock"
+#capture_toggle = "leftshift+rightshift"
 
 # Separate capture on/off chords, if you prefer them over (or in addition to)
 # the toggle. Disabled by default.
