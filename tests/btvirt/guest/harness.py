@@ -636,6 +636,17 @@ class LeHost:
                     handles.append(handle)
         return handles
 
+    LAYOUT_UUID_PREFIX = "626c6f74-6572-4c41-594f-5554"
+
+    def layout_uuid(self):
+        """UUID of the vendor layout characteristic, whose last four bytes carry
+        the HID descriptor fingerprint (design/CONNECTION.md §7.2b), or None."""
+        for line in self.output().splitlines():
+            line = line.strip()
+            if line.startswith("charac -") and self.LAYOUT_UUID_PREFIX in line:
+                return re.search(r"uuid: (\S+)", line).group(1)
+        return None
+
     def subscribe(self, timeout=10.0):
         """Write every Report CCCD, which is what makes blooter "connected"."""
         handles = self.report_handles()

@@ -265,11 +265,11 @@ Bluetooth audio/headsets and devices with no real name (only a hex identifier)
 are moved to an **"Other devices"** submenu so the main list shows just plausible
 HID hosts.
 
-**Both transports run the same menu.** `menu::Kind` carries the only two
-differences: the discovery filter (`bredr` vs `le`, so the list only offers
-devices reachable over the transport in use) and whether `[f] Fix connection`
-applies at all — it does not on BLE, which has no cached SDP record to
-invalidate (§7). Classification handles both worlds: a device is "Other" if it
+**Both transports run the same menu.** `menu::Kind` carries the only difference:
+the discovery filter (`bredr` vs `le`, so the list only offers devices reachable
+over the transport in use). `[f] Fix connection` is offered on either, on any
+bonded host; what it *does* is transport-specific (§7). Classification handles
+both worlds: a device is "Other" if it
 has no real name, if its **Class of Device** is audio (BR/EDR), or if its **GAP
 Appearance** category is HID or audio (LE); each property check simply falls
 through when the peer does not carry that property. `menu::Session` wraps the
@@ -330,18 +330,24 @@ stateDiagram-v2
   signal, so an incoming connection or a signal preempts it cleanly and the
   terminal is always restored.
 
-## 7. Fix connection (stale host SDP cache)
+## 7. Fix connection (stale host cache)
 
-A host caches blooter's SDP record — the HID report descriptor included — for the
-lifetime of its bond, and never re-reads it on a plain reconnect. BlueZ hosts keep
-it in `/var/lib/bluetooth/<adapter>/cache/<blooter-addr>`. So **changing the
+A host caches blooter's HID report descriptor for the lifetime of its bond, and
+never re-reads it on a plain reconnect. On **Classic** that is the whole SDP
+record (BlueZ hosts keep it in
+`/var/lib/bluetooth/<adapter>/cache/<blooter-addr>`); on **BLE** it is the cached
+GATT database, the Report Map characteristic's value with it. So **changing the
 descriptor has no effect on an already-bonded host**: it keeps driving the layout
 it cached when it first paired. The descriptor changes whenever the advertised
-gamepad slot count does (ARCH.md §3.2), which under the default
-`slots = "initial"` happens simply by plugging a controller in before startup.
+gamepad slot count does (ARCH.md §3.2) — which under the default
+`slots = "initial"` happens simply by plugging a controller in before startup —
+or whenever `[pointer] axis_bits` changes.
 
 The symptom is silent: the host connects, keyboard and mouse work, and the newly
 advertised gamepad never appears — no error on either side.
+
+Detection (§7.1) is shared. The repair is transport-specific: a virtual-cable
+unplug on Classic (§7.2a), a Service Changed indication on BLE (§7.2b).
 
 ### 7.1 Detection
 
@@ -356,7 +362,7 @@ stale — blooter never guesses.
 All of this is best-effort: an unwritable state file costs a marker, never a
 startup failure.
 
-### 7.2 The fix
+### 7.2a The fix on Classic
 
 `[f]` in the menu, on any bonded host, runs `Classic::fix_host`:
 
@@ -381,9 +387,49 @@ drops our bond to match rather than leaving a one-sided bond behind.
 An unreachable host cannot be sent an unplug at all; blooter says so and the bond
 must be removed from that host's Bluetooth settings by hand.
 
+### 7.2b The fix on BLE
+
+GATT has a purpose-built mechanism for exactly this: **Service Changed**
+(`0x2A05`) in the Generic Attribute service, plus the **Database Hash**
+(`0x2B2A`) of GATT Caching. Neither is ours to declare — bluetoothd owns the
+Generic Attribute service and builds both itself — so blooter drives them
+indirectly, from two sides.
+
+**Automatic, via the Database Hash.** The GATT tree carries a vendor **layout
+service** (`layout_service` in `transport/le.rs`) whose single characteristic's
+UUID has the descriptor fingerprint in its low 32 bits (base
+`626c6f74-6572-4c41-594f-5554xxxxxxxx`), and which reads back the same value.
+The Database Hash covers service, include and characteristic *declarations* —
+not arbitrary characteristic values — so without this a change to
+`[pointer] axis_bits`, which alters only the Report Map's *value*, would leave
+the database, its handles and its hash byte-identical and no caching client would
+ever notice. With it, every descriptor change moves the hash, and a host doing
+robust caching re-discovers on its next connection by itself. (A slot-count
+change moves the handles anyway, since it adds or removes Report
+characteristics.)
+
+**On demand, via `[f]`.** `Le::fix_host`, for hosts that do not act on the hash:
+
+1. `Device.Connect()` to the host — a Service Changed indication only reaches a
+   *connected* client, and there is no queue for one that is away.
+2. Register a throwaway service (`626c6f74-6572-4348-554e-…`) and, a second
+   later, unregister it (`churn_database`). Each edge changes bluetoothd's local
+   attribute database, and bluetoothd indicates Service Changed to every
+   connected, subscribed client for it. HOGP requires the HID Host to have
+   subscribed, and BlueZ restores that CCCD from the bond, so a reconnected host
+   is already listening. The host re-discovers and re-reads the Report Map, then
+   subscribes — which is an ordinary session, and the new fingerprint is recorded
+   through the normal path.
+
+No bond is touched, so unlike Classic there is nothing to re-pair. The
+**fallback** is Classic's outcome: a host that cannot be reached gets no
+indication, so blooter drops our bond, forgets its fingerprint, and says to
+remove blooter from that host's Bluetooth settings and pair again. A host that is
+reachable but ignores the indication is told the same thing, without the unbond.
+
 ### 7.3 What does not work
 
-Ruled out by experiment before settling on the unplug:
+Ruled out by experiment before settling on the unplug (Classic):
 
 - **Disconnect/reconnect** — a bonded host restores its UUIDs from storage and
   never re-browses.
@@ -434,15 +480,17 @@ only starts at all on the interactive rows.
   menu (restoring the terminal). The target is cleared on the first successful
   link, and an incoming connection preempts an open menu.
 - **`transport/le.rs`** — drop its private agent; rely on the shared one. Holds
-  an optional target, the interactive flag and the `TermCoord`; `wait_connected`
-  spawns the menu each cycle and races the CCCD subscribe, a backoff-gated
-  outgoing `Device::connect()` and the menu pick in one `select!` (§4).
+  an optional target, the interactive flag, the `TermCoord` and the shared
+  `state::Hosts`; `wait_connected` spawns the menu each cycle and races the CCCD
+  subscribe, a backoff-gated outgoing `Device::connect()` and the menu pick in
+  one `select!` (§4), recording the fingerprint of each host that subscribes and
+  performing a `[f]` fix once those futures are gone (§7.2b).
 - **`menu.rs`** — the interactive `crossterm` TUI, shared by both transports:
   `run` scans (filtered to the transport's `menu::Kind`), lists eligible hosts
   (audio/nameless devices under an "Other devices" submenu), navigates by
   arrow/number/letter keys with a rescan action, pairs a newly-picked (unbonded)
   host from here, and returns a `Pick` (address + whether `[f]` asked for a fix,
-  §7 — Classic only). Marks stale hosts. Pre-emptable via a `oneshot` cancel; a
+  §7). Marks stale hosts. Pre-emptable via a `oneshot` cancel; a
   pair attempt against a device bluetoothd has since dropped rediscovers and
   retries once. `menu::Session` is the transport-facing spawn/cancel/join handle.
 - **`transport/mod.rs`** — the dial backoff constants, shared by both initiator

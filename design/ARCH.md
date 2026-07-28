@@ -193,11 +193,11 @@ fields byte-aligned. The Report Count quirk above does not arise here: each
 item's count equals its own usage count by construction.
 
 The axis width is part of the descriptor, so it feeds `descriptor_fingerprint`
-and a bonded Classic host holding the other width is flagged for
-`[f] Fix connection` (CONNECTION.md §7). **BLE has no equivalent repair** — the
-GATT tree declares no Service Changed characteristic, so a host bonded under the
-other width keeps its cached Report Map and misreads the reports until it is
-re-paired by hand.
+and a bonded host holding the other width is flagged for `[f] Fix connection`
+on either transport (CONNECTION.md §7). It is the case the BLE repair is built
+around: it changes only the *value* of the Report Map, leaving the GATT database
+and its handles identical, which is why the fingerprint is also carried in a
+vendor characteristic's UUID (§4.2, CONNECTION.md §7.2b).
 - **Usage Page Generic Desktop, Usage Keyboard, Collection Application**
   - Report ID **2**; Collection Physical
     - Modifier byte: usages Keyboard `0xE0`–`0xE7`, 8 × 1-bit (Data,Var,Abs)
@@ -217,9 +217,10 @@ Generic-Desktop Gamepad application collection with Report ID **3, 4, …** (bas
 Report IDs 1 (mouse), 2 (keyboard) and 3+ (gamepads) and the wire formats in §5
 are kept in sync with this descriptor.
 
-**Hosts cache this descriptor.** A remote host reads the SDP record once, when it
-bonds, and keeps it for the lifetime of the bond — so changing the descriptor
-(i.e. changing the advertised gamepad slot count) is invisible to hosts that
+**Hosts cache this descriptor.** A remote host reads it once, when it bonds — the
+SDP record on Classic, the Report Map characteristic on BLE — and keeps it for
+the lifetime of the bond, so changing the descriptor (i.e. changing the
+advertised gamepad slot count or the axis width) is invisible to hosts that
 already paired, and the new layout silently never appears on them. blooter
 fingerprints the descriptor and offers a "fix connection" action to clear a host's
 cached copy; see CONNECTION.md §7.
@@ -310,6 +311,18 @@ device, one advertisement set per adapter suffices.
   (`0x2A29`, `blooter`) and Model Number (`0x2A24`, `blooter HID`).
 - **Battery service (`0x180F`)** — a constant 100% Battery Level (`0x2A19`),
   Read + Notify (mandatory HOGP companion; blooter never pushes a notification).
+- **Layout service (`626c6f74-6572-4c41-594f-5554…`)** — one read-only vendor
+  characteristic whose UUID carries the descriptor fingerprint (§3.2) in its low
+  32 bits, and which reads back the same value. Hosts ignore it; its job is to
+  put the fingerprint somewhere the GATT **Database Hash** (`0x2B2A`) covers,
+  since that hash includes characteristic *declarations* but not characteristic
+  values — so a host doing robust caching notices any descriptor change,
+  including one that alters the Report Map's value alone. See CONNECTION.md
+  §7.2b, which also covers the on-demand `[f]` repair (Service Changed, `0x2A05`).
+
+bluetoothd owns the GAP (`0x1800`) and Generic Attribute (`0x1801`) services and
+builds Service Changed and the Database Hash itself; a D-Bus GATT application
+cannot register them, only change the database they describe.
 
 #### Advertising, security and sessions
 
@@ -740,4 +753,5 @@ the outgoing connection to it: the HID L2CAP PSMs on Classic (CONNECTION.md
 **incoming** connection that arrives while it is open is taken as the user's
 choice: blooter uses it and closes the menu with a note. Pressing Enter skips,
 leaving blooter accepting (plus dialing any bonded `[connection] reconnect`
-target). `[f] Fix connection` is offered on Classic only (CONNECTION.md §7).
+target). `[f] Fix connection` is offered on any bonded host, on either transport
+(CONNECTION.md §7).

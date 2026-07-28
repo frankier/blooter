@@ -7,10 +7,9 @@
 //! cancel signal (fired on inbound-accept or shutdown) preempts the menu at any
 //! await point and the terminal is always restored.
 //!
-//! Both transports use it: [`Kind`] carries the only differences — which
-//! discovery transport to scan on, and whether `[f] Fix connection` applies
-//! (Classic only, §7). [`Session`] wraps the spawn/cancel/join plumbing so each
-//! transport's `wait_connected` drives the menu the same way.
+//! Both transports use it: [`Kind`] carries the only difference — which
+//! discovery transport to scan on. [`Session`] wraps the spawn/cancel/join
+//! plumbing so each transport's `wait_connected` drives the menu the same way.
 //!
 //! Ineligible devices — Bluetooth audio/headsets, and devices with no real name
 //! (only a hex identifier) — are moved to an "Other devices" submenu so the main
@@ -53,12 +52,6 @@ impl Kind {
             Self::Ble => DiscoveryTransport::Le,
         }
     }
-
-    /// `[f] Fix connection` invalidates a host's cached SDP record with a HIDP
-    /// virtual-cable unplug, which exists only on Classic (§7).
-    fn allow_fix(self) -> bool {
-        self == Self::Classic
-    }
 }
 
 // --- Pure model ----------------------------------------------------------
@@ -87,8 +80,9 @@ struct Row {
 /// What the menu resolved to: a host, and what to do with it.
 pub struct Pick {
     pub addr: Address,
-    /// Unplug and unbond this host instead of connecting to it, so its next
-    /// pairing re-reads blooter's SDP record (design/CONNECTION.md §7).
+    /// Repair this host rather than starting a session on it: make it drop the
+    /// copy of blooter's HID layout it cached when it bonded, by whatever means
+    /// the transport has (design/CONNECTION.md §7).
     pub fix: bool,
 }
 
@@ -100,7 +94,7 @@ enum Action {
     None,
     /// Select the device at this index within the active screen's list.
     Select(usize),
-    /// Fix the connection to the device at this index: unplug + unbond it.
+    /// Fix the connection to the device at this index (§7).
     Fix(usize),
     Rescan,
     Skip,
@@ -113,8 +107,6 @@ struct MenuState {
     main_devs: Vec<Device>,
     other_devs: Vec<Device>,
     selected: usize,
-    /// Whether `[f] Fix connection` is offered at all ([`Kind::allow_fix`]).
-    allow_fix: bool,
 }
 
 impl MenuState {
@@ -209,10 +201,10 @@ fn on_key(state: &mut MenuState, key: KeyEvent) -> Action {
             }
             Action::None
         }
-        // Only bonded hosts have a cached record to invalidate, and only on
-        // Classic; on anything else the key is a no-op.
+        // Only bonded hosts have a cached record to invalidate; on anything else
+        // the key is a no-op.
         KeyCode::Char('f') | KeyCode::Char('F') => match state.rows().get(state.selected) {
-            Some(r) if state.allow_fix && r.paired => Action::Fix(state.selected),
+            Some(r) if r.paired => Action::Fix(state.selected),
             _ => Action::None,
         },
         KeyCode::Char('r') | KeyCode::Char('R') => Action::Rescan,
@@ -263,7 +255,7 @@ fn render_lines(state: &MenuState) -> Vec<String> {
     // `[f]` applies to bonded hosts only, so it is offered only when the cursor
     // is on one.
     let fix = match rows.get(state.selected) {
-        Some(r) if state.allow_fix && r.paired => "[f] Fix connection   ",
+        Some(r) if r.paired => "[f] Fix connection   ",
         _ => "",
     };
     let footer = match state.screen {
@@ -526,7 +518,6 @@ async fn scan(
         main_devs,
         other_devs,
         selected: 0,
-        allow_fix: kind.allow_fix(),
     })
 }
 
@@ -822,7 +813,6 @@ mod tests {
         }
     }
 
-    /// A Classic menu state (where `[f]` applies); [`ble_state`] is the LE one.
     fn state(main: Vec<Row>, other: Vec<Row>) -> MenuState {
         MenuState {
             screen: Screen::Main,
@@ -831,14 +821,6 @@ mod tests {
             main_devs: Vec::new(),
             other_devs: Vec::new(),
             selected: 0,
-            allow_fix: Kind::Classic.allow_fix(),
-        }
-    }
-
-    fn ble_state(main: Vec<Row>, other: Vec<Row>) -> MenuState {
-        MenuState {
-            allow_fix: Kind::Ble.allow_fix(),
-            ..state(main, other)
         }
     }
 
@@ -884,17 +866,6 @@ mod tests {
         assert!(!is_other(None, Some(0x0080), true));
         assert!(!is_other(None, Some(0x0040), true));
         assert!(!is_other(None, Some(0x0000), true));
-    }
-
-    #[test]
-    fn fix_hidden_on_ble() {
-        // Same bonded host as `fix_offered_only_for_bonded_hosts`, but on BLE
-        // there is no cached SDP record to invalidate, so `[f]` is inert and
-        // unadvertised (design/CONNECTION.md §7).
-        let mut s = ble_state(vec![row("Laptop", false, true, None)], vec![]);
-        assert_eq!(on_key(&mut s, key(KeyCode::Char('f'))), Action::None);
-        assert!(!render_lines(&s).last().unwrap().contains("[f]"));
-        assert_eq!(render_lines(&s).last().unwrap(), "[r] Rescan   [q] Skip");
     }
 
     #[test]

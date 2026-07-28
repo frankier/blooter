@@ -76,8 +76,7 @@
 #              Registers a GATT server and an LE advertisement; no
 #              `bluetoothd -P input` and no privileged port bind required.
 #   "classic"  Bluetooth Classic (BR/EDR) HID. Needs `bluetoothd -P input` and
-#              privilege to bind the HID L2CAP PSMs, and is the only transport
-#              with `[f] Fix connection` (design/CONNECTION.md §7).
+#              privilege to bind the HID L2CAP PSMs.
 #protocol = "ble"
 
 # How the pairing agent answers bonding requests (see design/CONNECTION.md §5).

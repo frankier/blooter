@@ -102,9 +102,9 @@ harness starts **no btvirt and no bluetoothd** — the mock is the whole stack.
   calls `Pair` and then `Connect`, but the mock does not drive the resulting
   agent exchange, so the outgoing-pair path is not exercised end to end. The
   Classic pick is not covered at all.
-- **`[f] Fix connection`** — its presence in the footer is asserted (and its
-  absence on BLE), but not the unplug-and-unbond it performs, which needs a real
-  link.
+- **`[f] Fix connection`** — its presence in the footer is asserted on both
+  transports, but not what it performs (the Classic unplug-and-unbond, the BLE
+  connect-and-churn), which needs a real link.
 - **The BLE link itself** — advertising, the CCCD subscribe and report
   notifications are `tests/btvirt`; here the LE transport's GATT registration is
   a mock stub.

@@ -254,6 +254,16 @@ def test_ble_advertises_hogp_gatt_tree(t):
     assert len(handles) == 2, \
         f"expected mouse + keyboard Report characteristics, got {handles}"
 
+    # The layout characteristic puts the descriptor fingerprint where the GATT
+    # Database Hash covers it, so a host caching the Report Map can see a
+    # descriptor change (design/CONNECTION.md §7.2b). Its UUID tail is the
+    # fingerprint, which is not fixed here — only that it is non-zero, i.e. that
+    # a real fingerprint was registered.
+    uuid = host.layout_uuid()
+    assert uuid, f"no layout characteristic in blooter's GATT tree:\n{host.output()}"
+    assert uuid.split("-")[-1][-8:] != "00000000", \
+        f"layout characteristic carries no fingerprint: {uuid}"
+
 
 @tests.test
 def test_ble_subscribe_connects(t):

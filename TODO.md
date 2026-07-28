@@ -28,10 +28,12 @@ Roughly in order of how much risk they carry.
   asserts that a BLE pick calls `Pair` then `Connect`, but the mock accepts
   `Pair` without driving the resulting agent exchange, and the Classic pick stops
   at the UI.
-- **`[f] Fix connection`** (§7). Only its presence in the footer is asserted. The
-  unplug + unbond it performs needs a real link, so it belongs in
-  `tests/btvirt` — but it also needs a bonded peer that can be re-paired
-  afterwards, which is the shared-agent problem below.
+- **`[f] Fix connection`** (§7). Only its presence in the footer is asserted, on
+  either transport. What it performs needs a real link, so it belongs in
+  `tests/btvirt`: the Classic unplug + unbond needs a bonded peer that can be
+  re-paired afterwards (the shared-agent problem below), and the BLE repair needs
+  a peer that observes the Service Changed indication and re-reads the Report Map
+  — neither of which the `btvirt` peer does today.
 - **First-contact pairing over a real link.** `tests/btvirt` bonds the two
   controllers *before* blooter starts, to dodge the shared-agent artifact, so
   every test there exercises the already-bonded reconnect path. Pairing a
@@ -99,13 +101,14 @@ Roughly in order of how much risk they carry.
   `payload.to_vec()` — on the hot path AGENTS.md calls out. Batching cuts how
   often this runs, but the allocation should go: reuse a per-connection buffer
   and copy into it, or hold the notifier without the map lookup.
-- **BLE has no "fix connection" for a descriptor change.** The GATT tree
-  (`hid_service`, `transport/le.rs`) declares no Service Changed characteristic
-  (`0x2A05`), and `Le` never touches `state::Hosts`. Hosts cache the Report Map
-  across a bond exactly as Classic hosts cache the SDP record, so changing
-  `[gamepad] slots` or `[pointer] axis_bits` leaves a bonded BLE host misreading
-  reports with no way to repair it short of re-pairing by hand. Since BLE is the
-  default transport this is the bigger of the two caching gaps.
+- **The BLE "fix connection" repair is unverified against real hosts.** The
+  mechanism (CONNECTION.md §7.2b) is spec-correct, but which hosts act on it is
+  not established: whether a BlueZ host's `input/hog-lib.c` re-reads the Report
+  Map after a Database Hash mismatch or a Service Changed indication (as opposed
+  to only after a fresh pairing), and the same question for Windows and Android.
+  Worth a matrix of {BlueZ, Windows, Android} × {`slots` change, `axis_bits`
+  change} × {automatic on reconnect, explicit `[f]`}. Where a host ignores it,
+  the fallback is the manual re-pair blooter already prints.
 
 ## Done since (kept here for history)
 

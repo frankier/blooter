@@ -175,8 +175,7 @@ excess goes out as extra reports, so nothing is lost; `"carry"` spreads it over
 following reports instead, and `"clamp"` drops it. Setting
 `[pointer] axis_bits = 16` widens the axes to ±32767 so this stops arising at
 all — but it changes the HID report descriptor, which hosts cache, so already
-paired hosts need fixing (`[f]` in the connection menu, on Classic) or
-re-pairing (on BLE).
+paired hosts need fixing (`[f]` in the connection menu).
 
 ## How it works
 
@@ -215,14 +214,24 @@ built-in agent (`[connection] pairing`). See
 
 ### Fixing a host that ignores a layout change
 
-*(Classic only.)* Hosts cache blooter's HID descriptor for the lifetime of their bond, so changing
-the number of advertised gamepads has **no effect on an already-paired host** —
-it keeps using the layout it cached, and the new controller silently never shows
-up. blooter warns about such hosts at startup and marks them `stale` in the
-connection menu; select one and press **`[f]`** to fix it. That tells the host to
-forget blooter (an HID virtual-cable unplug) and drops the bond on both sides, so
-re-pairing from that host picks up the current layout. Setting a fixed
-`[gamepad] slots = N` avoids the situation entirely. See
+Hosts cache blooter's HID descriptor for the lifetime of their bond, so changing
+the number of advertised gamepads (or the pointer axis width) has **no effect on
+an already-paired host** — it keeps using the layout it cached, and the new
+controller silently never shows up. blooter warns about such hosts at startup and
+marks them `stale` in the connection menu; select one and press **`[f]`** to fix
+it.
+
+What that does depends on the transport. On **BLE** it connects to the host and
+changes blooter's GATT database under it, which makes bluetoothd tell the host
+its cached copy is stale (a Service Changed indication); the host re-reads the
+layout by itself, with no re-pairing. Many hosts pick the change up on their own
+at the next connection, without `[f]`. On **Classic** it tells the host to forget
+blooter (an HID virtual-cable unplug) and drops the bond on both sides, so
+re-pairing from that host picks up the current layout.
+
+Either way, a host that cannot be reached (or that ignores the notification) has
+to be repaired by hand: remove blooter from its Bluetooth settings and pair
+again. Setting a fixed `[gamepad] slots = N` avoids the situation entirely. See
 [design/CONNECTION.md](design/CONNECTION.md) §7.
 
 ## Exit codes

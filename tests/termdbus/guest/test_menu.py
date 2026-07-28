@@ -297,15 +297,16 @@ def test_ble_appearance_moves_peripherals_to_other_devices(t):
 
 
 @tests.test
-def test_ble_offers_no_fix_for_a_bonded_host(t):
-    """`[f] Fix connection` unplugs a cached SDP record, which BLE has none of,
-    so it must not be offered even on a bonded host (design/CONNECTION.md §7)."""
+def test_ble_offers_fix_for_a_bonded_host(t):
+    """A BLE host caches blooter's GATT database — the Report Map with it —
+    across its bond, and `[f] Fix connection` invalidates that with a Service
+    Changed indication, so it is offered here too (design/CONNECTION.md §7)."""
     t.mock.add_device(LAPTOP, "my-laptop", cls=None, paired=True,
                       appearance=APPEARANCE_COMPUTER)
     term = t.menu(protocol="ble")
 
     assert_screen_contains(term, "[paired", "the paired status marker")
-    assert_menu_lacks(term, "[f] Fix connection", "fix offered on BLE")
+    assert_screen_contains(term, "[f] Fix connection", "the fix action")
 
 
 @tests.test

@@ -308,6 +308,7 @@ async fn run(args: cli::Args) -> Result<(), AppError> {
                     cfg.axis_bits,
                     target,
                     interactive && !args.nosetup,
+                    hosts.clone(),
                     term_coord.clone(),
                 )
                 .await?,
