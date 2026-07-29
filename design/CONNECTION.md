@@ -263,16 +263,22 @@ small `crossterm`-based TUI: arrow keys move, number keys pick a host, letter
 keys drive actions (`[o]` Other devices, `[r]` Rescan, `[q]`/Enter skip).
 Bluetooth audio/headsets and devices with no real name (only a hex identifier)
 are moved to an **"Other devices"** submenu so the main list shows just plausible
-HID hosts.
+HID hosts — except that an already-bonded device always stays on the main list.
 
 **Both transports run the same menu.** `menu::Kind` carries the only difference:
 the discovery filter (`bredr` vs `le`, so the list only offers devices reachable
 over the transport in use). `[f] Fix connection` is offered on either, on any
 bonded host; what it *does* is transport-specific (§7). Classification handles
-both worlds: a device is "Other" if it
-has no real name, if its **Class of Device** is audio (BR/EDR), or if its **GAP
-Appearance** category is HID or audio (LE); each property check simply falls
-through when the peer does not carry that property. `menu::Session` wraps the
+both worlds: a **paired** device is never "Other" (bonding it was a deliberate
+choice, and it outranks every heuristic below, including the name check);
+otherwise a device is "Other" if it has no real name, if its **Class of Device**
+is audio (BR/EDR), or if its **GAP Appearance** category is HID or audio (LE);
+each property check simply falls through when the peer does not carry that
+property. "Audio" here means the *device* is audio, not that it merely speaks
+audio: within the Audio/Video major class the display-type minor classes (TV,
+monitor, set-top box, video conferencing, console) are hosts, and the Audio
+service-class bit only demotes a device whose major class is not already a
+plausible host — laptops and TVs routinely advertise A2DP. `menu::Session` wraps the
 spawn/cancel/join plumbing so each transport's `wait_connected` drives the menu
 identically — it must be a *local* of `wait_connected`, since its `&mut` borrow
 in a `select!` arm would otherwise conflict with the shared `&self` the
@@ -487,7 +493,7 @@ only starts at all on the interactive rows.
   performing a `[f]` fix once those futures are gone (§7.2b).
 - **`menu.rs`** — the interactive `crossterm` TUI, shared by both transports:
   `run` scans (filtered to the transport's `menu::Kind`), lists eligible hosts
-  (audio/nameless devices under an "Other devices" submenu), navigates by
+  (unpaired audio/nameless devices under an "Other devices" submenu), navigates by
   arrow/number/letter keys with a rescan action, pairs a newly-picked (unbonded)
   host from here, and returns a `Pick` (address + whether `[f]` asked for a fix,
   §7). Marks stale hosts. Pre-emptable via a `oneshot` cancel; a

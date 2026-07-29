@@ -13,7 +13,8 @@
 //!
 //! Ineligible devices — Bluetooth audio/headsets, and devices with no real name
 //! (only a hex identifier) — are moved to an "Other devices" submenu so the main
-//! list shows just plausible HID hosts (computers/phones).
+//! list shows just plausible HID hosts (computers/phones/TVs). Already-paired
+//! devices always stay on the main list: bonding one was a deliberate choice.
 
 use std::future;
 use std::io::{self, Write};
@@ -131,24 +132,60 @@ const APPEARANCE_HID: u16 = 0x0f;
 const APPEARANCE_AUDIO_SINK: u16 = 0x21;
 const APPEARANCE_AUDIO_SOURCE: u16 = 0x22;
 
+/// Minor device classes within the Audio/Video major class that are display-type
+/// devices — TVs, set-top boxes, consoles — and so plausible HID hosts, unlike
+/// the speakers and headsets that share the major class with them.
+const AV_MINOR_HOSTS: [u32; 5] = [
+    0x09, // Set-top box
+    0x0e, // Video Monitor
+    0x0f, // Video Display and Loudspeaker
+    0x10, // Video Conferencing
+    0x12, // Gaming/Toy
+];
+
 /// True if a device belongs in the "Other devices" submenu rather than the main
-/// host list. Strict rule, applied uniformly (even to paired/connected devices):
-/// a device is "Other" if it has no real name, if its Class of Device marks it
-/// as audio (headset/speaker/etc.), or if its GAP Appearance marks it as another
-/// HID peripheral or an audio device. Both property checks are applied whenever
-/// the property is present — LE-only peers have no Class of Device and BR/EDR
-/// peers usually have no Appearance, so each simply falls through for the other.
-/// A named device with neither marker stays in the main list.
-fn is_other(class: Option<u32>, appearance: Option<u16>, has_real_name: bool) -> bool {
+/// host list. A bond outranks every heuristic: pairing is an explicit decision
+/// that this device is a host worth using, so a paired device is never filed
+/// under "Other" whatever it claims to be. Otherwise a device is "Other" if it
+/// has no real name, if its Class of Device marks it as a non-display audio
+/// device, or if its GAP Appearance marks it as another HID peripheral or an
+/// audio device. Both property checks are applied whenever the property is
+/// present — LE-only peers have no Class of Device and BR/EDR peers usually have
+/// no Appearance, so each simply falls through for the other. A named device
+/// with neither marker stays in the main list.
+fn is_other(
+    class: Option<u32>,
+    appearance: Option<u16>,
+    has_real_name: bool,
+    paired: bool,
+) -> bool {
+    if paired {
+        return false;
+    }
     if !has_real_name {
         return true;
     }
-    // Major device class (bits 8-12) == 4 is Audio/Video; the Audio service
-    // class flag is bit 21. Either marks a headset/speaker-type device.
-    if let Some(c) = class
-        && (((c >> 8) & 0x1f) == 4 || (c & (1 << 21)) != 0)
-    {
-        return true;
+    if let Some(c) = class {
+        // Major device class is bits 8-12, minor device class bits 2-7.
+        let major = (c >> 8) & 0x1f;
+        let minor = (c >> 2) & 0x3f;
+        // Computers and phones are hosts, and so are the display-type members of
+        // the Audio/Video major class (a TV is as good a host as a laptop).
+        let host_class = match major {
+            1 | 2 => true,
+            4 => AV_MINOR_HOSTS.contains(&minor),
+            _ => false,
+        };
+        // Anything else in Audio/Video is a headset/speaker/camera.
+        if major == 4 && !host_class {
+            return true;
+        }
+        // The Audio *service* class flag (bit 21) only demotes a device whose
+        // major class is not itself a plausible host: laptops and TVs routinely
+        // advertise A2DP without ceasing to be hosts.
+        if !host_class && (c & (1 << 21)) != 0 {
+            return true;
+        }
     }
     matches!(
         appearance.map(|a| a >> 6),
@@ -452,7 +489,7 @@ async fn collect(adapter: &Adapter, stale: &[Address]) -> (Vec<(Row, Device)>, V
             // Only a bond carries a cached record, so only bonded hosts can be stale.
             stale: paired && stale.contains(&addr),
         };
-        if is_other(class, appearance, has_real_name) {
+        if is_other(class, appearance, has_real_name, paired) {
             other.push((row, dev));
         } else {
             main.push((row, dev));
@@ -830,27 +867,47 @@ mod tests {
 
     #[test]
     fn classify_audio_major_class() {
-        // Major class 4 (Audio/Video), e.g. a headset.
-        assert!(is_other(Some(0x0024_0404), None, true));
+        // Major class 4 (Audio/Video), e.g. a headset (minor 0x01) or a
+        // loudspeaker (minor 0x05).
+        assert!(is_other(Some(0x0024_0404), None, true, false));
+        assert!(is_other(Some(0x0000_0414), None, true, false));
     }
 
     #[test]
     fn classify_audio_service_bit() {
-        assert!(is_other(Some(1 << 21), None, true));
+        // The bare service bit on an otherwise uninformative class still demotes.
+        assert!(is_other(Some(1 << 21), None, true, false));
+        // But a computer advertising A2DP is still a computer.
+        assert!(!is_other(Some(0x0020_010c), None, true, false));
+    }
+
+    #[test]
+    fn classify_display_av_devices_are_hosts() {
+        // Major class 4 covers TVs too: minor 0x0F (Video Display and
+        // Loudspeaker, audio service bit set) and minor 0x09 (set-top box).
+        assert!(!is_other(Some(0x0024_043c), None, true, false));
+        assert!(!is_other(Some(0x0000_0424), None, true, false));
     }
 
     #[test]
     fn classify_no_name_is_other() {
-        assert!(is_other(Some(0x0000_010c), None, false));
-        assert!(is_other(None, None, false));
+        assert!(is_other(Some(0x0000_010c), None, false, false));
+        assert!(is_other(None, None, false, false));
+    }
+
+    #[test]
+    fn classify_paired_devices_stay_on_main() {
+        // A bond beats every other signal, including a missing name.
+        assert!(!is_other(Some(0x0024_0404), Some(0x0841), false, true));
+        assert!(!is_other(None, None, false, true));
     }
 
     #[test]
     fn classify_named_hosts_are_main() {
         // Computer (major 1) and phone (major 2), and an unknown class but named.
-        assert!(!is_other(Some(0x0000_010c), None, true)); // major 1 computer
-        assert!(!is_other(Some(0x0000_020c), None, true)); // major 2 phone
-        assert!(!is_other(None, None, true));
+        assert!(!is_other(Some(0x0000_010c), None, true, false)); // major 1 computer
+        assert!(!is_other(Some(0x0000_020c), None, true, false)); // major 2 phone
+        assert!(!is_other(None, None, true, false));
     }
 
     #[test]
@@ -858,14 +915,14 @@ mod tests {
         // LE-only peers carry no Class of Device, so the GAP Appearance decides.
         // Keyboard (0x03C1) and mouse (0x03C2) are category 0x0F (HID); a
         // standalone speaker (0x0841) is category 0x21 (Audio Sink).
-        assert!(is_other(None, Some(0x03C1), true));
-        assert!(is_other(None, Some(0x03C2), true));
-        assert!(is_other(None, Some(0x0841), true));
+        assert!(is_other(None, Some(0x03C1), true, false));
+        assert!(is_other(None, Some(0x03C2), true, false));
+        assert!(is_other(None, Some(0x0841), true, false));
         // Generic Computer (0x0080) and Generic Phone (0x0040) are hosts, and so
         // is anything with an unknown/unset appearance.
-        assert!(!is_other(None, Some(0x0080), true));
-        assert!(!is_other(None, Some(0x0040), true));
-        assert!(!is_other(None, Some(0x0000), true));
+        assert!(!is_other(None, Some(0x0080), true, false));
+        assert!(!is_other(None, Some(0x0040), true, false));
+        assert!(!is_other(None, Some(0x0000), true, false));
     }
 
     #[test]

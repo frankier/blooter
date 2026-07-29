@@ -644,8 +644,8 @@ fn chord_advance(hotkeys: &Hotkeys, state: &mut InputState, code: u16) -> bool {
         let steps = &hotkeys.chords()[cand.chord as usize].steps;
         // Only the first key of a chord is ordered; the rest may arrive in any
         // order, so any not-yet-matched step will do.
-        let Some(step) = (1..steps.len())
-            .find(|&s| cand.matched & (1 << s) == 0 && steps[s].matches(code))
+        let Some(step) =
+            (1..steps.len()).find(|&s| cand.matched & (1 << s) == 0 && steps[s].matches(code))
         else {
             continue;
         };
@@ -912,7 +912,10 @@ mod tests {
     fn bare_trigger_key_is_forwarded() {
         let hk = Hotkeys::default();
         let mut s = InputState::default();
-        assert_eq!(mods(&one(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 1))), 0x20);
+        assert_eq!(
+            mods(&one(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 1))),
+            0x20
+        );
         // Shifted letter reaches the host with the modifier set.
         assert_eq!(
             mods(&one(&hk, &mut s, key(keymap::KEY_A, 1))),
@@ -920,7 +923,10 @@ mod tests {
             "Right Shift + 'a' must arrive shifted"
         );
         tr(&hk, &mut s, key(keymap::KEY_A, 0));
-        assert_eq!(mods(&one(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 0))), 0x00);
+        assert_eq!(
+            mods(&one(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 0))),
+            0x00
+        );
     }
 
     /// A chord prefix is held back, then replayed in press order once it is
@@ -965,7 +971,10 @@ mod tests {
         // Starting with a key that is not first, though, forwards it: Right
         // Shift then Left Shift is not the capture toggle.
         s.reset();
-        assert_eq!(mods(&one(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 1))), 0x20);
+        assert_eq!(
+            mods(&one(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 1))),
+            0x20
+        );
         assert!(tr(&hk, &mut s, key(keymap::KEY_LEFTSHIFT, 1)).is_empty());
         let outs = tr(&hk, &mut s, key(keymap::KEY_LEFTSHIFT, 0));
         assert_eq!(outs.len(), 2);
@@ -989,7 +998,10 @@ mod tests {
         assert_eq!(s.modifiers, 0x00);
         // Once released, those keys forward normally again.
         s.capture = true;
-        assert_eq!(mods(&one(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 1))), 0x20);
+        assert_eq!(
+            mods(&one(&hk, &mut s, key(keymap::KEY_RIGHTSHIFT, 1))),
+            0x20
+        );
     }
 
     /// Pointer activity passes through without disturbing a buffered prefix.

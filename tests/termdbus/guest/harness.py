@@ -42,6 +42,8 @@ AGENT_MANAGER_PATH = "/org/bluez"
 # Class-of-device values used to drive the "Other devices" split (menu.rs::is_other).
 CLASS_COMPUTER = 0x00010C  # major class 1 (computer) -- stays in the main list
 CLASS_HEADSET = 0x240404  # major class 4 (audio/video) -- goes to "Other devices"
+CLASS_TV = 0x24043C  # major 4 / minor 0x0F (display) -- stays in the main list
+CLASS_COMPUTER_AUDIO = 0x20010C  # a computer advertising A2DP -- stays in the main list
 
 # GAP Appearance values, the LE counterpart of the classes above: LE-only peers
 # carry no Class of Device, so menu.rs::is_other falls through to these.
