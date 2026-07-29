@@ -2,7 +2,7 @@
 
 A Bluetooth **HID device emulator** — it makes a Linux machine appear
 to remote hosts as a Bluetooth keyboard + mouse (and, optionally, one or more
-gamepads). It reads local Linux input events (`/dev/input/event*` or a FIFO),
+gamepads, or a TV remote). It reads local Linux input events (`/dev/input/event*` or a FIFO),
 translates them into Boot-style HID input reports, and forwards them to a
 connected host over **Bluetooth Low Energy** (HID-over-GATT, the default) or
 **Bluetooth Classic** (BR/EDR L2CAP), selected with `[connection] protocol`.
@@ -157,6 +157,50 @@ With an explicit `-e` selection, only the listed event numbers are opened. This
 needs system **libudev** (a build- and run-time dependency, present on any
 systemd/udev Linux).
 
+### TV remote
+
+With `[remote] enabled = true` blooter also presents a **Consumer Control**
+collection — the same thing every Bluetooth TV remote is under the hood — so it
+can drive volume, power, transport controls and the TV-specific buttons
+(channels, guide, coloured keys, captions, "switch to TV"). It is **off by
+default**, because turning it on changes the HID report descriptor and
+already-paired hosts cache that (see "Fixing a host that ignores a layout change"
+below).
+
+It has two halves:
+
+- **Passthrough** (`passthrough = true`, the default once enabled) forwards the
+  media keys your own keyboard already has — volume, mute, play/pause, next,
+  previous, search, home, back — which are otherwise dropped, because they are
+  outside the keyboard usage range. Set it to `false` to keep those keys
+  controlling the local machine.
+- **Bindings** for the remote buttons a keyboard has no key for. Each is a
+  chord, in the same syntax as `[hotkeys]`, because blooter's premise is that
+  every key is forwarded — stealing a bare key to mean "channel up" would be a
+  regression, while a chord is invisible to the host until it fires:
+
+  ```toml
+  [remote]
+  enabled      = true
+  tv           = "leftmeta+t"
+  guide        = "leftmeta+g"
+  channel_up   = "leftmeta+pageup"
+  channel_down = "leftmeta+pagedown"
+  ```
+
+  A fired binding is a **tap** — press and release — so channel-surfing means
+  repeating the chord rather than holding it.
+
+What a given host does with each button is up to that host: on an Android TV or
+Fire TV box volume and power are relayed to the television over HDMI-CEC, so a
+blooter remote does control the TV's volume and standby. **Switching the TV's
+input is not reachable** — that is a CEC operation, not a HID one, and no
+Bluetooth remote protocol exposes it. Navigation (D-pad, OK, digits, text entry)
+goes through the ordinary keyboard collection, which already works.
+
+See [design/REMOTE.md](design/REMOTE.md) for the full button table, the
+per-host behaviour and why input switching is out of reach.
+
 ### Pointer batching
 
 A mouse or touchpad produces events far faster than a Bluetooth link carries
@@ -226,9 +270,9 @@ built-in agent (`[connection] pairing`). See
 ### Fixing a host that ignores a layout change
 
 Hosts cache blooter's HID descriptor for the lifetime of their bond, so changing
-the number of advertised gamepads (or the pointer axis width) has **no effect on
-an already-paired host** — it keeps using the layout it cached, and the new
-controller silently never shows up. blooter warns about such hosts at startup and
+the number of advertised gamepads, the pointer axis width or `[remote] enabled`
+has **no effect on an already-paired host** — it keeps using the layout it
+cached, and the new controller (or remote) silently never shows up. blooter warns about such hosts at startup and
 marks them `stale` in the connection menu; select one and press **`[f]`** to fix
 it.
 
@@ -242,8 +286,9 @@ re-pairing from that host picks up the current layout.
 
 Either way, a host that cannot be reached (or that ignores the notification) has
 to be repaired by hand: remove blooter from its Bluetooth settings and pair
-again. Setting a fixed `[gamepad] slots = N` avoids the situation entirely. See
-[design/CONNECTION.md](design/CONNECTION.md) §7.
+again. Setting a fixed `[gamepad] slots = N` avoids the gamepad case entirely,
+and settling `[remote]` and `[pointer] axis_bits` before pairing widely avoids
+the rest. See [design/CONNECTION.md](design/CONNECTION.md) §7.
 
 ## Exit codes
 

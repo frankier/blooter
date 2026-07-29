@@ -35,6 +35,9 @@ INTERRUPT_PSM = 0x13
 HIDP_DATA_INPUT = 0xA1
 REPORT_ID_MOUSE = 0x01
 REPORT_ID_KEYBOARD = 0x02
+# With no gamepads (FIFO mode has none) the consumer collection takes the next
+# id after the keyboard's (design/REMOTE.md §3.1).
+REPORT_ID_CONSUMER = 0x03
 
 # HID_CONTROL | VIRTUAL_CABLE_UNPLUG -- "forget this device" (classic.rs).
 VIRTUAL_CABLE_UNPLUG = 0x15
@@ -53,6 +56,12 @@ EV_REL = 0x02
 SYN_REPORT = 0x00
 KEY_A = 30
 KEY_B = 48
+KEY_T = 20
+KEY_LEFTMETA = 125
+KEY_VOLUMEUP = 115
+# Consumer-page usages (design/REMOTE.md §2).
+CONSUMER_VOLUME_UP = 0x0E9
+CONSUMER_TV = 0x089
 BTN_LEFT = 0x110
 REL_X = 0x00
 REL_Y = 0x01
@@ -400,11 +409,14 @@ class Blooter:
     """
 
     def __init__(self, binary, extra_args=(), fifo=None, protocol="classic",
-                 batch="none"):
+                 batch="none", config_extra=""):
         self.binary = binary
         self.fifo_path = fifo or os.path.join(RUNDIR, "blooter.fifo")
         self.extra_args = list(extra_args)
         self.protocol = protocol
+        # Extra TOML appended verbatim, for tests that need a section the
+        # fixed preamble below does not write (e.g. [remote]).
+        self.config_extra = config_extra
         # Default to unbatched so a report arrives per injected frame; tests
         # that exercise batching pass batch="auto" or a millisecond count.
         self.batch = batch
@@ -426,6 +438,7 @@ class Blooter:
             batch = (self.batch if isinstance(self.batch, int)
                      else f'"{self.batch}"')
             fh.write(f'[pointer]\nbatch = {batch}\n')
+            fh.write(self.config_extra)
 
         env = dict(os.environ, RUST_BACKTRACE="1")
         # Full adapter setup is deliberately left on (no `-n`): blooter making
@@ -714,6 +727,13 @@ def mouse_report(buttons=0, x=0, y=0, wheel=0):
                   x & 0xFF, y & 0xFF, wheel & 0xFF])
 
 
+def consumer_report(usage=0):
+    """A 4-byte consumer report: the held usage little-endian, or nothing held
+    (design/REMOTE.md §4)."""
+    return bytes([HIDP_DATA_INPUT, REPORT_ID_CONSUMER]) + \
+        usage.to_bytes(2, "little")
+
+
 def describe(report):
     return " ".join(f"{b:02x}" for b in report) if report else "<empty>"
 
@@ -787,9 +807,11 @@ class TestContext:
         self.blooter = None
         self.hosts = []
 
-    def start_blooter(self, extra_args=(), protocol="classic", batch="none"):
+    def start_blooter(self, extra_args=(), protocol="classic", batch="none",
+                      config_extra=""):
         self.blooter = Blooter(self.binary, extra_args=extra_args,
-                               protocol=protocol, batch=batch).start()
+                               protocol=protocol, batch=batch,
+                               config_extra=config_extra).start()
         return self.blooter
 
     def host(self):

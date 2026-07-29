@@ -347,10 +347,12 @@ descriptor has no effect on an already-bonded host**: it keeps driving the layou
 it cached when it first paired. The descriptor changes whenever the advertised
 gamepad slot count does (ARCH.md §3.2) — which under the default
 `slots = "initial"` happens simply by plugging a controller in before startup —
-or whenever `[pointer] axis_bits` changes.
+whenever `[pointer] axis_bits` changes, or whenever `[remote] enabled` is turned
+on or off (REMOTE.md §3.2).
 
 The symptom is silent: the host connects, keyboard and mouse work, and the newly
-advertised gamepad never appears — no error on either side.
+advertised gamepad — or the TV remote — never appears, with no error on either
+side.
 
 Detection (§7.1) is shared. The repair is transport-specific: a virtual-cable
 unplug on Classic (§7.2a), a Service Changed indication on BLE (§7.2b).
@@ -452,7 +454,9 @@ Ruled out by experiment before settling on the unplug (Classic):
 A fixed `[gamepad] slots = N` keeps the descriptor stable across runs regardless
 of what is plugged in, so the situation never arises. `slots = "initial"` (the
 default) re-derives it from the controllers present at startup and can therefore
-change it from run to run.
+change it from run to run. `[remote] enabled` and `[pointer] axis_bits` are
+one-off decisions rather than per-run ones: settle them before pairing widely,
+and every bond afterwards carries the layout you want.
 
 ## 8. Scenario matrix
 

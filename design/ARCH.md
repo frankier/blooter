@@ -142,10 +142,12 @@ attributes (BlueZ record-XML syntax):
 
 ### 3.2 HID report descriptor
 
-The descriptor is assembled dynamically by
-`sdp::report_descriptor(n_gamepads, axis_bits)`: a **mouse collection** in one of
-two axis widths, the fixed **44-byte keyboard collection**, then one **85-byte
-gamepad collection** per advertised controller. With 8-bit axes the mouse
+The descriptor is assembled dynamically by `sdp::report_descriptor(layout)`,
+where `sdp::Layout` is the gamepad slot count, the axis width and whether the
+TV-remote collection is on: a **mouse collection** in one of two axis widths, the
+fixed **44-byte keyboard collection**, one **85-byte gamepad collection** per
+advertised controller, and finally — with `[remote] enabled` — the **25-byte
+Consumer Control collection** (REMOTE.md §3). With 8-bit axes the mouse
 collection is 54 bytes, so the base is the original **98 bytes**; with 16-bit
 axes (§7.2c) it is 66 bytes, for a **110-byte** base.
 
@@ -214,14 +216,23 @@ Generic-Desktop Gamepad application collection with Report ID **3, 4, …** (bas
 - Sticks X, Y, Rx, Ry: 4 × 8-bit input (Data,Var,Abs), logical 0–255
 - Triggers Z, Rz: 2 × 8-bit input (Data,Var,Abs), logical 0–255
 
-Report IDs 1 (mouse), 2 (keyboard) and 3+ (gamepads) and the wire formats in §5
-are kept in sync with this descriptor.
+**Consumer Control collection (25 bytes, `sdp::consumer_block`):** present only
+with `[remote] enabled`, and emitted *after* every gamepad so that enabling it
+shifts no other report ID and leaving it off reproduces the descriptor
+byte-for-byte. Its report ID is therefore `3 + n_gamepads`. One 16-bit array
+item, logical and usage range `0x0000`–`0x02A2`, Report Count 1: the report
+carries the usage code of the single remote button held, `0x0000` for none. See
+REMOTE.md §3 for the byte listing and §2 for which usages a host acts on.
+
+Report IDs 1 (mouse), 2 (keyboard), 3+ (gamepads) and `3 + n_gamepads`
+(consumer) and the wire formats in §5 are kept in sync with this descriptor.
 
 **Hosts cache this descriptor.** A remote host reads it once, when it bonds — the
 SDP record on Classic, the Report Map characteristic on BLE — and keeps it for
 the lifetime of the bond, so changing the descriptor (i.e. changing the
-advertised gamepad slot count or the axis width) is invisible to hosts that
-already paired, and the new layout silently never appears on them. blooter
+advertised gamepad slot count, the axis width or the remote) is invisible to hosts that
+already paired, and the new layout silently never appears on them — the same
+applies to turning `[remote]` on (REMOTE.md §3.2). blooter
 fingerprints the descriptor and offers a "fix connection" action to clear a host's
 cached copy; see CONNECTION.md §7.
 
@@ -293,10 +304,11 @@ device, one advertisement set per adapter suffices.
   - **HID Information (`0x2A4A`)** — read: bcdHID `0x0111`, country code `0`,
     flags = NormallyConnectable.
   - **Report Map (`0x2A4B`)** — read: the HID report descriptor bytes, exactly
-    the output of `sdp::report_descriptor(n_gamepads)` (the same descriptor the
+    the output of `sdp::report_descriptor(layout)` (the same descriptor the
     classic path embeds in its SDP record, §3.2; the SDP *XML* is classic-only).
   - **Report (`0x2A4D`)** — one instance per report blooter sends: mouse (id 1),
-    keyboard (id 2), and each gamepad (id 3+). Each is Read + **Notify**, has a
+    keyboard (id 2), each gamepad (id 3+) and, with `[remote] enabled`, the
+    consumer collection (id `3 + n_gamepads`). Each is Read + **Notify**, has a
     **Report Reference** descriptor (`0x2908` = `[report_id, type=Input(1)]`) and
     a **CCCD** (`0x2902`, added automatically by BlueZ for a notify
     characteristic). Reads require an encrypted link.
@@ -329,7 +341,9 @@ cannot register them, only change the database they describe.
 - **Advertising:** advertisement type Peripheral, the HID service UUID
   (`0x1812`), local name `blooter`, Keyboard **Appearance** (`0x03C1`) — a combo
   keyboard/mouse device advertises the keyboard icon, matching the identity the
-  classic transport sets as its Class of Device — and discoverable/connectable.
+  classic transport sets as its Class of Device, and it stays `0x03C1` with the
+  TV remote enabled too, since hosts key HID handling off the report map rather
+  than the appearance (REMOTE.md §9) — and discoverable/connectable.
   This replaces the Class-of-Device and adapter-name logic of `setup.rs`, which
   is not run in LE mode.
 - **Pairing / bonding:** HOGP requires an encrypted, bonded link before reports
@@ -404,6 +418,14 @@ signed 8-bit Wheel in byte 7. This is the width at which accumulated motion
 
 Each gamepad report is a full snapshot, re-sent whenever any control on that
 controller changes.
+
+**Consumer report — 4 bytes** (only with `[remote] enabled`, REMOTE.md §4):
+
+| Byte | Meaning |
+|---|---|
+| 0 | `0xA1` |
+| 1 | Report ID = `3 + n_gamepads` |
+| 2–3 | The Consumer-page usage currently held, little-endian; `00 00` for none |
 
 ## 6. Input sources
 
@@ -650,9 +672,12 @@ range (Keyboard/Keypad page, usages 4–99):
 | `KEY_NUMLOCK`, `KEY_KPSLASH`, `KEY_KPASTERISK`, `KEY_KPMINUS`, `KEY_KPPLUS`, `KEY_KPENTER` | 83, 84, 85, 86, 87, 88 |
 | `KEY_KP1` … `KEY_KP9`, `KEY_KP0`, `KEY_KPDOT` | 89 … 97, 98, 99 |
 
-Everything else (media keys, `KEY_MENU`, …) is unmapped/ignored, matching the
-usage range 0–0x65 declared in the report descriptor. A key taking part in a
-chord is mapped no differently; whether it reaches the host is decided earlier,
+Everything else — media keys, `KEY_MENU`, `KEY_SEARCH`, … — is outside the usage
+range 0–0x65 the keyboard collection declares. With `[remote]` off it is
+unmapped and ignored; with `[remote] passthrough` on it goes to the *Consumer*
+page instead, via `keymap::consumer_usage` (REMOTE.md §5), and reaches the host
+as a consumer report rather than a keyboard one. A key taking part in a chord is
+mapped no differently either way; whether it reaches the host is decided earlier,
 by the chord buffer (§7.3).
 
 ### 7.5 Gamepad events
@@ -746,6 +771,14 @@ default value commented out.
   descriptor, so bonded hosts must be fixed or re-paired (CONNECTION.md §7).
 - **`[pointer] overflow`** — `"burst"` (default), `"carry"` or `"clamp"`: what
   happens when merged motion exceeds one report's range (§7.2c).
+- **`[remote]`** — TV-remote emulation (REMOTE.md). `enabled` (default `false`)
+  advertises the Consumer Control collection, which changes the descriptor, so
+  bonded hosts must be fixed or re-paired (CONNECTION.md §7). `passthrough`
+  (default `true`) forwards the local keyboard's media keys on the Consumer page
+  (§7.4). Every other key in the table binds a remote button — a name such as
+  `tv` or `channel_up`, or `"usage:0xNNN"` — to a chord in the `[hotkeys]`
+  syntax, capped at `MAX_REMOTE_BINDINGS` (24). With `enabled = false` the
+  bindings are parsed and then ignored, with a warning.
 
 Parse errors report the offending line and abort startup (exit 1).
 

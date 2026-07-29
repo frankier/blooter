@@ -13,16 +13,23 @@ import sys
 
 from harness import (
     BTN_LEFT,
+    CONSUMER_TV,
+    CONSUMER_VOLUME_UP,
     KEY_A,
     KEY_B,
+    KEY_LEFTMETA,
+    KEY_T,
+    KEY_VOLUMEUP,
     REL_X,
     REL_Y,
     Registry,
     assert_report,
+    consumer_report,
     describe,
     keyboard_report,
     le_payload,
     mouse_report,
+    wait_for,
 )
 
 tests = Registry()
@@ -316,6 +323,116 @@ def test_ble_unsubscribe_ends_session(t):
         r"host disconnected", 10.0,
         "blooter to end the session after the host left")
     assert t.blooter.proc.alive(), "blooter exited when the LE host left"
+
+
+# --------------------------------------------------------------------------
+# TV remote (design/REMOTE.md)
+# --------------------------------------------------------------------------
+
+# The remote is off by default precisely so it costs existing bonds nothing, so
+# every test below has to turn it on explicitly.
+REMOTE_CONFIG = '[remote]\nenabled = true\ntv = "leftmeta+t"\n'
+
+
+def consumer_payloads(host):
+    """The consumer notifications received so far, in order.
+
+    Identified by length: the consumer report's value is 2 bytes, where the
+    mouse's is 4 and the keyboard's 9 (design/REMOTE.md §4).
+    """
+    return [p for _handle, p in host.notifications() if len(p) == 2]
+
+
+def wait_for_consumer_tail(host, expected, timeout=5.0):
+    """Wait until the last len(expected) consumer notifications are `expected`.
+
+    A tail rather than a `wait_for_notification` per report: a release is
+    `00 00` whatever was released, so matching one anywhere in the history
+    would be satisfied by an earlier release and prove nothing about order.
+    """
+    want = [le_payload(r) for r in expected]
+
+    def check():
+        return consumer_payloads(host)[-len(want):] == want
+
+    try:
+        wait_for(check, timeout, f"consumer reports {[describe(p) for p in want]}")
+    except Exception:
+        got = [describe(p) for p in consumer_payloads(host)]
+        raise AssertionError(
+            f"expected the last consumer reports to be "
+            f"{[describe(p) for p in want]}\n  received: {got or '<none>'}") from None
+
+
+@tests.test
+def test_ble_remote_advertises_a_consumer_report(t):
+    """With [remote] enabled the GATT tree gains a third Report characteristic,
+    for the consumer collection (design/REMOTE.md §3.1, §8)."""
+    t.start_blooter(protocol="ble", config_extra=REMOTE_CONFIG)
+    host = t.le_host().connect()
+
+    handles = host.report_handles()
+    assert len(handles) == 3, \
+        f"expected mouse + keyboard + consumer Report characteristics, got {handles}"
+
+
+@tests.test
+def test_ble_remote_off_by_default(t):
+    """Without the section there is no consumer characteristic at all — the
+    guarantee that makes the feature free for everyone else (§3.1)."""
+    t.start_blooter(protocol="ble")
+    host = t.le_host().connect()
+
+    assert len(host.report_handles()) == 2, \
+        "an unconfigured blooter must advertise no consumer collection"
+
+
+@tests.test
+def test_ble_media_key_passthrough(t):
+    """A media key the keyboard collection cannot carry reaches the host on the
+    consumer one instead (§5)."""
+    t.start_blooter(protocol="ble", config_extra=REMOTE_CONFIG)
+    host = t.connected_le_host()
+
+    t.blooter.key(KEY_VOLUMEUP, True)
+    wait_for_consumer_tail(host, [consumer_report(CONSUMER_VOLUME_UP)])
+    t.blooter.key(KEY_VOLUMEUP, False)
+    wait_for_consumer_tail(host, [consumer_report(CONSUMER_VOLUME_UP),
+                                  consumer_report()])
+
+
+@tests.test
+def test_ble_remote_chord_is_a_tap(t):
+    """A [remote] chord produces exactly two frames — press then release — and
+    forwards neither of its own keys (§6)."""
+    t.start_blooter(protocol="ble", config_extra=REMOTE_CONFIG)
+    host = t.connected_le_host()
+
+    # Anchor the count on a report already waited for, so the zeroed report
+    # blooter pushes at connect cannot still be in flight while counting.
+    t.blooter.key(KEY_VOLUMEUP, True)
+    t.blooter.key(KEY_VOLUMEUP, False)
+    wait_for_consumer_tail(host, [consumer_report(CONSUMER_VOLUME_UP),
+                                  consumer_report()])
+    before = len(consumer_payloads(host))
+
+    t.blooter.key(KEY_LEFTMETA, True)
+    t.blooter.key(KEY_T, True)
+    wait_for_consumer_tail(host, [consumer_report(CONSUMER_TV), consumer_report()])
+    t.blooter.key(KEY_T, False)
+    t.blooter.key(KEY_LEFTMETA, False)
+
+    # Releasing the chord's keys adds nothing: the host never saw them go down,
+    # and the tap does not autorepeat.
+    t.blooter.key(KEY_VOLUMEUP, True)
+    wait_for_consumer_tail(host, [consumer_report(CONSUMER_VOLUME_UP)])
+    assert len(consumer_payloads(host)) == before + 3, \
+        f"a tap plus one press is three reports, got "\
+        f"{[describe(p) for p in consumer_payloads(host)[before:]]}"
+    # Nor did the chord's keys reach the keyboard collection.
+    assert le_payload(keyboard_report(modifiers=0x08)) not in \
+        [p for _h, p in host.notifications()], \
+        "a fired chord must not forward its own keys"
 
 
 def main():

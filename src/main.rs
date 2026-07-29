@@ -145,7 +145,12 @@ async fn run(args: cli::Args) -> Result<(), AppError> {
     // lifetime of their bond, so changing the descriptor — which is exactly what
     // changing the gamepad slot count does — has no effect on an already-bonded
     // host until it is re-paired (design/CONNECTION.md §7).
-    let descriptor_fp = sdp::descriptor_fingerprint(n_gamepads, cfg.axis_bits);
+    let layout = sdp::Layout {
+        n_gamepads,
+        axis_bits: cfg.axis_bits,
+        remote: cfg.remote.enabled,
+    };
+    let descriptor_fp = sdp::descriptor_fingerprint(layout);
     let hosts = std::sync::Arc::new(std::sync::Mutex::new(state::Hosts::load()));
     let stale = hosts.lock().unwrap().stale(descriptor_fp);
     if !stale.is_empty() {
@@ -193,7 +198,9 @@ async fn run(args: cli::Args) -> Result<(), AppError> {
             .map_err(|e| AppError::new(1, format!("signal setup failed: {e}")))?,
     };
 
-    let mut state = InputState::with_gamepads(n_gamepads).with_pointer(cfg.axis_bits, cfg.overflow);
+    let mut state = InputState::with_gamepads(n_gamepads)
+        .with_pointer(cfg.axis_bits, cfg.overflow)
+        .with_remote(cfg.remote);
     let ctx = Ctx {
         hotkeys: &hotkeys,
         capture_tx: &capture_tx,
@@ -230,7 +237,7 @@ async fn run(args: cli::Args) -> Result<(), AppError> {
     let mut discoverable_reset: Option<bluer::Adapter> = None;
     let transport = match cfg.protocol {
         config::Protocol::Classic => {
-            profile_task = register_profile(&session, &args, n_gamepads, cfg.axis_bits).await?;
+            profile_task = register_profile(&session, &args, layout).await?;
             let adapter = if args.nosetup {
                 None
             } else {
@@ -304,8 +311,7 @@ async fn run(args: cli::Args) -> Result<(), AppError> {
             AnyTransport::Le(
                 Le::new(
                     adapter,
-                    n_gamepads,
-                    cfg.axis_bits,
+                    layout,
                     target,
                     interactive && !args.nosetup,
                     hosts.clone(),
@@ -384,8 +390,7 @@ async fn main_loop(
 async fn register_profile(
     session: &Session,
     args: &cli::Args,
-    n_gamepads: usize,
-    axis_bits: config::AxisBits,
+    layout: sdp::Layout,
 ) -> Result<Option<tokio::task::JoinHandle<()>>, AppError> {
     if args.skipsdp {
         return Ok(None);
@@ -397,7 +402,7 @@ async fn register_profile(
         role: Some(Role::Server),
         require_authentication: Some(false),
         require_authorization: Some(false),
-        service_record: Some(sdp::service_record_xml(n_gamepads, axis_bits)),
+        service_record: Some(sdp::service_record_xml(layout)),
         ..Default::default()
     };
     let mut handle = session.register_profile(profile).await.map_err(|e| {

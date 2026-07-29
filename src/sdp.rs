@@ -7,6 +7,26 @@ use crate::config::AxisBits;
 /// report ID 1 and keyboard is report ID 2 (see `BASE_DESCRIPTOR`).
 pub const GAMEPAD_REPORT_ID_BASE: u8 = 3;
 
+/// What the HID report descriptor advertises: the gamepad slot count, the
+/// pointer axis width and whether the Consumer Control ("TV remote") collection
+/// is present. These three always travel together — a change to any of them is
+/// a descriptor change an already-bonded host cannot see (design/CONNECTION.md
+/// §7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Layout {
+    pub n_gamepads: usize,
+    pub axis_bits: AxisBits,
+    /// `[remote] enabled` (design/REMOTE.md §3.1).
+    pub remote: bool,
+}
+
+/// Report ID of the Consumer Control collection, which is emitted last so that
+/// enabling it leaves every other report ID — and, when it is off, the whole
+/// descriptor — byte-identical (design/REMOTE.md §3.1).
+pub fn consumer_report_id(n_gamepads: usize) -> u8 {
+    GAMEPAD_REPORT_ID_BASE + n_gamepads as u8
+}
+
 /// The mouse application collection (report ID 1) with 8-bit relative axes: 54
 /// bytes, X/Y/Wheel in one Input item. The report-count for that item is fixed
 /// to 3 here (see design/ARCH.md §3.2 quirk note); this does not change the wire
@@ -74,19 +94,44 @@ fn gamepad_block(report_id: u8) -> [u8; 85] {
     ]
 }
 
+/// The Consumer Control application collection with the given report ID: 25
+/// bytes. A single 16-bit *array* item carrying the usage code of the button
+/// currently held (`0x0000` = nothing), so the whole page is covered without a
+/// descriptor bit per button and the input report stays 2 bytes. Report Count
+/// is 1: remote buttons are not chorded (design/REMOTE.md §3).
+fn consumer_block(report_id: u8) -> [u8; 25] {
+    [
+        0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0x85, report_id, //
+        // Usage/logical range 0x0000..=0x02A2, the highest usage blooter binds.
+        0x15, 0x00, 0x26, 0xA2, 0x02, 0x19, 0x00, 0x2A, 0xA2, 0x02, //
+        // One 16-bit array element: Input (Data, Array, Absolute).
+        0x75, 0x10, 0x95, 0x01, 0x81, 0x00, //
+        0xC0,
+    ]
+}
+
 /// The full HID report descriptor: the mouse collection (in the requested axis
-/// width), the keyboard collection, then one gamepad collection per requested
-/// slot (report IDs `GAMEPAD_REPORT_ID_BASE`, …).
-pub fn report_descriptor(n_gamepads: usize, axis_bits: AxisBits) -> Vec<u8> {
+/// width), the keyboard collection, one gamepad collection per requested slot
+/// (report IDs `GAMEPAD_REPORT_ID_BASE`, …) and, with `[remote] enabled`, the
+/// Consumer Control collection last (design/REMOTE.md §3.1).
+pub fn report_descriptor(layout: Layout) -> Vec<u8> {
+    let Layout {
+        n_gamepads,
+        axis_bits,
+        remote,
+    } = layout;
     let mouse: &[u8] = match axis_bits {
         AxisBits::Eight => &MOUSE_BLOCK_8,
         AxisBits::Sixteen => &MOUSE_BLOCK_16,
     };
-    let mut d = Vec::with_capacity(mouse.len() + KEYBOARD_BLOCK.len() + n_gamepads * 85);
+    let mut d = Vec::with_capacity(mouse.len() + KEYBOARD_BLOCK.len() + n_gamepads * 85 + 25);
     d.extend_from_slice(mouse);
     d.extend_from_slice(&KEYBOARD_BLOCK);
     for i in 0..n_gamepads {
         d.extend_from_slice(&gamepad_block(GAMEPAD_REPORT_ID_BASE + i as u8));
+    }
+    if remote {
+        d.extend_from_slice(&consumer_block(consumer_report_id(n_gamepads)));
     }
     d
 }
@@ -95,9 +140,9 @@ pub fn report_descriptor(n_gamepads: usize, axis_bits: AxisBits) -> Vec<u8> {
 /// descriptor for the lifetime of the bond, so a change here is invisible to an
 /// already-bonded host; comparing fingerprints identifies hosts holding a stale
 /// copy (see `state::Hosts`, design/CONNECTION.md §7).
-pub fn descriptor_fingerprint(n_gamepads: usize, axis_bits: AxisBits) -> u32 {
+pub fn descriptor_fingerprint(layout: Layout) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
-    for b in report_descriptor(n_gamepads, axis_bits) {
+    for b in report_descriptor(layout) {
         h ^= u32::from(b);
         h = h.wrapping_mul(0x0100_0193);
     }
@@ -107,8 +152,8 @@ pub fn descriptor_fingerprint(n_gamepads: usize, axis_bits: AxisBits) -> u32 {
 /// The HID Profile UUID.
 pub const HID_UUID: &str = "00001124-0000-1000-8000-00805f9b34fb";
 
-fn descriptor_hex(n_gamepads: usize, axis_bits: AxisBits) -> String {
-    let desc = report_descriptor(n_gamepads, axis_bits);
+fn descriptor_hex(layout: Layout) -> String {
+    let desc = report_descriptor(layout);
     let mut s = String::with_capacity(desc.len() * 2);
     for b in desc {
         s.push_str(&format!("{b:02x}"));
@@ -116,11 +161,10 @@ fn descriptor_hex(n_gamepads: usize, axis_bits: AxisBits) -> String {
     s
 }
 
-/// Build the BlueZ record-XML `ServiceRecord` string (design/ARCH.md §3.1). The
-/// embedded HID report descriptor advertises `n_gamepads` gamepad collections
-/// in addition to the mouse and keyboard.
-pub fn service_record_xml(n_gamepads: usize, axis_bits: AxisBits) -> String {
-    let hex = descriptor_hex(n_gamepads, axis_bits);
+/// Build the BlueZ record-XML `ServiceRecord` string (design/ARCH.md §3.1), with
+/// the report descriptor `layout` advertises embedded in it.
+pub fn service_record_xml(layout: Layout) -> String {
+    let hex = descriptor_hex(layout);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8" ?>
 <record>
@@ -234,25 +278,91 @@ mod tests {
     const EIGHT: AxisBits = AxisBits::Eight;
     const SIXTEEN: AxisBits = AxisBits::Sixteen;
 
+    /// A layout with `n` gamepad slots, the given axis width and the remote on
+    /// or off — the three axes every descriptor test varies.
+    fn layout(n: usize, axis_bits: AxisBits, remote: bool) -> Layout {
+        Layout {
+            n_gamepads: n,
+            axis_bits,
+            remote,
+        }
+    }
+
     #[test]
     fn descriptor_length_is_dynamic() {
         // Base is the 54-byte mouse plus the 44-byte keyboard collection; each
         // gamepad appends one 85-byte collection.
-        assert_eq!(report_descriptor(0, EIGHT).len(), 98);
-        assert_eq!(report_descriptor(1, EIGHT).len(), 98 + 85);
-        assert_eq!(report_descriptor(3, EIGHT).len(), 98 + 3 * 85);
-        assert_eq!(descriptor_hex(0, EIGHT).len(), 196);
+        assert_eq!(report_descriptor(layout(0, EIGHT, false)).len(), 98);
+        assert_eq!(report_descriptor(layout(1, EIGHT, false)).len(), 98 + 85);
+        assert_eq!(
+            report_descriptor(layout(3, EIGHT, false)).len(),
+            98 + 3 * 85
+        );
+        assert_eq!(descriptor_hex(layout(0, EIGHT, false)).len(), 196);
         // The 16-bit mouse collection is 12 bytes longer (a second Input item
         // for the wheel, and two-byte logical bounds for X/Y).
-        assert_eq!(report_descriptor(0, SIXTEEN).len(), 110);
-        assert_eq!(report_descriptor(3, SIXTEEN).len(), 110 + 3 * 85);
+        assert_eq!(report_descriptor(layout(0, SIXTEEN, false)).len(), 110);
+        assert_eq!(
+            report_descriptor(layout(3, SIXTEEN, false)).len(),
+            110 + 3 * 85
+        );
+        // The consumer collection adds a flat 25 bytes wherever it lands
+        // (design/REMOTE.md §3).
+        assert_eq!(report_descriptor(layout(0, EIGHT, true)).len(), 123);
+        assert_eq!(report_descriptor(layout(0, SIXTEEN, true)).len(), 135);
+        assert_eq!(report_descriptor(layout(1, EIGHT, true)).len(), 123 + 85);
+    }
+
+    /// The whole point of putting the consumer collection last: with `[remote]`
+    /// off the descriptor is byte-identical to what it was before the feature
+    /// existed, so no existing bond is disturbed (design/REMOTE.md §3.1).
+    #[test]
+    fn disabled_remote_leaves_the_descriptor_untouched() {
+        for n in 0..4 {
+            for bits in [EIGHT, SIXTEEN] {
+                let plain = report_descriptor(layout(n, bits, false));
+                let with_remote = report_descriptor(layout(n, bits, true));
+                assert_eq!(
+                    with_remote[..plain.len()],
+                    plain[..],
+                    "the consumer collection must only ever be appended"
+                );
+                // Gamepad report IDs do not shift; the consumer block takes the
+                // next one after them.
+                assert_eq!(consumer_report_id(n), GAMEPAD_REPORT_ID_BASE + n as u8);
+                assert!(
+                    with_remote[plain.len()..]
+                        .windows(2)
+                        .any(|w| w == [0x85, consumer_report_id(n)])
+                );
+            }
+        }
+    }
+
+    /// The consumer block declares the Consumer page, an application collection
+    /// and one 16-bit array element covering 0x0000..=0x02A2 (§3).
+    #[test]
+    fn consumer_block_is_well_formed() {
+        let d = report_descriptor(layout(0, EIGHT, true));
+        let at = d
+            .windows(6)
+            .position(|w| w == [0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01])
+            .expect("Consumer Control application collection");
+        assert_eq!(d[at + 6..at + 8], [0x85, consumer_report_id(0)]);
+        // Logical/usage maxima are both 0x02A2, and the item is an array
+        // (Input bit 1 clear), not a variable bitmap.
+        assert_eq!(d[at + 10..at + 13], [0x26, 0xA2, 0x02]);
+        assert_eq!(d[at + 15..at + 18], [0x2A, 0xA2, 0x02]);
+        assert_eq!(d[at + 18..at + 24], [0x75, 0x10, 0x95, 0x01, 0x81, 0x00]);
+        assert_eq!(d[at + 24], 0xC0);
+        assert_eq!(at + 25, d.len(), "the collection must be emitted last");
     }
 
     /// The 16-bit variant must declare X/Y and Wheel as two separate Input
     /// items, with the Wheel usage after the item that consumes X and Y.
     #[test]
     fn sixteen_bit_block_is_well_formed() {
-        let d = report_descriptor(0, SIXTEEN);
+        let d = report_descriptor(layout(0, SIXTEEN, false));
         // Report Size 16, Report Count 2, Input(Data,Var,Rel) for X and Y.
         let xy = d
             .windows(6)
@@ -279,7 +389,7 @@ mod tests {
 
     #[test]
     fn gamepad_blocks_carry_ascending_report_ids() {
-        let desc = report_descriptor(2, EIGHT);
+        let desc = report_descriptor(layout(2, EIGHT, false));
         // Report-ID items (0x85, id) for the two gamepads.
         assert!(desc.windows(2).any(|w| w == [0x85, GAMEPAD_REPORT_ID_BASE]));
         assert!(
@@ -290,8 +400,8 @@ mod tests {
 
     #[test]
     fn record_embeds_descriptor_hex() {
-        let xml = service_record_xml(2, EIGHT);
-        assert!(xml.contains(&descriptor_hex(2, EIGHT)));
+        let xml = service_record_xml(layout(2, EIGHT, false));
+        assert!(xml.contains(&descriptor_hex(layout(2, EIGHT, false))));
         // Report-descriptor attribute and the HID report descriptor tag.
         assert!(xml.contains(r#"id="0x0206""#));
         assert!(xml.contains(r#"<uint8 value="0x22" />"#));
@@ -302,10 +412,12 @@ mod tests {
         // Stable for a given slot count, distinct across counts — the whole
         // point is that adding/removing a gamepad is detectable.
         assert_eq!(
-            descriptor_fingerprint(1, EIGHT),
-            descriptor_fingerprint(1, EIGHT)
+            descriptor_fingerprint(layout(1, EIGHT, false)),
+            descriptor_fingerprint(layout(1, EIGHT, false))
         );
-        let fps: Vec<u32> = (0..4).map(|n| descriptor_fingerprint(n, EIGHT)).collect();
+        let fps: Vec<u32> = (0..4)
+            .map(|n| descriptor_fingerprint(layout(n, EIGHT, false)))
+            .collect();
         for (i, a) in fps.iter().enumerate() {
             for b in &fps[i + 1..] {
                 assert_ne!(a, b, "fingerprints must differ per slot count");
@@ -315,11 +427,26 @@ mod tests {
         // holding the old layout get flagged (design/CONNECTION.md §7).
         for n in 0..4 {
             assert_ne!(
-                descriptor_fingerprint(n, EIGHT),
-                descriptor_fingerprint(n, SIXTEEN),
+                descriptor_fingerprint(layout(n, EIGHT, false)),
+                descriptor_fingerprint(layout(n, SIXTEEN, false)),
                 "axis width must be visible in the fingerprint"
             );
+            // As is enabling the remote, which is why turning it on needs
+            // [f] Fix connection on already-bonded hosts (design/REMOTE.md §3.2).
+            assert_ne!(
+                descriptor_fingerprint(layout(n, EIGHT, false)),
+                descriptor_fingerprint(layout(n, EIGHT, true)),
+                "the consumer collection must be visible in the fingerprint"
+            );
         }
+    }
+
+    /// The fingerprint with `[remote]` off is the one existing bonds were
+    /// recorded under: pin the literal so a descriptor change cannot silently
+    /// invalidate every stored host (design/REMOTE.md §3.1).
+    #[test]
+    fn disabled_fingerprint_is_unchanged() {
+        assert_eq!(descriptor_fingerprint(layout(0, EIGHT, false)), 0x74bf_6be9);
     }
 
     #[test]
@@ -328,7 +455,7 @@ mod tests {
         if let Ok(dir) = std::env::var("BLOOTER_DUMP_DIR") {
             std::fs::write(
                 format!("{dir}/service_record.xml"),
-                service_record_xml(2, EIGHT),
+                service_record_xml(layout(2, EIGHT, false)),
             )
             .unwrap();
         }

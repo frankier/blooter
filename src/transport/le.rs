@@ -149,8 +149,7 @@ impl Le {
     /// the menu, respawned each accept cycle (§6).
     pub async fn new(
         adapter: Adapter,
-        n_gamepads: usize,
-        axis_bits: crate::config::AxisBits,
+        layout: sdp::Layout,
         target: Option<Address>,
         interactive: bool,
         hosts: Arc<std::sync::Mutex<crate::state::Hosts>>,
@@ -158,7 +157,7 @@ impl Le {
     ) -> Result<Self, AppError> {
         // Same fingerprint `main` warns about at startup, derived here from the
         // descriptor this transport actually serves (§7).
-        let descriptor_fp = sdp::descriptor_fingerprint(n_gamepads, axis_bits);
+        let descriptor_fp = sdp::descriptor_fingerprint(layout);
         adapter
             .set_powered(true)
             .await
@@ -175,7 +174,7 @@ impl Le {
             services: vec![
                 device_info_service(),
                 battery_service(),
-                hid_service(&shared, n_gamepads, axis_bits),
+                hid_service(&shared, layout),
                 layout_service(descriptor_fp),
             ],
             ..Default::default()
@@ -339,6 +338,9 @@ impl Transport for Le {
         self.send_report(InputState::keys_up_report().as_slice())
             .await;
         for r in state.gamepad_neutral_reports() {
+            self.send_report(r.as_slice()).await;
+        }
+        if let Some(r) = state.consumer_up_report() {
             self.send_report(r.as_slice()).await;
         }
     }
@@ -518,28 +520,24 @@ impl Transport for Le {
 
 /// The HID service (0x1812): HID Information, Report Map, Protocol Mode, HID
 /// Control Point, and one Report characteristic per report id (design/ARCH.md §4.2).
-fn hid_service(
-    shared: &Arc<Shared>,
-    n_gamepads: usize,
-    axis_bits: crate::config::AxisBits,
-) -> Service {
+fn hid_service(shared: &Arc<Shared>, layout: sdp::Layout) -> Service {
     let mut characteristics = vec![
         // HID Information: bcdHID 1.11, country 0, flags NormallyConnectable.
         read_char(HID_INFORMATION, vec![0x11, 0x01, 0x00, 0x02], true),
         // Report Map: the exact HID report descriptor (reused from the classic
         // SDP path, design/ARCH.md §4.2).
-        read_char(
-            REPORT_MAP,
-            sdp::report_descriptor(n_gamepads, axis_bits),
-            true,
-        ),
+        read_char(REPORT_MAP, sdp::report_descriptor(layout), true),
         protocol_mode_char(),
         hid_control_point_char(),
     ];
 
-    // Report characteristics: mouse (id 1), keyboard (id 2), gamepads (3+).
+    // Report characteristics: mouse (id 1), keyboard (id 2), gamepads (3+) and,
+    // with `[remote]` on, the consumer collection last (design/REMOTE.md §3.1).
     let mut report_ids = vec![1u8, 2u8];
-    report_ids.extend((0..n_gamepads).map(|i| GAMEPAD_REPORT_ID_BASE + i as u8));
+    report_ids.extend((0..layout.n_gamepads).map(|i| GAMEPAD_REPORT_ID_BASE + i as u8));
+    if layout.remote {
+        report_ids.push(sdp::consumer_report_id(layout.n_gamepads));
+    }
     for id in report_ids {
         characteristics.push(report_char(shared.clone(), id));
     }
@@ -742,18 +740,29 @@ mod tests {
     /// layout identical (design/CONNECTION.md §7.2b).
     #[test]
     fn layout_uuid_carries_the_fingerprint() {
-        let uuid = |n, bits| {
-            let svc = layout_service(sdp::descriptor_fingerprint(n, bits));
+        let uuid = |n, bits, remote| {
+            let svc = layout_service(sdp::descriptor_fingerprint(sdp::Layout {
+                n_gamepads: n,
+                axis_bits: bits,
+                remote,
+            }));
             assert_eq!(svc.uuid, Uuid::from_u128(LAYOUT_UUID_BASE));
             svc.characteristics[0].uuid
         };
-        let distinct = [uuid(0, Eight), uuid(1, Eight), uuid(0, Sixteen)];
+        // Enabling the remote is a descriptor change like any other, so it must
+        // reach the UUID too (design/REMOTE.md §3.2).
+        let distinct = [
+            uuid(0, Eight, false),
+            uuid(1, Eight, false),
+            uuid(0, Sixteen, false),
+            uuid(0, Eight, true),
+        ];
         for (i, a) in distinct.iter().enumerate() {
             for b in &distinct[i + 1..] {
                 assert_ne!(a, b, "each descriptor needs its own characteristic UUID");
             }
         }
         // Same descriptor, same UUID: an unchanged run must not look like a change.
-        assert_eq!(uuid(2, Sixteen), uuid(2, Sixteen));
+        assert_eq!(uuid(2, Sixteen, false), uuid(2, Sixteen, false));
     }
 }

@@ -1,7 +1,7 @@
 //! Session input state and translation of Linux input events into HID Boot
 //! input reports. See design/ARCH.md §5 and §7.
 
-use crate::config::{Action, AxisBits, Chord, Hotkeys, MAX_CHORD_KEYS, Overflow};
+use crate::config::{Action, AxisBits, Chord, Hotkeys, MAX_CHORD_KEYS, Overflow, Remote};
 use crate::keymap;
 
 // Linux event types (from <linux/input-event-codes.h>).
@@ -261,6 +261,17 @@ pub struct InputState {
     mouse_dirty: bool,
     axis_bits: AxisBits,
     overflow: Overflow,
+    /// Report ID of the Consumer Control collection, or `None` with `[remote]`
+    /// off — in which case no consumer report is ever built (design/REMOTE.md §3.1).
+    consumer_id: Option<u8>,
+    /// Whether the local keyboard's own media keys are forwarded as consumer
+    /// usages (`[remote] passthrough`, §5).
+    passthrough: bool,
+    /// The consumer usage currently reported as held (`0` for none), and the
+    /// keycode that owns it, so a stale release cannot clear someone else's
+    /// press (§7).
+    consumer_usage: u16,
+    consumer_owner: u16,
 }
 
 impl Default for InputState {
@@ -286,6 +297,10 @@ impl InputState {
             mouse_dirty: false,
             axis_bits: AxisBits::Eight,
             overflow: Overflow::Burst,
+            consumer_id: None,
+            passthrough: false,
+            consumer_usage: 0,
+            consumer_owner: 0,
         }
     }
 
@@ -293,6 +308,17 @@ impl InputState {
     pub fn with_pointer(mut self, axis_bits: AxisBits, overflow: Overflow) -> Self {
         self.axis_bits = axis_bits;
         self.overflow = overflow;
+        self
+    }
+
+    /// Enable TV-remote emulation from `[remote]`. The consumer collection is
+    /// emitted after every gamepad, so its report ID follows from the slot
+    /// count this state was built with (design/REMOTE.md §3.1).
+    pub fn with_remote(mut self, remote: Remote) -> Self {
+        if remote.enabled {
+            self.consumer_id = Some(crate::sdp::consumer_report_id(self.gamepads.len()));
+            self.passthrough = remote.passthrough;
+        }
         self
     }
 
@@ -344,6 +370,9 @@ pub enum Outcome {
     Keyboard(Report),
     /// A gamepad input report.
     Gamepad(Report),
+    /// A Consumer Control input report — a remote button held or released
+    /// (design/REMOTE.md §4).
+    Consumer(Report),
     /// End of an input frame (`SYN_REPORT`): a flush point. Necessary for a
     /// flush in every batching mode, and sufficient in `Batch::None` (§7.2c).
     Sync,
@@ -361,16 +390,19 @@ pub enum Outcome {
 /// The outcomes of translating one event, in the order they must be sent. More
 /// than one arises when a broken chord prefix is replayed: the keys held back
 /// are forwarded in press order, then the event that broke the chord (§7.3).
+///
+/// Sized `MAX_CHORD_KEYS + 2` rather than `+ 1` because a fired `[remote]` chord
+/// is a tap: it pushes a press *and* a release (design/REMOTE.md §7).
 #[derive(Clone, Copy)]
 pub struct Outcomes {
-    buf: [Outcome; MAX_CHORD_KEYS + 1],
+    buf: [Outcome; MAX_CHORD_KEYS + 2],
     len: usize,
 }
 
 impl Default for Outcomes {
     fn default() -> Self {
         Self {
-            buf: [Outcome::Nothing; MAX_CHORD_KEYS + 1],
+            buf: [Outcome::Nothing; MAX_CHORD_KEYS + 2],
             len: 0,
         }
     }
@@ -423,6 +455,7 @@ impl InputState {
         self.touching = false;
         self.last_abs = [None; 2];
         self.accum = MouseAccum::default();
+        self.clear_consumer();
         for gp in self.gamepads.iter_mut() {
             *gp = GamepadState::neutral();
         }
@@ -473,6 +506,28 @@ impl InputState {
         r[0] = 0xA1;
         r[1] = 0x02;
         Report::new(&r)
+    }
+
+    /// A consumer report carrying `usage` little-endian, or `None` with
+    /// `[remote]` off (design/REMOTE.md §4).
+    pub fn consumer_report(&self, usage: u16) -> Option<Report> {
+        let id = self.consumer_id?;
+        let [lo, hi] = usage.to_le_bytes();
+        Some(Report::new(&[0xA1, id, lo, hi]))
+    }
+
+    /// The "nothing held" consumer report. Sent wherever held state is dropped
+    /// — capture-off, session drop, reconnect — because a host left believing a
+    /// remote button is down is a volume ramp that never stops (§7).
+    pub fn consumer_up_report(&self) -> Option<Report> {
+        self.consumer_report(0)
+    }
+
+    /// Forget any held consumer usage, so a release arriving later cannot
+    /// re-report one the host has already been told to drop.
+    pub fn clear_consumer(&mut self) {
+        self.consumer_usage = 0;
+        self.consumer_owner = 0;
     }
 
     fn press(&mut self, usage: u8) {
@@ -603,7 +658,7 @@ fn translate_key(
         if value == 1 && chord_advance(hotkeys, state, code) {
             if let Some(action) = chord_fire(hotkeys, state) {
                 state.chord_held.push(code);
-                out.push(apply_action(state, action));
+                apply_action(state, action, out);
             }
             return;
         }
@@ -613,7 +668,7 @@ fn translate_key(
     // single-key chord is complete at once.
     if value == 1 && chord_open(hotkeys, state, code) {
         if let Some(action) = chord_fire(hotkeys, state) {
-            out.push(apply_action(state, action));
+            apply_action(state, action, out);
         }
         return;
     }
@@ -696,9 +751,11 @@ fn chord_replay(state: &mut InputState, out: &mut Outcomes) {
     }
 }
 
-/// Apply a fired hotkey to the session state and report what it did.
-fn apply_action(state: &mut InputState, action: Action) -> Outcome {
-    match action {
+/// Apply a fired hotkey to the session state and queue what it did. Only a
+/// `Consumer` action queues more than one outcome: it is a tap, so it emits a
+/// press report and the matching release at once (design/REMOTE.md §6).
+fn apply_action(state: &mut InputState, action: Action, out: &mut Outcomes) {
+    let outcome = match action {
         Action::Exit => Outcome::Exit,
         Action::DropConnection => Outcome::DropSession,
         Action::CaptureOn => {
@@ -717,11 +774,29 @@ fn apply_action(state: &mut InputState, action: Action) -> Outcome {
                 Outcome::CaptureOff
             }
         }
-    }
+        Action::Consumer(usage) => {
+            // Unlike the capture/exit hotkeys, this one forwards input, so it
+            // is suppressed while capture is off just like a key would be.
+            if state.capture
+                && let Some(press) = state.consumer_report(usage)
+            {
+                out.push(Outcome::Consumer(press));
+                // Release back to whatever passthrough still holds — normally
+                // nothing, but a media key held across the tap stays held.
+                let held = state.consumer_usage;
+                out.push(Outcome::Consumer(
+                    state.consumer_report(held).expect("consumer is enabled"),
+                ));
+            }
+            return;
+        }
+    };
+    out.push(outcome);
 }
 
 /// Track a key that is not part of any chord in progress and, while capturing,
-/// emit the resulting keyboard report.
+/// emit the resulting keyboard report — or, for a media key under
+/// `[remote] passthrough`, the resulting consumer report.
 fn plain_key(state: &mut InputState, code: u16, value: i32) -> Outcome {
     use keymap::*;
     if let Some(bit) = modifier_bit(code) {
@@ -737,10 +812,48 @@ fn plain_key(state: &mut InputState, code: u16, value: i32) -> Outcome {
             _ => {} // autorepeat (value 2): no list change, still report
         }
     } else {
-        return Outcome::Nothing;
+        return consumer_key(state, code, value);
     }
     if state.capture {
         Outcome::Keyboard(state.keyboard_report())
+    } else {
+        Outcome::Nothing
+    }
+}
+
+/// A key with no Keyboard/Keypad usage: forward it on the Consumer page if
+/// `[remote] passthrough` maps it (design/REMOTE.md §5, §7).
+///
+/// The report is a one-element array, so only one usage can be held at a time:
+/// two media keys down at once is last-press-wins, and releasing the loser must
+/// not cancel the winner — hence the owner check. Autorepeat is ignored: an
+/// identical array report with no intervening zero is a no-op on most hosts,
+/// and hosts generate their own repeat.
+fn consumer_key(state: &mut InputState, code: u16, value: i32) -> Outcome {
+    if state.consumer_id.is_none() || !state.passthrough {
+        return Outcome::Nothing;
+    }
+    match value {
+        1 => match keymap::consumer_usage(code) {
+            Some(usage) => {
+                state.consumer_usage = usage;
+                state.consumer_owner = code;
+            }
+            None => return Outcome::Nothing,
+        },
+        0 => {
+            // `consumer_owner` is 0 when nothing is held, and no keycode is 0.
+            if state.consumer_owner != code {
+                return Outcome::Nothing;
+            }
+            state.clear_consumer();
+        }
+        _ => return Outcome::Nothing,
+    }
+    if state.capture {
+        state
+            .consumer_report(state.consumer_usage)
+            .map_or(Outcome::Nothing, Outcome::Consumer)
     } else {
         Outcome::Nothing
     }
@@ -1297,6 +1410,183 @@ mod tests {
             Outcome::Gamepad(r) => assert_eq!(r[4], 8),
             _ => panic!(),
         }
+    }
+
+    // ---- TV remote (design/REMOTE.md) ----
+
+    const REMOTE_ON: Remote = Remote {
+        enabled: true,
+        passthrough: true,
+    };
+
+    /// The payload of a consumer outcome: the held usage, little-endian, on the
+    /// consumer report id (§4).
+    fn consumer(out: &Outcome) -> u16 {
+        match out {
+            Outcome::Consumer(r) => {
+                assert_eq!(r.len(), 4, "a consumer report is 4 bytes on the wire");
+                assert_eq!(r[..2], [0xA1, crate::sdp::consumer_report_id(0)]);
+                u16::from_le_bytes([r[2], r[3]])
+            }
+            _ => panic!("expected a consumer report"),
+        }
+    }
+
+    #[test]
+    fn media_key_passthrough() {
+        let hk = Hotkeys::default();
+        let mut s = InputState::default().with_remote(REMOTE_ON);
+        assert_eq!(
+            consumer(&one(&hk, &mut s, key(keymap::KEY_VOLUMEUP, 1))),
+            0x0E9
+        );
+        assert_eq!(consumer(&one(&hk, &mut s, key(keymap::KEY_VOLUMEUP, 0))), 0);
+        // Autorepeat is ignored: no zero report intervenes, so a repeat of the
+        // same array report would be a no-op anyway (§7).
+        one(&hk, &mut s, key(keymap::KEY_PLAYPAUSE, 1));
+        assert!(matches!(
+            one(&hk, &mut s, key(keymap::KEY_PLAYPAUSE, 2)),
+            Outcome::Nothing
+        ));
+        assert_eq!(
+            consumer(&one(&hk, &mut s, key(keymap::KEY_PLAYPAUSE, 0))),
+            0
+        );
+    }
+
+    /// Two media keys at once is last-press-wins, and releasing the loser must
+    /// not cancel the winner (§7).
+    #[test]
+    fn media_keys_are_last_press_wins() {
+        let hk = Hotkeys::default();
+        let mut s = InputState::default().with_remote(REMOTE_ON);
+        assert_eq!(
+            consumer(&one(&hk, &mut s, key(keymap::KEY_VOLUMEUP, 1))),
+            0x0E9
+        );
+        assert_eq!(
+            consumer(&one(&hk, &mut s, key(keymap::KEY_VOLUMEDOWN, 1))),
+            0x0EA
+        );
+        // The stale release of the loser is dropped.
+        assert!(matches!(
+            one(&hk, &mut s, key(keymap::KEY_VOLUMEUP, 0)),
+            Outcome::Nothing
+        ));
+        assert_eq!(s.consumer_usage, 0x0EA);
+        assert_eq!(
+            consumer(&one(&hk, &mut s, key(keymap::KEY_VOLUMEDOWN, 0))),
+            0
+        );
+    }
+
+    /// With `[remote]` off — or with passthrough off — a media key dies at the
+    /// `hid_usage` fall-through exactly as it did before the feature existed.
+    #[test]
+    fn media_keys_need_the_remote() {
+        let hk = Hotkeys::default();
+        let mut s = InputState::default();
+        assert!(matches!(
+            one(&hk, &mut s, key(keymap::KEY_VOLUMEUP, 1)),
+            Outcome::Nothing
+        ));
+        assert!(s.consumer_up_report().is_none());
+
+        let mut s = InputState::default().with_remote(Remote {
+            enabled: true,
+            passthrough: false,
+        });
+        assert!(matches!(
+            one(&hk, &mut s, key(keymap::KEY_VOLUMEUP, 1)),
+            Outcome::Nothing
+        ));
+        // The collection is still advertised, so the release report exists.
+        assert!(s.consumer_up_report().is_some());
+    }
+
+    /// Nothing is forwarded while capture is off, and the state a paused
+    /// session left behind cannot resurface as a release (§7).
+    #[test]
+    fn media_keys_respect_capture() {
+        let hk = Hotkeys::default();
+        let mut s = InputState::default().with_remote(REMOTE_ON);
+        s.capture = false;
+        assert!(matches!(
+            one(&hk, &mut s, key(keymap::KEY_VOLUMEUP, 1)),
+            Outcome::Nothing
+        ));
+        // `step` clears the held usage alongside the zero report it sends.
+        s.clear_consumer();
+        assert!(matches!(
+            one(&hk, &mut s, key(keymap::KEY_VOLUMEUP, 0)),
+            Outcome::Nothing
+        ));
+        assert_eq!(s.consumer_usage, 0);
+    }
+
+    /// A `[remote]` chord is a tap: press then release, in one event (§6).
+    #[test]
+    fn remote_chord_is_a_tap() {
+        let hk = crate::config::parse(
+            "[remote]\nenabled = true\ntv = \"leftmeta+t\"\nchannel_up = \"leftmeta+pageup\"\n",
+        )
+        .unwrap()
+        .hotkeys;
+        let mut s = InputState::default().with_remote(REMOTE_ON);
+        // Meta alone opens the buffer and is held back.
+        assert!(tr(&hk, &mut s, key(keymap::KEY_LEFTMETA, 1)).is_empty());
+        let outs = tr(&hk, &mut s, key(keymap::KEY_T, 1));
+        assert_eq!(outs.len(), 2, "a tap is exactly two reports");
+        assert_eq!(consumer(&outs[0]), 0x089);
+        assert_eq!(consumer(&outs[1]), 0);
+        // Holding it does not autorepeat, and neither key reaches the host.
+        assert!(tr(&hk, &mut s, key(keymap::KEY_T, 2)).is_empty());
+        assert!(tr(&hk, &mut s, key(keymap::KEY_T, 0)).is_empty());
+        assert!(tr(&hk, &mut s, key(keymap::KEY_LEFTMETA, 0)).is_empty());
+        assert_eq!(s.modifiers, 0x00);
+    }
+
+    /// A tap released back to whatever passthrough still holds, so a media key
+    /// held across it stays held host-side (§7).
+    #[test]
+    fn remote_chord_preserves_a_held_media_key() {
+        let hk = crate::config::parse("[remote]\nenabled = true\ntv = \"leftmeta+t\"\n")
+            .unwrap()
+            .hotkeys;
+        let mut s = InputState::default().with_remote(REMOTE_ON);
+        assert_eq!(
+            consumer(&one(&hk, &mut s, key(keymap::KEY_VOLUMEUP, 1))),
+            0x0E9
+        );
+        tr(&hk, &mut s, key(keymap::KEY_LEFTMETA, 1));
+        let outs = tr(&hk, &mut s, key(keymap::KEY_T, 1));
+        assert_eq!(consumer(&outs[0]), 0x089);
+        assert_eq!(consumer(&outs[1]), 0x0E9);
+    }
+
+    /// A remote chord forwards input, so unlike exit/capture it is suppressed
+    /// while capture is off.
+    #[test]
+    fn remote_chord_respects_capture() {
+        let hk = crate::config::parse("[remote]\nenabled = true\ntv = \"leftmeta+t\"\n")
+            .unwrap()
+            .hotkeys;
+        let mut s = InputState::default().with_remote(REMOTE_ON);
+        s.capture = false;
+        tr(&hk, &mut s, key(keymap::KEY_LEFTMETA, 1));
+        assert!(tr(&hk, &mut s, key(keymap::KEY_T, 1)).is_empty());
+    }
+
+    /// The report id follows the gamepad slots, so a remote coexists with them
+    /// without shifting anything (design/REMOTE.md §3.1).
+    #[test]
+    fn consumer_report_id_follows_the_gamepads() {
+        let s = InputState::with_gamepads(2).with_remote(REMOTE_ON);
+        assert_eq!(s.consumer_up_report().unwrap().id(), 5);
+        assert_eq!(
+            s.consumer_report(0x0E9).unwrap().as_slice(),
+            [0xA1, 5, 0xE9, 0x00]
+        );
     }
 
     #[test]

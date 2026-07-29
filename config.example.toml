@@ -152,3 +152,55 @@
 #
 # With axis_bits = 16 this effectively never comes into play.
 #overflow = "burst"
+
+[remote]
+
+# TV-remote emulation: an extra HID Consumer Control collection, which is what
+# every Bluetooth TV remote is under the hood. See design/REMOTE.md for the full
+# button table and for what each kind of host actually does with it.
+#
+# This changes the HID report descriptor, which hosts cache for the lifetime of
+# their bond — the same caveat as [gamepad] slots and [pointer] axis_bits. An
+# already-paired host keeps using the layout it cached and will ignore every
+# remote button until it re-reads the descriptor: fix it with [f] in the
+# connection menu, or re-pair (design/CONNECTION.md §7). While this is false the
+# descriptor is exactly what it was without this section, so leaving it off
+# costs existing hosts nothing.
+#enabled = false
+
+# Forward the multimedia keys the local keyboard already has — volume, mute,
+# play/pause, next, previous, search, home, back — which are otherwise dropped
+# for being outside the keyboard usage range. Set it to false for a pure virtual
+# remote, when those keys should keep controlling the local machine.
+#passthrough = true
+
+# Bindings for the remote buttons a keyboard has no key for. Same syntax as
+# [hotkeys]: the binding name is the key, the chord is the value, "" disables.
+# Chords rather than bare keys, because blooter forwards every key — stealing a
+# bare key to mean "channel up" would be a regression, while a chord stays
+# invisible to the host until it fires. A fired binding is a tap (press then
+# release), so it never autorepeats: channel-surfing means repeating the chord.
+#
+# Recognized names: tv, guide, dvr, channel_up, channel_down, last_channel,
+# captions, info, red, green, yellow, blue, aspect_ratio, all_apps. All are
+# unbound by default.
+#tv            = "leftmeta+t"
+#guide         = "leftmeta+g"
+#channel_up    = "leftmeta+pageup"
+#channel_down  = "leftmeta+pagedown"
+#last_channel  = "leftmeta+l"
+#captions      = "leftmeta+c"
+#dvr           = "leftmeta+d"
+#info          = "leftmeta+i"
+#red           = "leftmeta+f1"
+#green         = "leftmeta+f2"
+#yellow        = "leftmeta+f3"
+#blue          = "leftmeta+f4"
+#all_apps      = "leftmeta+a"
+#aspect_ratio  = "leftmeta+r"
+
+# Escape hatch for any Consumer-page usage in 0x000..=0x2A2 that has no name
+# above. Best-effort by definition: 0x082 (Mode Step) is the nearest thing to
+# "cycle TV input", but Android TV drops it, which is why it has no friendly
+# name (design/REMOTE.md §2.1). At most 24 bindings in total.
+#"usage:0x082" = "leftmeta+s"

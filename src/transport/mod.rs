@@ -310,13 +310,17 @@ pub trait Transport {
     /// does nothing.
     async fn on_connected(&self, _state: &InputState) {}
 
-    /// Release all inputs host-side: an all-keys-up keyboard report plus a
-    /// neutral report for every advertised gamepad, so nothing stays latched
-    /// when a session is dropped, blooter exits, or capture is paused.
+    /// Release all inputs host-side: an all-keys-up keyboard report, a neutral
+    /// report for every advertised gamepad and — with `[remote]` on — a
+    /// nothing-held consumer report, so nothing stays latched when a session is
+    /// dropped, blooter exits, or capture is paused (design/REMOTE.md §7).
     async fn release_all(&self, state: &InputState) {
         self.send_report(InputState::keys_up_report().as_slice())
             .await;
         for r in state.gamepad_neutral_reports() {
+            self.send_report(r.as_slice()).await;
+        }
+        if let Some(r) = state.consumer_up_report() {
             self.send_report(r.as_slice()).await;
         }
     }
@@ -360,9 +364,9 @@ pub async fn step<T: Transport>(
     // coming replays the keys it held back, in press order (design/ARCH.md §7.3).
     for i in 0..outs.len() {
         match outs.get(i) {
-            Outcome::Keyboard(r) | Outcome::Gamepad(r) => {
-                // A full ring must not drop a keyboard or gamepad report: flush
-                // to make room, then queue.
+            Outcome::Keyboard(r) | Outcome::Gamepad(r) | Outcome::Consumer(r) => {
+                // A full ring must not drop a keyboard, gamepad or consumer
+                // report: flush to make room, then queue.
                 if !out.push(r) {
                     if !out.flush(t).await {
                         return Step::Return(Flow::Continue);
@@ -394,12 +398,14 @@ pub async fn step<T: Transport>(
                 out.clear();
                 state.clear_mouse();
                 t.release_all(state).await;
+                state.clear_consumer();
                 return Step::Return(Flow::Continue);
             }
             Outcome::Exit => {
                 out.clear();
                 state.clear_mouse();
                 t.release_all(state).await;
+                state.clear_consumer();
                 return Step::Return(Flow::Shutdown);
             }
             Outcome::CaptureOff => {
@@ -408,6 +414,7 @@ pub async fn step<T: Transport>(
                 out.clear();
                 state.clear_mouse();
                 t.release_all(state).await;
+                state.clear_consumer();
             }
             Outcome::CaptureOn | Outcome::Nothing => {}
         }

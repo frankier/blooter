@@ -14,6 +14,9 @@ pub enum Action {
     CaptureOn,
     CaptureOff,
     CaptureToggle,
+    /// Tap a Consumer-page button on the virtual remote: one press report and
+    /// one release report (design/REMOTE.md §6, §7).
+    Consumer(u16),
 }
 
 /// The most keys one chord may name (the 8 HID modifiers plus a final key).
@@ -179,6 +182,34 @@ pub enum Overflow {
 /// Outgoing report slots per connection when `[pointer] buffer` is unset.
 pub const DEFAULT_BUFFER: usize = 16;
 
+/// TV-remote emulation: the Consumer Control collection and what feeds it
+/// (design/REMOTE.md). The chords bound in `[remote]` are not held here — they
+/// are folded into [`Hotkeys`] as `Action::Consumer` chords, so one chord
+/// matcher serves the whole config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Remote {
+    /// Advertise the Consumer Control collection. Off by default: turning it on
+    /// changes the report descriptor, which already-bonded hosts have cached
+    /// (design/REMOTE.md §3.2).
+    pub enabled: bool,
+    /// Forward the local keyboard's own media keys as consumer usages (§5).
+    pub passthrough: bool,
+}
+
+impl Default for Remote {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            passthrough: true,
+        }
+    }
+}
+
+/// The most `[remote]` bindings one config may declare. Caps `MAX_CHORDS`, and
+/// with it the fixed-size candidate array in `report::ChordBuf`; 24 is more
+/// buttons than a real remote has (design/REMOTE.md §8).
+pub const MAX_REMOTE_BINDINGS: usize = 24;
+
 /// The parsed configuration file.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -195,6 +226,8 @@ pub struct Config {
     pub buffer: usize,
     pub axis_bits: AxisBits,
     pub overflow: Overflow,
+    /// TV-remote emulation (design/REMOTE.md).
+    pub remote: Remote,
 }
 
 impl Default for Config {
@@ -210,12 +243,14 @@ impl Default for Config {
             buffer: DEFAULT_BUFFER,
             axis_bits: AxisBits::default(),
             overflow: Overflow::default(),
+            remote: Remote::default(),
         }
     }
 }
 
-/// The most chords a hotkey table can hold: one per recognized `[hotkeys]` key.
-pub const MAX_CHORDS: usize = DEFAULTS.len();
+/// The most chords a hotkey table can hold: one per recognized `[hotkeys]` key,
+/// plus the `[remote]` bindings (design/REMOTE.md §8).
+pub const MAX_CHORDS: usize = DEFAULTS.len() + MAX_REMOTE_BINDINGS;
 
 /// The recognized `[hotkeys]` keys and their built-in defaults. An empty
 /// string means the hotkey is disabled.
@@ -262,6 +297,13 @@ impl Hotkeys {
     pub fn starts(&self, code: u16) -> bool {
         self.chords.iter().any(|c| c.steps[0].matches(code))
     }
+
+    /// Fold in further chords — the `[remote]` bindings, which are matched by
+    /// the same machinery as `[hotkeys]` (design/REMOTE.md §6).
+    fn extend(&mut self, chords: impl IntoIterator<Item = Chord>) {
+        self.chords.extend(chords);
+        debug_assert!(self.chords.len() <= MAX_CHORDS, "too many chords");
+    }
 }
 
 /// Read and parse a config file.
@@ -295,8 +337,22 @@ pub fn parse(text: &str) -> Result<Config, String> {
             let gamepad = top.gamepad.unwrap_or_default();
             let connection = top.connection.unwrap_or_default();
             let pointer = top.pointer.unwrap_or_default();
+            let remote = top.remote.unwrap_or_default();
+            // With the collection off there is nothing for a binding to reach,
+            // so the rest of the section is ignored — a warning rather than an
+            // error, so a config can be prepared before flipping the switch
+            // (design/REMOTE.md §6).
+            let mut hotkeys = top.hotkeys.unwrap_or_default();
+            if remote.remote.enabled {
+                hotkeys.extend(remote.chords);
+            } else if !remote.chords.is_empty() {
+                log::warn!(
+                    "[remote] enabled is false, so its {} binding(s) are ignored",
+                    remote.chords.len()
+                );
+            }
             Ok(Config {
-                hotkeys: top.hotkeys.unwrap_or_default(),
+                hotkeys,
                 gamepad_slots: gamepad.slots,
                 hotplug: gamepad.hotplug,
                 protocol: connection.protocol,
@@ -306,6 +362,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 buffer: pointer.buffer,
                 axis_bits: pointer.axis_bits,
                 overflow: pointer.overflow,
+                remote: remote.remote,
             })
         }
         Err(e) => {
@@ -322,13 +379,14 @@ pub fn parse(text: &str) -> Result<Config, String> {
     }
 }
 
-/// The whole config file: the optional `[hotkeys]`, `[gamepad]`, `[connection]`
-/// and `[pointer]` tables.
+/// The whole config file: the optional `[hotkeys]`, `[gamepad]`, `[connection]`,
+/// `[pointer]` and `[remote]` tables.
 struct TopLevel {
     hotkeys: Option<Hotkeys>,
     gamepad: Option<Gamepad>,
     connection: Option<Connection>,
     pointer: Option<Pointer>,
+    remote: Option<RemoteSection>,
 }
 
 impl<'de> FromToml<'de> for TopLevel {
@@ -338,14 +396,99 @@ impl<'de> FromToml<'de> for TopLevel {
         let gamepad = th.optional("gamepad");
         let connection = th.optional("connection");
         let pointer = th.optional("pointer");
+        let remote = th.optional("remote");
         th.require_empty()?;
         Ok(TopLevel {
             hotkeys,
             gamepad,
             connection,
             pointer,
+            remote,
         })
     }
+}
+
+/// The `[remote]` table: the two switches, plus every other key in the table
+/// read as a binding — a remote-button name or `"usage:0xNNN"` — bound to a
+/// chord (design/REMOTE.md §6).
+#[derive(Default)]
+struct RemoteSection {
+    remote: Remote,
+    chords: Vec<Chord>,
+}
+
+impl<'de> FromToml<'de> for RemoteSection {
+    fn from_toml(ctx: &mut Context<'de>, item: &Item<'de>) -> Result<Self, Failed> {
+        let mut th = item.table_helper(ctx)?;
+        let enabled = th.optional_mapped("enabled", bool_item).unwrap_or(false);
+        let passthrough = th.optional_mapped("passthrough", bool_item).unwrap_or(true);
+        // Everything left is a binding. `require_empty` cannot be used here:
+        // the binding names are open-ended, so unknown keys are diagnosed
+        // against the binding table below instead.
+        let entries: Vec<_> = th.into_remaining().collect();
+        let mut chords = Vec::new();
+        let mut failed = false;
+        for (key, value) in entries {
+            let Some(usage) = binding_usage(key.name) else {
+                ctx.report_custom_error(
+                    format!(
+                        "'{}' is not a remote button; use one of the names in \
+                         design/REMOTE.md §6, or \"usage:0xNNN\"",
+                        key.name
+                    ),
+                    value,
+                );
+                failed = true;
+                continue;
+            };
+            match chord_item(value) {
+                Ok(Some(steps)) => chords.push(Chord {
+                    steps,
+                    action: Action::Consumer(usage),
+                }),
+                Ok(None) => {} // explicitly disabled with ""
+                Err(e) => {
+                    ctx.push_error(e);
+                    failed = true;
+                }
+            }
+        }
+        if chords.len() > MAX_REMOTE_BINDINGS {
+            ctx.report_custom_error(
+                format!("[remote] binds at most {MAX_REMOTE_BINDINGS} buttons"),
+                item,
+            );
+            failed = true;
+        }
+        if failed {
+            return Err(Failed);
+        }
+        Ok(RemoteSection {
+            remote: Remote {
+                enabled,
+                passthrough,
+            },
+            chords,
+        })
+    }
+}
+
+/// The Consumer-page usage a `[remote]` key names: a friendly button name, or
+/// the `"usage:0xNNN"` escape hatch for anything unlisted — including
+/// best-effort usages such as Mode Step, which is deliberately nameless
+/// (design/REMOTE.md §2.1, §6).
+fn binding_usage(name: &str) -> Option<u16> {
+    if let Some(hex) = name.strip_prefix("usage:0x") {
+        let usage = u16::from_str_radix(hex, 16).ok()?;
+        return (usage <= keymap::MAX_CONSUMER_USAGE).then_some(usage);
+    }
+    keymap::remote_usage(name)
+}
+
+/// Parse a boolean value.
+fn bool_item(item: &Item<'_>) -> Result<bool, toml_spanner::Error> {
+    item.as_bool()
+        .ok_or_else(|| item.expected(&"true or false"))
 }
 
 /// The `[pointer]` table (design/ARCH.md §7.2c).
@@ -685,6 +828,99 @@ mod tests {
         assert_eq!(cfg.buffer, DEFAULT_BUFFER);
         assert_eq!(cfg.axis_bits, AxisBits::Eight);
         assert_eq!(cfg.overflow, Overflow::Burst);
+        assert_eq!(cfg.remote, Remote::default());
+    }
+
+    /// The usages the named `[remote]` bindings resolve to, in config order.
+    fn consumer_usages(hk: &Hotkeys) -> Vec<u16> {
+        hk.chords()
+            .iter()
+            .filter_map(|c| match c.action {
+                Action::Consumer(u) => Some(u),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn remote_parse() {
+        // Absent → off, and off is the state in which the descriptor is
+        // unchanged (design/REMOTE.md §3.1).
+        assert_eq!(parse("").unwrap().remote, Remote::default());
+        assert!(!parse("[remote]\n").unwrap().remote.enabled);
+        // Passthrough defaults on once enabled, and can be turned off.
+        let cfg = parse("[remote]\nenabled = true\n").unwrap();
+        assert_eq!(
+            cfg.remote,
+            Remote {
+                enabled: true,
+                passthrough: true
+            }
+        );
+        assert!(
+            !parse("[remote]\nenabled = true\npassthrough = false\n")
+                .unwrap()
+                .remote
+                .passthrough
+        );
+
+        // Named bindings become Consumer chords alongside the hotkey defaults.
+        let cfg = parse(
+            "[remote]\n\
+             enabled = true\n\
+             tv = \"leftmeta+t\"\n\
+             channel_up = \"leftmeta+pageup\"\n\
+             all_apps = \"\"\n",
+        )
+        .unwrap();
+        assert_eq!(consumer_usages(&cfg.hotkeys), [0x089, 0x09C]);
+        // They match through the same machinery as `[hotkeys]`, so a bare meta
+        // now opens a chord buffer.
+        assert!(cfg.hotkeys.starts(keymap::KEY_LEFTMETA));
+        // The defaults survive.
+        assert!(steps(&cfg.hotkeys, Action::CaptureToggle).is_some());
+
+        // The escape hatch takes any usage the descriptor declares — including
+        // Mode Step, which has no friendly name on purpose (§2.1).
+        let cfg = parse("[remote]\nenabled = true\n\"usage:0x082\" = \"leftmeta+s\"\n").unwrap();
+        assert_eq!(consumer_usages(&cfg.hotkeys), [0x082]);
+        assert_eq!(
+            consumer_usages(
+                &parse("[remote]\nenabled = true\n\"usage:0x2A2\" = \"leftmeta+a\"\n")
+                    .unwrap()
+                    .hotkeys
+            ),
+            [0x2A2]
+        );
+
+        // Disabled: the bindings are ignored rather than rejected, so a config
+        // can be prepared before flipping the switch (§6).
+        let cfg = parse("[remote]\ntv = \"leftmeta+t\"\n").unwrap();
+        assert_eq!(consumer_usages(&cfg.hotkeys), [] as [u16; 0]);
+        assert!(!cfg.hotkeys.starts(keymap::KEY_LEFTMETA));
+    }
+
+    #[test]
+    fn remote_rejects_bad_input() {
+        // Unknown button names, and the ones §2.1 deliberately refuses to offer.
+        assert!(parse("[remote]\nenabled = true\nsource = \"leftmeta+s\"\n").is_err());
+        assert!(parse("[remote]\nenabled = true\ninput = \"leftmeta+i\"\n").is_err());
+        // Malformed or out-of-range escape hatches.
+        assert!(parse("[remote]\nenabled = true\n\"usage:0x2A3\" = \"leftmeta+s\"\n").is_err());
+        assert!(parse("[remote]\nenabled = true\n\"usage:0xZZ\" = \"leftmeta+s\"\n").is_err());
+        assert!(parse("[remote]\nenabled = true\n\"usage:130\" = \"leftmeta+s\"\n").is_err());
+        // Bad chords and wrong value types.
+        assert!(parse("[remote]\nenabled = true\ntv = \"leftmeta+nosuchkey\"\n").is_err());
+        assert!(parse("[remote]\nenabled = true\ntv = 1\n").is_err());
+        assert!(parse("[remote]\nenabled = \"yes\"\n").is_err());
+        // Bindings are checked even while disabled; only their *effect* is
+        // dropped, so a typo is still reported.
+        assert!(parse("[remote]\nnosuchbutton = \"leftmeta+s\"\n").is_err());
+        // More bindings than the fixed chord buffer can hold.
+        let many: String = (0..=MAX_REMOTE_BINDINGS)
+            .map(|i| format!("\"usage:0x{i:03x}\" = \"leftmeta+a\"\n"))
+            .collect();
+        assert!(parse(&format!("[remote]\nenabled = true\n{many}")).is_err());
     }
 
     #[test]

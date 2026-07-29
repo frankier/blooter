@@ -1,5 +1,9 @@
 //! Mapping from Linux input keycodes to USB HID usage codes (Keyboard/Keypad
 //! page), and the modifier-bit assignment. See design/ARCH.md §7.2 / §7.4.
+//!
+//! Media keys map onto the *Consumer* page instead, via `consumer_usage`; the
+//! `[remote]` binding names map onto the same page via `remote_usage`. Both are
+//! only consulted when `[remote] enabled` (design/REMOTE.md §5, §6).
 
 // Linux keycodes (from <linux/input-event-codes.h>) that we care about.
 pub const KEY_ESC: u16 = 1;
@@ -106,6 +110,47 @@ pub const KEY_DELETE: u16 = 111;
 pub const KEY_PAUSE: u16 = 119;
 pub const KEY_LEFTMETA: u16 = 125;
 pub const KEY_RIGHTMETA: u16 = 126;
+
+// Media and application keys. These have no Keyboard/Keypad usage; they reach
+// a host through the Consumer collection instead (design/REMOTE.md §5).
+pub const KEY_MUTE: u16 = 113;
+pub const KEY_VOLUMEDOWN: u16 = 114;
+pub const KEY_VOLUMEUP: u16 = 115;
+pub const KEY_POWER: u16 = 116;
+pub const KEY_STOP: u16 = 128;
+pub const KEY_MENU: u16 = 139;
+pub const KEY_CALC: u16 = 140;
+pub const KEY_FILE: u16 = 144;
+pub const KEY_WWW: u16 = 150;
+/// `KEY_COFFEE`, aka `KEY_SCREENLOCK`.
+pub const KEY_COFFEE: u16 = 152;
+pub const KEY_MAIL: u16 = 155;
+pub const KEY_BOOKMARKS: u16 = 156;
+pub const KEY_BACK: u16 = 158;
+pub const KEY_FORWARD: u16 = 159;
+pub const KEY_EJECTCD: u16 = 161;
+pub const KEY_NEXTSONG: u16 = 163;
+pub const KEY_PLAYPAUSE: u16 = 164;
+pub const KEY_PREVIOUSSONG: u16 = 165;
+pub const KEY_STOPCD: u16 = 166;
+pub const KEY_RECORD: u16 = 167;
+pub const KEY_REWIND: u16 = 168;
+pub const KEY_HOMEPAGE: u16 = 172;
+pub const KEY_REFRESH: u16 = 173;
+pub const KEY_PLAYCD: u16 = 200;
+pub const KEY_PLAY: u16 = 207;
+pub const KEY_FASTFORWARD: u16 = 208;
+pub const KEY_SEARCH: u16 = 217;
+pub const KEY_BRIGHTNESSDOWN: u16 = 224;
+pub const KEY_BRIGHTNESSUP: u16 = 225;
+pub const KEY_AUDIO: u16 = 392;
+pub const KEY_VOICECOMMAND: u16 = 582;
+pub const KEY_ASSISTANT: u16 = 583;
+
+/// The highest Consumer-page usage the report descriptor declares
+/// (`AC Desktop Show All Applications`), and so the largest value the
+/// `"usage:0xNNN"` escape hatch accepts (design/REMOTE.md §3, §6).
+pub const MAX_CONSUMER_USAGE: u16 = 0x2A2;
 
 // Mouse buttons.
 pub const BTN_LEFT: u16 = 0x110;
@@ -392,6 +437,79 @@ pub fn hid_usage(code: u16) -> Option<u8> {
     })
 }
 
+/// Translate a Linux keycode to a HID *Consumer*-page usage (design/REMOTE.md
+/// §5), or `None` if the key has no consumer meaning. This is the inverse of
+/// the kernel's `HID_UP_CONSUMER` case in `drivers/hid/hid-input.c`, restricted
+/// to the keycodes evdev keyboards actually produce — a host running that same
+/// table therefore recovers the keycode blooter started from.
+///
+/// Consulted only when `[remote] passthrough` is on, and only after
+/// [`hid_usage`] has declined the key, so it never shadows a keyboard key.
+pub fn consumer_usage(code: u16) -> Option<u16> {
+    Some(match code {
+        KEY_MUTE => 0x0E2,
+        KEY_VOLUMEDOWN => 0x0EA,
+        KEY_VOLUMEUP => 0x0E9,
+        KEY_POWER => 0x030,
+        KEY_STOP => 0x226,    // AC Stop
+        KEY_MENU => 0x040,    // Menu
+        KEY_BACK => 0x224,    // AC Back
+        KEY_FORWARD => 0x225, // AC Forward
+        KEY_EJECTCD => 0x0B8,
+        KEY_NEXTSONG => 0x0B5,
+        KEY_PLAYPAUSE => 0x0CD,
+        KEY_PREVIOUSSONG => 0x0B6,
+        KEY_STOPCD => 0x0B7,
+        KEY_RECORD => 0x0B2,
+        KEY_REWIND => 0x0B4,
+        KEY_HOMEPAGE => 0x223, // AC Home
+        KEY_REFRESH => 0x227,  // AC Refresh
+        KEY_MAIL => 0x18A,
+        KEY_BOOKMARKS => 0x22A, // AC Bookmarks
+        KEY_FILE => 0x194,
+        KEY_AUDIO => 0x1B7,
+        // The kernel gives `KEY_PLAY` no consumer usage of its own, but Android
+        // treats both it and `KEY_PLAYCD` as MEDIA_PLAY, so both map to the
+        // discrete Play usage (design/REMOTE.md §5).
+        KEY_PLAY | KEY_PLAYCD => 0x0B0,
+        KEY_FASTFORWARD => 0x0B3,
+        KEY_SEARCH => 0x221, // AC Search
+        KEY_BRIGHTNESSDOWN => 0x070,
+        KEY_BRIGHTNESSUP => 0x06F,
+        KEY_WWW => 0x08A,
+        KEY_CALC => 0x192,
+        KEY_COFFEE => 0x19E,
+        KEY_ASSISTANT => 0x1CB,
+        KEY_VOICECOMMAND => 0x0CF,
+        _ => return None,
+    })
+}
+
+/// The Consumer-page usage a `[remote]` binding name stands for
+/// (design/REMOTE.md §6), or `None` for an unknown name. Only the remote
+/// buttons a keyboard has no key for get a name; everything a keyboard can
+/// already emit is passthrough's job (§5), and anything unlisted goes through
+/// the `"usage:0xNNN"` escape hatch.
+pub fn remote_usage(name: &str) -> Option<u16> {
+    Some(match name {
+        "tv" => 0x089,           // Media Select TV
+        "guide" => 0x08D,        // Media Select Program Guide
+        "dvr" => 0x09A,          // Media Select Home (DVR/recordings)
+        "channel_up" => 0x09C,   //
+        "channel_down" => 0x09D, //
+        "last_channel" => 0x083, // Recall Last
+        "captions" => 0x061,     // Closed Caption
+        "info" => 0x060,         // Data On Screen
+        "red" => 0x069,
+        "green" => 0x06A,
+        "yellow" => 0x06B,
+        "blue" => 0x06C,
+        "aspect_ratio" => 0x06D,
+        "all_apps" => 0x2A2, // AC Desktop Show All Applications
+        _ => return None,
+    })
+}
+
 /// The HID gamepad button bit (0..=15) a Linux `BTN_*` code maps to, or `None`
 /// if the code is not one of the forwarded gamepad/joystick buttons. Modern
 /// pads report the `BTN_GAMEPAD` range (`BTN_SOUTH` …); cheap/generic pads,
@@ -444,6 +562,78 @@ mod tests {
         assert_eq!(gamepad_button_bit(0x121), Some(1)); // BTN_THUMB
         assert_eq!(gamepad_button_bit(0x129), Some(9)); // BTN_BASE4
         assert_eq!(gamepad_button_bit(BTN_JOYSTICK_LAST), Some(15)); // BTN_DEAD
+    }
+
+    /// The pairs that matter are the ones the kernel's consumer table maps back
+    /// onto the keycode we started from (design/REMOTE.md §5).
+    #[test]
+    fn consumer_usages_round_trip() {
+        for (code, usage) in [
+            (KEY_MUTE, 0x0E2),
+            (KEY_VOLUMEDOWN, 0x0EA),
+            (KEY_VOLUMEUP, 0x0E9),
+            (KEY_POWER, 0x030),
+            (KEY_PLAYPAUSE, 0x0CD),
+            (KEY_NEXTSONG, 0x0B5),
+            (KEY_PREVIOUSSONG, 0x0B6),
+            (KEY_HOMEPAGE, 0x223),
+            (KEY_BACK, 0x224),
+            (KEY_SEARCH, 0x221),
+            (KEY_ASSISTANT, 0x1CB),
+        ] {
+            assert_eq!(consumer_usage(code), Some(usage), "keycode {code}");
+        }
+        // Both spellings of "play" reach the discrete Play usage.
+        assert_eq!(consumer_usage(KEY_PLAY), consumer_usage(KEY_PLAYCD));
+    }
+
+    /// Keys the keyboard collection already carries must not be diverted to the
+    /// consumer one, and vice versa: the two tables are disjoint.
+    #[test]
+    fn consumer_and_keyboard_tables_are_disjoint() {
+        for code in 0..=700u16 {
+            assert!(
+                hid_usage(code).is_none() || consumer_usage(code).is_none(),
+                "keycode {code} is in both the keyboard and consumer tables"
+            );
+        }
+        // `KEY_PAUSE` is a keyboard key (Pause/Break), not a media pause — the
+        // consumer page's Pause is deliberately unreachable (design/REMOTE.md §2).
+        assert!(consumer_usage(KEY_PAUSE).is_none());
+    }
+
+    /// Every named `[remote]` binding is inside the range the report descriptor
+    /// declares, and none of them duplicates another.
+    #[test]
+    fn remote_binding_names_are_in_range_and_distinct() {
+        let names = [
+            "tv",
+            "guide",
+            "dvr",
+            "channel_up",
+            "channel_down",
+            "last_channel",
+            "captions",
+            "info",
+            "red",
+            "green",
+            "yellow",
+            "blue",
+            "aspect_ratio",
+            "all_apps",
+        ];
+        let mut usages = Vec::new();
+        for name in names {
+            let usage = remote_usage(name).unwrap_or_else(|| panic!("{name} is unbound"));
+            assert!(usage <= MAX_CONSUMER_USAGE, "{name} is out of range");
+            assert!(
+                !usages.contains(&usage),
+                "{name} duplicates another binding"
+            );
+            usages.push(usage);
+        }
+        assert_eq!(remote_usage("source"), None);
+        assert_eq!(remote_usage("input"), None);
     }
 
     #[test]
