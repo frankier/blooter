@@ -82,6 +82,15 @@ impl Hosts {
         stale
     }
 
+    /// Every host with a record, whatever its fingerprint. The BLE menu unions
+    /// this with bluetoothd's bonded devices, so a host whose device object
+    /// bluetoothd has dropped still has a row to act on (design/CONNECTION.md §6).
+    pub fn addresses(&self) -> Vec<Address> {
+        let mut addrs: Vec<Address> = self.map.keys().copied().collect();
+        addrs.sort_by_key(|a| a.0); // stable order, as `stale` gives
+        addrs
+    }
+
     /// Rewrite the file. Failures are logged at debug and otherwise ignored —
     /// losing this state costs a stale marker, not correctness.
     fn save(&self) {

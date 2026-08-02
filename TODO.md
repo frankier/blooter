@@ -18,22 +18,30 @@ have since been done and are noted as such.
 The two integration suites (tests/README.md) leave these paths unexercised.
 Roughly in order of how much risk they carry.
 
-- **Reconnect-initiate / the outgoing dial** (design/CONNECTION.md §3.2, and its
-  BLE counterpart in §4). No suite covers it over a real link: that needs blooter
-  to initiate to an already-bonded target, which means driving a pairing first.
-  The race, the exponential backoff and the one-shot target clearing are still
-  only covered by reading.
-- **Menu-driven pairing** (`finalize` in `menu.rs`). Picking an unbonded host from
-  the menu drops raw mode, pairs from here, then initiates. `tests/termdbus`
-  asserts that a BLE pick calls `Pair` then `Connect`, but the mock accepts
-  `Pair` without driving the resulting agent exchange, and the Classic pick stops
-  at the UI.
-- **`[f] Fix connection`** (§7). Only its presence in the footer is asserted, on
-  either transport. What it performs needs a real link, so it belongs in
+- **Reconnect-initiate / the outgoing dial** (design/CONNECTION.md §3.2), now
+  Classic-only. No suite covers it over a real link: that needs blooter to
+  initiate to an already-bonded target, which means driving a pairing first. The
+  race, the exponential backoff and the one-shot target clearing are still only
+  covered by reading.
+- **Menu-driven pairing** (`finalize` in `menu.rs`), now Classic-only. Picking an
+  unbonded host from the menu drops raw mode, pairs from here, then initiates.
+  The Classic pick stops at the UI in `tests/termdbus`.
+- **The `prompt` agent's passkey paths** (§5.2). `tests/termdbus` covers the
+  y/n confirmation and the terminal hand-off around it; `RequestPasskey`,
+  `DisplayPasskey` and the two PIN variants are only covered by the capability
+  unit test, not by an exchange. Driving them needs a mock that picks an
+  association model, which dbusmock's bluez5 template does not do.
+- **`[f] Fix connection`** (§7). `tests/termdbus` asserts its presence in the
+  footer on both transports, and that a BLE `[f]` against a disconnected host
+  keeps the bond. What it *performs* needs a real link, so it belongs in
   `tests/btvirt`: the Classic unplug + unbond needs a bonded peer that can be
   re-paired afterwards (the shared-agent problem below), and the BLE repair needs
   a peer that observes the Service Changed indication and re-reads the Report Map
   — neither of which the `btvirt` peer does today.
+- **`[ble] advertise`** (§4.1). Nothing asserts the adapter alias or Class of
+  Device is actually set, or restored on exit. `tests/termdbus`' mock adapter
+  could check `Alias`, but the class goes through the management socket, which
+  only `tests/btvirt` has.
 - **First-contact pairing over a real link.** `tests/btvirt` bonds the two
   controllers *before* blooter starts, to dodge the shared-agent artifact, so
   every test there exercises the already-bonded reconnect path. Pairing a
@@ -53,6 +61,18 @@ Roughly in order of how much risk they carry.
 
 ## To investigate
 
+- **`test_ble_unsubscribe_ends_session` is flaky, and fails outright in
+  isolation.** Running `tests/btvirt/run.sh ble_unsubscribe` on its own fails
+  every time — blooter never logs "host disconnected" within the 10 s window —
+  while the full suite passes. Reproduced identically at `e0cc014`, so it
+  predates the BLE peripheral rework and is a property of the test, not the
+  transport: the suite pre-bonds the two controllers, and the earlier tests
+  evidently leave state this one depends on. It has also failed once in a full
+  run out of four. Worth pinning down before it masks a real teardown bug: the
+  session ends off `notifier.stopped()` in `Shared::subscribe`
+  (`transport/le.rs`), so the question is whether BlueZ always reports the CCCD
+  session as stopped when an LE host vanishes, or only when it unsubscribes
+  cleanly.
 - **Menu repaints may stack at the bottom of the terminal.** Under
   `tests/termdbus` (100x30 PTY) each menu redraw left the previous render
   visible above it, rather than overwriting in place — several stacked copies
@@ -108,7 +128,10 @@ Roughly in order of how much risk they carry.
   to only after a fresh pairing), and the same question for Windows and Android.
   Worth a matrix of {BlueZ, Windows, Android} × {`slots` change, `axis_bits`
   change} × {automatic on reconnect, explicit `[f]`}. Where a host ignores it,
-  the fallback is the manual re-pair blooter already prints.
+  the fallback is the manual re-pair blooter already prints — `[u]` to drop the
+  bond here, then remove blooter from that host's Bluetooth settings. Note the
+  matrix now needs the host *connected* for `[f]` to do anything at all, since
+  blooter cannot bring the link up itself (CONNECTION.md §4).
 
 ## Done since (kept here for history)
 
@@ -124,15 +147,33 @@ Roughly in order of how much risk they carry.
 - **Pairing / agent handling** — implemented: a shared BlueZ agent is registered
   for both transports, auto-accepting ("Just Works") or prompting on the TTY per
   `[connection] pairing` (design/CONNECTION.md §5).
-- **Outgoing HID (reconnect-initiate) connections** — implemented: when a
-  reconnect target is set (the host menu, or `[connection] reconnect`), the
-  Classic transport dials the host's HID L2CAP PSMs, raced against the inbound
-  accept (design/CONNECTION.md §3.2, §6). BLE does the same with
-  `Device::connect()`, raced against the CCCD subscribe (§4).
+- **Outgoing HID (reconnect-initiate) connections** — implemented on Classic:
+  when a reconnect target is set (the host menu, or `[connection] reconnect`),
+  the Classic transport dials the host's HID L2CAP PSMs, raced against the
+  inbound accept (design/CONNECTION.md §3.2, §6).
+- **BLE outgoing connections** — implemented, then **removed**, and the reasoning
+  is worth keeping: it never worked and could not have. HOGP puts the HID device
+  in the GAP Peripheral role, so a host will not run its HOGP client over a link
+  blooter opened; and `Device1.Connect()` takes no transport argument, so BlueZ
+  picked the BR/EDR bearer for any dual-mode host and failed with
+  `br-connection-unknown` before the role question even arose. The BLE menu is a
+  bonded-host manager now rather than a host picker, and `[connection] reconnect`
+  is Classic-only (design/CONNECTION.md §4, §6).
+- **BLE pairing with no desktop agent** — fixed: the `accept` agent registered as
+  `DisplayYesNo` rather than `NoInputNoOutput` (bluer derives the capability from
+  which callbacks are set), so hosts chose Passkey Entry and blooter had no
+  handler for it — a PIN on the host, nothing on blooter. BLE's `accept` agent is
+  now callback-free, and `prompt` answers every association model on the TTY
+  (§5).
+- **The BLE device identity** — fixed: bluetoothd serves the GAP Device Name from
+  the adapter alias and the Appearance from its Class of Device, so a host saw
+  the machine's hostname and a computer icon whatever the advertisement said.
+  `setup.rs` runs on BLE too now, under `[ble] advertise` (§4.1).
 - **BLE as the default transport, with its own connection menu** — implemented:
-  `[connection] protocol` defaults to `"ble"`, and both transports run the same
-  `menu.rs` (differing only in the discovery filter and whether `[f]` applies).
-  Covered by `tests/termdbus` (the menu) and `tests/btvirt` (the link).
+  `[connection] protocol` defaults to `"ble"`. Both transports drive `menu.rs`,
+  but for different jobs — Classic picks a host to pair and dial, BLE manages
+  hosts already bonded (§6). Covered by `tests/termdbus` (the menu) and
+  `tests/btvirt` (the link).
 - **Batching pointer events for slower connections** — implemented: pointer
   motion accumulates per input frame and is flushed under a configurable policy
   (`[pointer] batch`/`buffer`/`axis_bits`/`overflow`, design/ARCH.md §7.2c). This

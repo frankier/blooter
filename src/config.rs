@@ -113,6 +113,31 @@ pub enum PairingMode {
     Prompt,
 }
 
+/// How much of the adapter's identity blooter takes over in BLE mode
+/// (design/CONNECTION.md §4.1).
+///
+/// The LE advertisement's name and appearance only reach a host *before* it
+/// connects. Once connected, the host reads the GAP service (0x1800), which
+/// bluetoothd owns and serves from the adapter's alias and Class of Device —
+/// so without setting those, a host sees the machine's hostname and its
+/// computer icon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Advertise {
+    /// `AliasCod`, but fall back to `Alias` without complaint when the Class of
+    /// Device cannot be set (it needs `CAP_NET_ADMIN`) — the default.
+    #[default]
+    Auto,
+    /// Set the adapter alias only. Needs no privilege, but leaves the host
+    /// showing the adapter's existing device icon.
+    Alias,
+    /// Set the alias *and* the Class of Device. Fails at startup if the class
+    /// cannot be set.
+    AliasCod,
+    /// `AliasCod`, plus turning off BR/EDR discoverability so only the LE
+    /// identity is on offer.
+    AliasCodHide,
+}
+
 /// What drives a flush of buffered pointer motion (design/ARCH.md §7.2c). A
 /// `SYN_REPORT` frame boundary is necessary for a flush in every mode, and
 /// sufficient in `None`.
@@ -219,8 +244,11 @@ pub struct Config {
     pub protocol: Protocol,
     /// Pairing agent behaviour (§5).
     pub pairing: PairingMode,
-    /// Address of a host to initiate an outgoing HID connection to (§3.2, §6).
+    /// Address of a host to initiate an outgoing HID connection to. Classic
+    /// only: BLE is peripheral-only and never dials out (§3.2, §4).
     pub reconnect: Option<String>,
+    /// How much of the adapter identity BLE mode takes over (§4.1).
+    pub advertise: Advertise,
     /// Pointer batching (§7.2c).
     pub batch: Batch,
     pub buffer: usize,
@@ -239,6 +267,7 @@ impl Default for Config {
             protocol: Protocol::default(),
             pairing: PairingMode::default(),
             reconnect: None,
+            advertise: Advertise::default(),
             batch: Batch::default(),
             buffer: DEFAULT_BUFFER,
             axis_bits: AxisBits::default(),
@@ -336,6 +365,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
         Ok(top) => {
             let gamepad = top.gamepad.unwrap_or_default();
             let connection = top.connection.unwrap_or_default();
+            let ble = top.ble.unwrap_or_default();
             let pointer = top.pointer.unwrap_or_default();
             let remote = top.remote.unwrap_or_default();
             // With the collection off there is nothing for a binding to reach,
@@ -358,6 +388,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 protocol: connection.protocol,
                 pairing: connection.pairing,
                 reconnect: connection.reconnect,
+                advertise: ble.advertise,
                 batch: pointer.batch,
                 buffer: pointer.buffer,
                 axis_bits: pointer.axis_bits,
@@ -380,11 +411,12 @@ pub fn parse(text: &str) -> Result<Config, String> {
 }
 
 /// The whole config file: the optional `[hotkeys]`, `[gamepad]`, `[connection]`,
-/// `[pointer]` and `[remote]` tables.
+/// `[ble]`, `[pointer]` and `[remote]` tables.
 struct TopLevel {
     hotkeys: Option<Hotkeys>,
     gamepad: Option<Gamepad>,
     connection: Option<Connection>,
+    ble: Option<Ble>,
     pointer: Option<Pointer>,
     remote: Option<RemoteSection>,
 }
@@ -395,6 +427,7 @@ impl<'de> FromToml<'de> for TopLevel {
         let hotkeys = th.optional("hotkeys");
         let gamepad = th.optional("gamepad");
         let connection = th.optional("connection");
+        let ble = th.optional("ble");
         let pointer = th.optional("pointer");
         let remote = th.optional("remote");
         th.require_empty()?;
@@ -402,6 +435,7 @@ impl<'de> FromToml<'de> for TopLevel {
             hotkeys,
             gamepad,
             connection,
+            ble,
             pointer,
             remote,
         })
@@ -605,6 +639,35 @@ impl<'de> FromToml<'de> for Connection {
             pairing,
             reconnect,
         })
+    }
+}
+
+/// The `[ble]` table: settings that only apply to the LE transport.
+#[derive(Default)]
+struct Ble {
+    advertise: Advertise,
+}
+
+impl<'de> FromToml<'de> for Ble {
+    fn from_toml(ctx: &mut Context<'de>, item: &Item<'de>) -> Result<Self, Failed> {
+        let mut th = item.table_helper(ctx)?;
+        let advertise = th
+            .optional_mapped("advertise", advertise_item)
+            .unwrap_or_default();
+        th.require_empty()?;
+        Ok(Ble { advertise })
+    }
+}
+
+/// Parse the `advertise` value: `"auto"`, `"alias"`, `"alias_cod"` or
+/// `"alias_cod_hide"`.
+fn advertise_item(item: &Item<'_>) -> Result<Advertise, toml_spanner::Error> {
+    match item.as_str() {
+        Some("auto") => Ok(Advertise::Auto),
+        Some("alias") => Ok(Advertise::Alias),
+        Some("alias_cod") => Ok(Advertise::AliasCod),
+        Some("alias_cod_hide") => Ok(Advertise::AliasCodHide),
+        _ => Err(item.expected(&"\"auto\", \"alias\", \"alias_cod\" or \"alias_cod_hide\"")),
     }
 }
 
@@ -1001,6 +1064,27 @@ mod tests {
         assert!(parse("[connection]\nreconnect = \"AA:BB:CC:DD:EE\"\n").is_err());
         assert!(parse("[connection]\nreconnect = \"ZZ:BB:CC:DD:EE:FF\"\n").is_err());
         assert!(parse("[connection]\nreconnect = 1\n").is_err());
+    }
+
+    #[test]
+    fn advertise_parses() {
+        // Absent → auto, whether or not the table is present.
+        assert_eq!(parse("").unwrap().advertise, Advertise::Auto);
+        assert_eq!(parse("[ble]\n").unwrap().advertise, Advertise::Auto);
+        for (text, want) in [
+            ("auto", Advertise::Auto),
+            ("alias", Advertise::Alias),
+            ("alias_cod", Advertise::AliasCod),
+            ("alias_cod_hide", Advertise::AliasCodHide),
+        ] {
+            let cfg = parse(&format!("[ble]\nadvertise = \"{text}\"\n")).unwrap();
+            assert_eq!(cfg.advertise, want, "advertise = {text}");
+        }
+        // Values are snake_case, matching `pairing`; kebab-case is not accepted.
+        assert!(parse("[ble]\nadvertise = \"alias-cod\"\n").is_err());
+        assert!(parse("[ble]\nadvertise = \"none\"\n").is_err());
+        assert!(parse("[ble]\nadvertise = true\n").is_err());
+        assert!(parse("[ble]\nunknown = 1\n").is_err());
     }
 
     #[test]

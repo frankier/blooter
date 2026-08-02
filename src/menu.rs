@@ -7,16 +7,26 @@
 //! cancel signal (fired on inbound-accept or shutdown) preempts the menu at any
 //! await point and the terminal is always restored.
 //!
-//! Both transports use it: [`Kind`] carries the only difference — which
-//! discovery transport to scan on. [`Session`] wraps the spawn/cancel/join
-//! plumbing so each transport's `wait_connected` drives the menu the same way.
+//! Both transports use it, but for **different jobs** — [`Kind`] is not a mere
+//! discovery filter (design/CONNECTION.md §6):
 //!
-//! Ineligible devices — Bluetooth audio/headsets and other HID peripherals, and
-//! devices with no real name (only a hex identifier) — are moved to an "Other
-//! devices" submenu so the main list shows just plausible HID hosts
-//! (computers/phones/TVs). The test is a deny-list, so an unrecognised device
-//! stays in the main list ([`is_other`]), and already-paired devices always do:
-//! bonding one was a deliberate choice.
+//! - [`Kind::Classic`] is a *host picker*. It scans for BR/EDR devices, pairs a
+//!   newly-picked one from here, and hands back an address to dial. Ineligible
+//!   devices — Bluetooth audio/headsets and other HID peripherals, and devices
+//!   with no real name (only a hex identifier) — are moved to an "Other devices"
+//!   submenu so the main list shows just plausible HID hosts
+//!   (computers/phones/TVs). The test is a deny-list, so an unrecognised device
+//!   stays in the main list ([`is_other`]), and already-paired devices always do:
+//!   bonding one was a deliberate choice.
+//! - [`Kind::Ble`] is a *bonded-host manager*, and deliberately does none of
+//!   that. blooter is a BLE peripheral: hosts are centrals, they do not
+//!   advertise, so scanning cannot find them and there is nothing to dial or to
+//!   pair from this side. It lists the hosts blooter is bonded to and offers the
+//!   two things that *are* ours to do — `[f]` fix a stale layout and `[u]` drop
+//!   the bond — while the host does the connecting and the pairing.
+//!
+//! [`Session`] wraps the spawn/cancel/join plumbing so each transport's
+//! `wait_connected` drives the menu the same way.
 
 use std::future;
 use std::io::{self, Write};
@@ -48,12 +58,18 @@ pub enum Kind {
 
 impl Kind {
     /// Scan only on the transport in use, so the list never offers a device the
-    /// caller cannot connect to.
+    /// caller cannot connect to. BLE does not scan at all.
     fn discovery_transport(self) -> DiscoveryTransport {
         match self {
             Self::Classic => DiscoveryTransport::BrEdr,
             Self::Ble => DiscoveryTransport::Le,
         }
+    }
+
+    /// Whether the menu picks a host to connect out to. Only Classic does:
+    /// initiating is not something a BLE peripheral can do (§4).
+    fn picks_hosts(self) -> bool {
+        self == Self::Classic
     }
 }
 
@@ -73,20 +89,32 @@ struct Row {
     alias: String,
     connected: bool,
     paired: bool,
+    /// Signal strength, from a discovery scan. Always `None` on BLE, which does
+    /// not scan.
     rssi: Option<i16>,
     /// Bonded under a different HID report descriptor than the current one, so
     /// this host is still using a cached copy that no longer matches what
     /// blooter sends (design/CONNECTION.md §7). Fixable with `[f]`.
     stale: bool,
+    /// blooter remembers bonding this host, but bluetoothd has no device object
+    /// for it any more. Kept in the list rather than dropped, so a host cannot
+    /// silently vanish from the only UI that can act on it.
+    forgotten_by_bluez: bool,
 }
 
-/// What the menu resolved to: a host, and what to do with it.
-pub struct Pick {
-    pub addr: Address,
+/// What the menu resolved to (design/CONNECTION.md §6).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pick {
+    /// Start a session on this host: pair it if new, then dial it. Classic only
+    /// — a BLE peripheral cannot initiate (§4).
+    Connect(Address),
     /// Repair this host rather than starting a session on it: make it drop the
     /// copy of blooter's HID layout it cached when it bonded, by whatever means
-    /// the transport has (design/CONNECTION.md §7).
-    pub fix: bool,
+    /// the transport has (§7).
+    Fix(Address),
+    /// Drop blooter's bond to this host. Always an explicit user choice — never
+    /// something a failed operation does on its own (§7.2b).
+    Forget(Address),
 }
 
 /// What a keypress asks the event loop to do. Cursor moves and screen switches
@@ -99,11 +127,14 @@ enum Action {
     Select(usize),
     /// Fix the connection to the device at this index (§7).
     Fix(usize),
+    /// Drop the bond to the device at this index (§7.2b).
+    Forget(usize),
     Rescan,
     Skip,
 }
 
 struct MenuState {
+    kind: Kind,
     screen: Screen,
     main: Vec<Row>,
     other: Vec<Row>,
@@ -228,16 +259,21 @@ fn on_key(state: &mut MenuState, key: KeyEvent) -> Action {
             }
             Action::None
         }
+        // Number keys pick a host to connect to where that means something; on
+        // BLE there is nothing to connect to, so they only move the cursor.
         KeyCode::Char(c @ '1'..='9') => {
             let idx = (c as usize) - ('1' as usize);
-            if idx < len {
-                Action::Select(idx)
-            } else {
-                Action::None
+            match (idx < len, state.kind.picks_hosts()) {
+                (false, _) => Action::None,
+                (true, true) => Action::Select(idx),
+                (true, false) => {
+                    state.selected = idx;
+                    Action::None
+                }
             }
         }
         KeyCode::Enter => {
-            if len > 0 {
+            if len > 0 && state.kind.picks_hosts() {
                 Action::Select(state.selected)
             } else {
                 Action::Skip
@@ -263,6 +299,13 @@ fn on_key(state: &mut MenuState, key: KeyEvent) -> Action {
             Some(r) if r.paired => Action::Fix(state.selected),
             _ => Action::None,
         },
+        // Dropping a bond is destructive and irreversible from here — the host
+        // has to pair again — so it is offered only where it is the documented
+        // repair, on BLE, and only on a host actually bonded (§7.2b).
+        KeyCode::Char('u') | KeyCode::Char('U') => match state.rows().get(state.selected) {
+            Some(r) if r.paired && !state.kind.picks_hosts() => Action::Forget(state.selected),
+            _ => Action::None,
+        },
         KeyCode::Char('r') | KeyCode::Char('R') => Action::Rescan,
         KeyCode::Char('q') | KeyCode::Char('Q') => Action::Skip,
         KeyCode::Esc => {
@@ -281,13 +324,24 @@ fn on_key(state: &mut MenuState, key: KeyEvent) -> Action {
 /// Render the current screen to a list of lines (pure; the caller does the I/O).
 fn render_lines(state: &MenuState) -> Vec<String> {
     let mut lines = Vec::new();
-    let (title, rows) = match state.screen {
-        Screen::Main => ("Bluetooth hosts:", &state.main),
-        Screen::Other => ("Other devices:", &state.other),
+    let ble = !state.kind.picks_hosts();
+    let (title, rows) = match (state.screen, ble) {
+        // On BLE the list is not something to choose from, so the title says
+        // what the user is actually meant to do: pair from the host.
+        (_, true) => (
+            "Paired hosts (pair new ones from the host's Bluetooth settings):",
+            &state.main,
+        ),
+        (Screen::Main, false) => ("Bluetooth hosts:", &state.main),
+        (Screen::Other, false) => ("Other devices:", &state.other),
     };
     lines.push(title.to_string());
     if rows.is_empty() {
-        lines.push("  (none found)".to_string());
+        lines.push(if ble {
+            "  (none yet)".to_string()
+        } else {
+            "  (none found)".to_string()
+        });
     }
     for (i, r) in rows.iter().enumerate() {
         let marker = if i == state.selected { '>' } else { ' ' };
@@ -300,8 +354,13 @@ fn render_lines(state: &MenuState) -> Vec<String> {
         };
         let sig = r.rssi.map(|v| format!(", {v} dBm")).unwrap_or_default();
         let stale = if r.stale { ", stale" } else { "" };
+        let gone = if r.forgotten_by_bluez {
+            ", unknown to bluetoothd"
+        } else {
+            ""
+        };
         lines.push(format!(
-            "{marker} {}. {}  {} [{st}{sig}{stale}]",
+            "{marker} {}. {}  {} [{st}{sig}{stale}{gone}]",
             i + 1,
             r.addr,
             r.alias
@@ -309,26 +368,35 @@ fn render_lines(state: &MenuState) -> Vec<String> {
     }
     lines.push(String::new());
     // `[f]` applies to bonded hosts only, so it is offered only when the cursor
-    // is on one.
-    let fix = match rows.get(state.selected) {
-        Some(r) if r.paired => "[f] Fix connection   ",
-        _ => "",
-    };
-    let footer = match state.screen {
-        Screen::Main if state.other.is_empty() => format!("{fix}[r] Rescan   [q] Skip"),
-        Screen::Main => format!(
+    // is on one; `[u]` likewise, and only on BLE.
+    let selected = rows.get(state.selected);
+    let bonded = matches!(selected, Some(r) if r.paired);
+    let fix = if bonded { "[f] Fix connection   " } else { "" };
+    let footer = match (state.screen, ble) {
+        (_, true) => {
+            let forget = if bonded { "[u] Forget host   " } else { "" };
+            format!("{fix}{forget}[r] Refresh   [q] Close")
+        }
+        (Screen::Main, false) if state.other.is_empty() => format!("{fix}[r] Rescan   [q] Skip"),
+        (Screen::Main, false) => format!(
             "[o] Other devices ({})   {fix}[r] Rescan   [q] Skip",
             state.other.len()
         ),
-        Screen::Other => format!("[b] Back   {fix}[r] Rescan   [q] Skip"),
+        (Screen::Other, false) => format!("[b] Back   {fix}[r] Rescan   [q] Skip"),
     };
     lines.push(footer);
     if rows.iter().any(|r| r.stale) {
-        lines.push(
+        // The two repairs differ: Classic tears the bond down and needs a fresh
+        // pairing, BLE tells the host to re-read over the existing one.
+        lines.push(if ble {
+            "A host marked 'stale' cached an older HID descriptor and will not see \
+             blooter's current one; connect from it, then press [f]."
+                .to_string()
+        } else {
             "A host marked 'stale' cached an older HID descriptor and will not see \
              blooter's current one; [f] fixes it (re-pair afterwards)."
-                .to_string(),
-        );
+                .to_string()
+        });
     }
     lines
 }
@@ -507,6 +575,7 @@ async fn collect(adapter: &Adapter, stale: &[Address]) -> (Vec<(Row, Device)>, V
             rssi: dev.rssi().await.ok().flatten(),
             // Only a bond carries a cached record, so only bonded hosts can be stale.
             stale: paired && stale.contains(&addr),
+            forgotten_by_bluez: false,
         };
         let other_dev = is_other(class, appearance, has_real_name, paired);
         // Everything the classification saw, so a misfiled host can be diagnosed
@@ -529,6 +598,56 @@ async fn collect(adapter: &Adapter, stale: &[Address]) -> (Vec<(Row, Device)>, V
     (main, other)
 }
 
+/// The BLE list: the hosts blooter is bonded to, with no discovery at all.
+///
+/// Scanning would be pointless — a host is a GAP Central and does not advertise
+/// — so the rows come from what is already known: bluetoothd's bonded devices,
+/// unioned with every address blooter has a recorded fingerprint for. That union
+/// is the point. `RemoveDevice` deletes the D-Bus object outright, and a host
+/// that is not advertising can never be rediscovered, so a list built from
+/// bluetoothd alone can lose a host permanently (design/CONNECTION.md §6).
+async fn collect_bonded(adapter: &Adapter, stale: &[Address], known: &[Address]) -> Vec<Row> {
+    let live = adapter.device_addresses().await.unwrap_or_default();
+    let mut rows = Vec::new();
+    for &addr in &live {
+        let Ok(dev) = adapter.device(addr) else {
+            continue;
+        };
+        if !dev.is_paired().await.unwrap_or(false) {
+            continue;
+        }
+        rows.push(Row {
+            addr,
+            alias: dev.alias().await.unwrap_or_else(|_| addr.to_string()),
+            connected: dev.is_connected().await.unwrap_or(false),
+            paired: true,
+            rssi: None,
+            stale: stale.contains(&addr),
+            forgotten_by_bluez: false,
+        });
+    }
+    // Hosts blooter remembers but bluetoothd no longer has an object for. Shown
+    // so `[u]` can clear the leftover record rather than leaving it invisible.
+    for &addr in known {
+        if live.contains(&addr) {
+            continue;
+        }
+        rows.push(Row {
+            addr,
+            alias: addr.to_string(),
+            connected: false,
+            paired: true,
+            rssi: None,
+            stale: stale.contains(&addr),
+            forgotten_by_bluez: true,
+        });
+    }
+    // Connected first, then the rest by address so the order is stable between
+    // refreshes (there is no RSSI to rank by).
+    rows.sort_by_key(|r| (!r.connected, r.forgotten_by_bluez, r.addr.to_string()));
+    rows
+}
+
 /// Connected first, then paired, then unpaired; each group strongest signal
 /// first (matching the previous menu's ordering).
 fn sort_entries(v: &mut [(Row, Device)]) {
@@ -544,14 +663,27 @@ fn sort_entries(v: &mut [(Row, Device)]) {
     });
 }
 
-/// Run a short discovery pass (cancellable), then build a fresh [`MenuState`].
-/// Returns `None` only if cancelled mid-scan.
+/// Build a fresh [`MenuState`]: a discovery pass then a partition on Classic,
+/// a plain re-read of the bonded hosts on BLE. Returns `None` only if cancelled
+/// mid-scan.
 async fn scan(
     adapter: &Adapter,
     kind: Kind,
     stale: &[Address],
+    known: &[Address],
     cancel: &mut oneshot::Receiver<()>,
 ) -> Option<MenuState> {
+    if !kind.picks_hosts() {
+        return Some(MenuState {
+            kind,
+            screen: Screen::Main,
+            main: collect_bonded(adapter, stale, known).await,
+            other: Vec::new(),
+            main_devs: Vec::new(),
+            other_devs: Vec::new(),
+            selected: 0,
+        });
+    }
     // Restrict the scan to the transport in use. Best-effort: a controller that
     // rejects the filter still gets the default (interleaved) scan.
     let filter = DiscoveryFilter {
@@ -580,6 +712,7 @@ async fn scan(
     let (main, main_devs): (Vec<Row>, Vec<Device>) = main.into_iter().unzip();
     let (other, other_devs): (Vec<Row>, Vec<Device>) = other.into_iter().unzip();
     Some(MenuState {
+        kind,
         screen: Screen::Main,
         main,
         other,
@@ -663,19 +796,34 @@ async fn finalize(
 
 // --- Event loop ----------------------------------------------------------
 
-/// The interactive loop, in raw mode. Returns the chosen [`Device`] (to be paired
-/// by the caller after the terminal is restored), or `None` on skip/cancel.
+/// What the navigation loop resolved to, before the terminal is restored.
+/// `Connect` still holds the live [`Device`], since the caller has to pair it;
+/// the other two need only the address.
+enum Chosen {
+    Connect(Device),
+    Fix(Address),
+    Forget(Address),
+}
+
+/// The interactive loop, in raw mode. Returns what the user chose, or `None` on
+/// skip/cancel.
 async fn menu_loop(
     adapter: &Adapter,
     kind: Kind,
     stale: &[Address],
+    known: &[Address],
     suspend_rx: &mut mpsc::Receiver<SuspendReq>,
     cancel: &mut oneshot::Receiver<()>,
-) -> Option<(Device, bool)> {
+) -> Option<Chosen> {
     let mut out = io::stdout();
     let mut events = EventStream::new();
-    let mut prev = draw_lines(&mut out, &scanning_line(), 0).ok()?;
-    let mut state = scan(adapter, kind, stale, cancel).await?;
+    // BLE reads bonds rather than scanning, so there is nothing to wait for and
+    // no reason to say so.
+    let mut prev = match kind.picks_hosts() {
+        true => draw_lines(&mut out, &scanning_line(), 0).ok()?,
+        false => 0,
+    };
+    let mut state = scan(adapter, kind, stale, known, cancel).await?;
     loop {
         prev = draw_lines(&mut out, &render_lines(&state), prev).ok()?;
         tokio::select! {
@@ -702,14 +850,21 @@ async fn menu_loop(
                         Action::None => {}
                         Action::Skip => return None,
                         Action::Rescan => {
-                            prev = draw_lines(&mut out, &scanning_line(), prev).ok()?;
-                            state = scan(adapter, kind, stale, cancel).await?;
+                            if kind.picks_hosts() {
+                                prev = draw_lines(&mut out, &scanning_line(), prev).ok()?;
+                            }
+                            state = scan(adapter, kind, stale, known, cancel).await?;
                         }
                         Action::Select(i) => {
-                            return state.devs().get(i).cloned().map(|d| (d, false));
+                            return state.devs().get(i).cloned().map(Chosen::Connect);
                         }
+                        // Fix and Forget act on the address alone, so they work
+                        // for a host bluetoothd has no device object for.
                         Action::Fix(i) => {
-                            return state.devs().get(i).cloned().map(|d| (d, true));
+                            return state.rows().get(i).map(|r| Chosen::Fix(r.addr));
+                        }
+                        Action::Forget(i) => {
+                            return state.rows().get(i).map(|r| Chosen::Forget(r.addr));
                         }
                     }
                 }
@@ -749,6 +904,7 @@ async fn run(
     adapter: Adapter,
     kind: Kind,
     stale: Vec<Address>,
+    known: Vec<Address>,
     coord: TermCoord,
     mut cancel: oneshot::Receiver<()>,
 ) -> Option<Pick> {
@@ -759,20 +915,18 @@ async fn run(
     // Raw mode is confined to the navigation loop; the guard drops (restoring the
     // terminal) before any pairing prompt/logs in `finalize`.
     let picked = match TermGuard::enter() {
-        Ok(_guard) => menu_loop(&adapter, kind, &stale, &mut suspend_rx, &mut cancel).await,
+        Ok(_guard) => menu_loop(&adapter, kind, &stale, &known, &mut suspend_rx, &mut cancel).await,
         Err(_) => None,
     };
     coord.deregister();
     match picked {
-        // A fix targets an already-bonded host and deliberately tears the bond
-        // down, so it skips `finalize`'s pairing entirely.
-        Some((dev, true)) => Some(Pick {
-            addr: dev.address(),
-            fix: true,
-        }),
-        Some((dev, false)) => finalize(&adapter, &dev, &mut cancel)
+        // Only a connect has to pair first; fix and forget act on a host that is
+        // bonded already, so they skip `finalize` entirely.
+        Some(Chosen::Connect(dev)) => finalize(&adapter, &dev, &mut cancel)
             .await
-            .map(|addr| Pick { addr, fix: false }),
+            .map(Pick::Connect),
+        Some(Chosen::Fix(addr)) => Some(Pick::Fix(addr)),
+        Some(Chosen::Forget(addr)) => Some(Pick::Forget(addr)),
         None => None,
     }
 }
@@ -798,11 +952,16 @@ pub struct Session {
 impl Session {
     /// Spawn this cycle's menu. With no adapter or outside interactive mode the
     /// result is inert: nothing is spawned and [`Session::recv`] never resolves.
+    /// `stale` are the bonded hosts whose cached descriptor no longer matches
+    /// (§7.1); `known` is every host blooter has a record for, which the BLE
+    /// list unions with bluetoothd's bonds so nothing can drop out of view.
+    /// Classic builds its list by scanning and ignores `known`.
     pub fn spawn(
         adapter: Option<&Adapter>,
         interactive: bool,
         kind: Kind,
         stale: Vec<Address>,
+        known: Vec<Address>,
         coord: &TermCoord,
     ) -> Self {
         let (Some(adapter), true) = (adapter, interactive) else {
@@ -817,7 +976,7 @@ impl Session {
         let adapter = adapter.clone();
         let coord = coord.clone();
         let task = tokio::spawn(async move {
-            if let Some(pick) = run(adapter, kind, stale, coord, cancel_rx).await {
+            if let Some(pick) = run(adapter, kind, stale, known, coord, cancel_rx).await {
                 let _ = pick_tx.send(pick).await;
             }
         });
@@ -878,11 +1037,17 @@ mod tests {
             connected,
             paired,
             rssi,
+            forgotten_by_bluez: false,
         }
     }
 
     fn state(main: Vec<Row>, other: Vec<Row>) -> MenuState {
+        state_of(Kind::Classic, main, other)
+    }
+
+    fn state_of(kind: Kind, main: Vec<Row>, other: Vec<Row>) -> MenuState {
         MenuState {
+            kind,
             screen: Screen::Main,
             main,
             other,
@@ -1114,5 +1279,97 @@ mod tests {
         let lines = render_lines(&s);
         assert!(lines[1].contains("[paired]"));
         assert!(!lines.last().unwrap().contains("cached an older"));
+    }
+
+    // --- The BLE menu: a bonded-host manager, not a host picker (§6) ------
+
+    fn ble(main: Vec<Row>) -> MenuState {
+        state_of(Kind::Ble, main, vec![])
+    }
+
+    /// Selecting means "connect to this", and a BLE peripheral cannot connect
+    /// to anything. Number keys therefore only move the cursor, and Enter
+    /// closes the menu rather than picking.
+    #[test]
+    fn ble_never_selects_a_host_to_connect_to() {
+        let mut s = ble(vec![
+            row("Laptop", false, true, None),
+            row("TV", false, true, None),
+        ]);
+        assert_eq!(on_key(&mut s, key(KeyCode::Char('2'))), Action::None);
+        assert_eq!(s.selected, 1, "the number key still moves the cursor");
+        assert_eq!(on_key(&mut s, key(KeyCode::Enter)), Action::Skip);
+        // Classic, for contrast, picks with both.
+        let mut s = state(vec![row("Laptop", false, true, None)], vec![]);
+        assert_eq!(on_key(&mut s, key(KeyCode::Char('1'))), Action::Select(0));
+        assert_eq!(on_key(&mut s, key(KeyCode::Enter)), Action::Select(0));
+    }
+
+    /// `[u]` is the only way a bond is ever dropped on BLE, so it must be
+    /// offered there and nowhere else — a failed `[f]` must not do it silently
+    /// (§7.2b).
+    #[test]
+    fn forget_is_offered_on_ble_for_bonded_hosts_only() {
+        let mut s = ble(vec![row("Laptop", false, true, None)]);
+        assert_eq!(on_key(&mut s, key(KeyCode::Char('u'))), Action::Forget(0));
+        assert!(render_lines(&s).last().unwrap().contains("[u] Forget host"));
+        // Not bonded: nothing to forget.
+        let mut s = ble(vec![row("Laptop", false, false, None)]);
+        assert_eq!(on_key(&mut s, key(KeyCode::Char('u'))), Action::None);
+        assert!(!render_lines(&s).last().unwrap().contains("[u]"));
+        // Classic drops the bond as part of `[f]`'s unplug, so it has no `[u]`.
+        let mut s = state(vec![row("Laptop", false, true, None)], vec![]);
+        assert_eq!(on_key(&mut s, key(KeyCode::Char('u'))), Action::None);
+        assert!(!render_lines(&s).last().unwrap().contains("[u]"));
+    }
+
+    /// There is no scan, so there is no "Other devices" list to classify into
+    /// or navigate to.
+    #[test]
+    fn ble_has_no_other_devices_submenu() {
+        let mut s = ble(vec![row("Laptop", false, true, None)]);
+        on_key(&mut s, key(KeyCode::Char('o')));
+        assert_eq!(s.screen, Screen::Main);
+        let footer = render_lines(&s).last().unwrap().clone();
+        assert!(!footer.contains("[o]"), "{footer}");
+        assert!(footer.contains("[r] Refresh"), "{footer}");
+        assert!(footer.contains("[q] Close"), "{footer}");
+    }
+
+    /// The header has to say what the user is meant to do, because on BLE the
+    /// answer is "go to the host" — nothing in this menu will pair for them.
+    #[test]
+    fn ble_header_directs_pairing_to_the_host() {
+        let lines = render_lines(&ble(vec![]));
+        assert!(
+            lines[0].contains("pair new ones from the host"),
+            "{lines:?}"
+        );
+        assert_eq!(lines[1], "  (none yet)");
+    }
+
+    /// A host bluetoothd has dropped the object for still gets a row: it is the
+    /// only place left to act on it, since it can never be rediscovered.
+    #[test]
+    fn ble_marks_hosts_bluez_no_longer_knows() {
+        let mut r = row("00:00:00:00:00:01", false, true, None);
+        r.forgotten_by_bluez = true;
+        let s = ble(vec![r]);
+        let lines = render_lines(&s);
+        assert!(lines[1].contains("unknown to bluetoothd"), "{}", lines[1]);
+    }
+
+    /// The BLE repair keeps the bond and needs a live link, so the advice
+    /// differs from Classic's "re-pair afterwards".
+    #[test]
+    fn ble_stale_advice_asks_for_a_connection_not_a_re_pair() {
+        let mut r = row("Laptop", false, true, None);
+        r.stale = true;
+        let advice = render_lines(&ble(vec![r])).last().unwrap().clone();
+        assert!(
+            advice.contains("connect from it, then press [f]"),
+            "{advice}"
+        );
+        assert!(!advice.contains("re-pair"), "{advice}");
     }
 }

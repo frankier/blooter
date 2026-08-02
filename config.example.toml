@@ -94,12 +94,40 @@
 #pairing = "accept"
 
 # Address of a host to initiate an outgoing connection to on startup
-# (reconnect-initiate; see design/CONNECTION.md §3.2 for Classic, §4 for BLE).
-# Only used if that host is already bonded. When unset, blooter waits for the
-# host to connect (in interactive mode the host menu can pick a target at
-# runtime instead). Once any link is up the target is cleared, so blooter does
-# not fight an intentional disconnect.
+# (reconnect-initiate; see design/CONNECTION.md §3.2). Only used if that host is
+# already bonded. When unset, blooter waits for the host to connect (in
+# interactive mode the host menu can pick a target at runtime instead). Once any
+# link is up the target is cleared, so blooter does not fight an intentional
+# disconnect.
+#
+# Classic only. Over BLE blooter is the peripheral and the host is the central,
+# so only the host can open a link; setting this with protocol = "ble" logs a
+# warning and is ignored. A bonded host reconnects to blooter's advertisement by
+# itself (design/CONNECTION.md §4).
 #reconnect = "AA:BB:CC:DD:EE:FF"
+
+[ble]
+
+# How much of the adapter's identity blooter takes over in BLE mode
+# (design/CONNECTION.md §4.1).
+#
+# The name and appearance in the LE advertisement only reach a host *before* it
+# connects. Once connected the host reads bluetoothd's GAP service, whose Device
+# Name comes from the adapter's alias and whose Appearance is derived from the
+# adapter's Class of Device — so without setting those, a host shows the
+# machine's hostname and its computer icon no matter what blooter advertises.
+#
+# The alias needs no privilege; the Class of Device goes through the Bluetooth
+# management socket and needs CAP_NET_ADMIN. Both are restored on exit.
+#
+#   "auto"            set the alias and, if permitted, the Class of Device;
+#                     carry on quietly without the class if not — the default
+#   "alias"           set the alias only, so hosts show the right name but the
+#                     adapter keeps its existing device icon
+#   "alias_cod"       set both, and refuse to start if the class cannot be set
+#   "alias_cod_hide"  as "alias_cod", plus turn off BR/EDR discoverability so
+#                     only the LE identity is on offer
+#advertise = "auto"
 
 [pointer]
 

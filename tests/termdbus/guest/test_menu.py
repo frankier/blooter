@@ -9,8 +9,8 @@ they are. See design/CONNECTION.md §5 (pairing) and §6 (menu).
 import sys
 
 from harness import (
+    ADAPTER_PATH,
     APPEARANCE_COMPUTER,
-    APPEARANCE_KEYBOARD,
     APPEARANCE_SPEAKER,
     CLASS_COMPUTER,
     CLASS_COMPUTER_AUDIO,
@@ -24,7 +24,6 @@ from harness import (
     assert_screen_lacks,
     menu_rows,
     selected_index,
-    wait_for,
     wait_for_menu,
 )
 
@@ -295,83 +294,132 @@ def test_menu_resumes_after_pairing_prompt(t):
 # --------------------------------------------------------------------------
 # The BLE menu (§4, §6)
 #
-# Same menu, same rendering, driven by the LE transport. The devices here carry
-# no Class of Device -- as an LE-only peer does not -- so the "Other devices"
-# split has to come from GAP Appearance instead.
+# NOT the same menu. blooter is a GAP Peripheral over BLE, so it can neither
+# dial a host nor pair with one, and a host -- being a central -- never
+# advertises, so scanning for one is pointless. The BLE menu is therefore a
+# manager for hosts already bonded: no discovery, no "Other devices" split, no
+# Pair, no Connect. What it offers is `[f]` fix and `[u]` forget.
 # --------------------------------------------------------------------------
 
 @tests.test
-def test_ble_menu_lists_discovered_hosts(t):
-    """The menu opens on BLE too, with the same title, rows and footer."""
-    t.mock.add_device(LAPTOP, "my-laptop", cls=None,
+def test_ble_menu_lists_bonded_hosts_only(t):
+    """Bonded hosts are listed; an unbonded device nearby is not, because the
+    list comes from bonds rather than from a scan."""
+    t.mock.add_device(LAPTOP, "my-laptop", cls=None, paired=True,
+                      appearance=APPEARANCE_COMPUTER)
+    t.mock.add_device(DESKTOP, "some-pc", cls=None, paired=False,
                       appearance=APPEARANCE_COMPUTER)
     term = t.menu(protocol="ble")
 
-    assert_screen_contains(term, "Bluetooth hosts:", "menu title")
-    assert_screen_contains(term, LAPTOP, "the device address")
-    assert_screen_contains(term, "my-laptop", "the device alias")
-    assert_screen_contains(term, "[q] Skip", "the footer")
+    assert_screen_contains(term, LAPTOP, "the bonded host's address")
+    assert_screen_contains(term, "my-laptop", "the bonded host's alias")
+    assert_screen_lacks(term, "some-pc", "an unbonded device")
+    assert_menu_contains(term, "[q] Close", "the footer")
 
 
 @tests.test
-def test_ble_appearance_moves_peripherals_to_other_devices(t):
-    """With no Class of Device to go on, a keyboard (Appearance category 0x0F)
-    and a speaker (0x21) are filed under 'Other devices' by Appearance."""
-    t.mock.add_device(LAPTOP, "my-laptop", cls=None,
+def test_ble_menu_does_not_scan(t):
+    """Scanning cannot find a host (a central does not advertise), so the BLE
+    menu must not start discovery at all -- and must not make the user wait for
+    a scan that could never help."""
+    t.mock.add_device(LAPTOP, "my-laptop", cls=None, paired=True,
                       appearance=APPEARANCE_COMPUTER)
-    t.mock.add_device(HEADSET, "my-speaker", cls=None,
+    # The mock records calls for the life of the dbusmock process, so earlier
+    # tests' scans are in there too; only what this blooter does counts.
+    before = len(t.mock.calls(ADAPTER_PATH))
+    term = t.menu(protocol="ble")
+    term.wait_for_idle()
+
+    calls = t.mock.calls(ADAPTER_PATH)[before:]
+    assert "StartDiscovery" not in calls, \
+        f"the BLE menu started a discovery scan: {calls}"
+    assert_screen_lacks(term, "Scanning for Bluetooth devices",
+                        "a scanning message")
+
+
+@tests.test
+def test_ble_menu_has_no_other_devices_submenu(t):
+    """With no scan there is nothing to classify, so the Appearance-driven
+    'Other devices' split does not apply on BLE."""
+    t.mock.add_device(LAPTOP, "my-laptop", cls=None, paired=True,
+                      appearance=APPEARANCE_COMPUTER)
+    t.mock.add_device(HEADSET, "my-speaker", cls=None, paired=True,
                       appearance=APPEARANCE_SPEAKER)
-    t.mock.add_device(DESKTOP, "some-keyboard", cls=None,
-                      appearance=APPEARANCE_KEYBOARD)
     term = t.menu(protocol="ble")
 
-    assert_screen_contains(term, "my-laptop", "the laptop in the main list")
-    assert_screen_lacks(term, "my-speaker", "the speaker in the main list")
-    assert_screen_lacks(term, "some-keyboard", "the keyboard in the main list")
-    assert_menu_contains(term, "[o] Other devices (2)", "the submenu offer")
+    assert_screen_lacks(term, "[o] Other devices", "the submenu offer")
+    # A bonded headset is a host blooter is bonded to like any other: it is
+    # listed, not hidden behind a submenu that no longer exists.
+    assert_screen_contains(term, "my-speaker", "the bonded speaker")
 
 
 @tests.test
-def test_ble_offers_fix_for_a_bonded_host(t):
-    """A BLE host caches blooter's GATT database — the Report Map with it —
-    across its bond, and `[f] Fix connection` invalidates that with a Service
-    Changed indication, so it is offered here too (design/CONNECTION.md §7)."""
+def test_ble_never_pairs_or_connects(t):
+    """Pairing and connecting are the host's to initiate over BLE. Pressing
+    Enter on a host must reach neither Pair nor Connect (§4)."""
+    path = t.mock.add_device(LAPTOP, "my-laptop", cls=None, paired=True,
+                             appearance=APPEARANCE_COMPUTER)
+    term = t.menu(protocol="ble")
+
+    term.press("Enter")
+    term.wait_for_text("ready to accept connections")
+    term.wait_for_idle()
+
+    calls = t.mock.calls(path)
+    assert "Pair" not in calls, f"the BLE menu paired from this side: {calls}"
+    assert "Connect" not in calls, f"the BLE menu dialled the host: {calls}"
+
+
+@tests.test
+def test_ble_offers_fix_and_forget_for_a_bonded_host(t):
+    """A BLE host caches blooter's GATT database -- the Report Map with it --
+    across its bond. `[f]` invalidates that with a Service Changed indication;
+    `[u]` drops the bond, and is the only thing that ever does
+    (design/CONNECTION.md §7.2b)."""
     t.mock.add_device(LAPTOP, "my-laptop", cls=None, paired=True,
                       appearance=APPEARANCE_COMPUTER)
     term = t.menu(protocol="ble")
 
     assert_screen_contains(term, "[paired", "the paired status marker")
-    assert_screen_contains(term, "[f] Fix connection", "the fix action")
+    assert_menu_contains(term, "[f] Fix connection", "the fix action")
+    assert_menu_contains(term, "[u] Forget host", "the forget action")
 
 
 @tests.test
-def test_ble_pick_pairs_then_connects(t):
-    """Selecting an unbonded host bonds it from here and then initiates the
-    outgoing LE connection (design/CONNECTION.md §4, §6)."""
-    path = t.mock.add_device(LAPTOP, "my-laptop", cls=None, paired=False,
+def test_ble_fix_on_a_disconnected_host_keeps_the_bond(t):
+    """A Service Changed indication only reaches a connected client, and blooter
+    cannot bring that link up itself. So `[f]` on a host that is away explains
+    what to do -- it must not silently drop the bond, which used to make the
+    host vanish from this list for good (§7.2b)."""
+    path = t.mock.add_device(LAPTOP, "my-laptop", cls=None, paired=True,
                              appearance=APPEARANCE_COMPUTER)
+    before_adapter = len(t.mock.calls(ADAPTER_PATH))
+    before_device = len(t.mock.calls(path))
     term = t.menu(protocol="ble")
 
-    term.press("Enter")
-    term.wait_for_text("Pairing with my-laptop")
-    wait_for(lambda: "Connect" in t.mock.calls(path), 15.0,
-             "blooter to pair and then connect to the picked host")
+    # `type` rather than `press`: termwright reads "f" as a function-key name.
+    term.type("f")
+    term.wait_for_text("is not connected")
+    term.wait_for_idle()
 
-    calls = t.mock.calls(path)
-    assert calls.index("Pair") < calls.index("Connect"), \
-        f"expected Pair before Connect, got {calls}"
+    calls = t.mock.calls(ADAPTER_PATH)[before_adapter:]
+    assert "RemoveDevice" not in calls, \
+        f"a failed fix removed the bond: {calls}"
+    assert "Connect" not in t.mock.calls(path)[before_device:], \
+        "a fix tried to dial the host, which a peripheral cannot do"
 
 
 @tests.test
 def test_ble_skip_closes_the_menu(t):
-    """`[q]` skips, leaving blooter advertising and waiting to be subscribed."""
-    t.mock.add_device(LAPTOP, "my-laptop", cls=None,
+    """`[q]` closes it, leaving blooter advertising and waiting to be
+    subscribed."""
+    t.mock.add_device(LAPTOP, "my-laptop", cls=None, paired=True,
                       appearance=APPEARANCE_COMPUTER)
     term = t.menu(protocol="ble")
 
     term.press("q")
     term.wait_for_text("ready to accept connections")
-    assert term.running(), "blooter exited when the BLE menu was skipped"
+    assert term.running(), "blooter exited when the BLE menu was closed"
 
 
 def main():

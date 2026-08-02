@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until, timeout_at};
 
 use super::{Accept, DIAL_BACKOFF_MAX, DIAL_BACKOFF_START, Flow, Outbox, Step, Transport, step};
+use crate::menu::Pick;
 use crate::report::{InputState, RawEvent};
 use crate::{AppError, Ctx, Signals};
 
@@ -239,6 +240,9 @@ impl Transport for Classic {
             self.interactive,
             crate::menu::Kind::Classic,
             stale,
+            // Classic builds its list by scanning, so it needs no remembered
+            // hosts (that union is the BLE menu's, §6).
+            Vec::new(),
             &self.term_coord,
         );
 
@@ -294,17 +298,22 @@ impl Transport for Classic {
                     match picked {
                         // A fix tears the bond down rather than connecting, so it
                         // must not become a dial target (§7).
-                        Some(p) if p.fix => {
-                            info!("menu selected {}; fixing connection", p.addr);
-                            fix = Some(p.addr);
+                        Some(Pick::Fix(addr)) => {
+                            info!("menu selected {addr}; fixing connection");
+                            fix = Some(addr);
                             target = None;
                             next_dial = None;
                         }
-                        Some(p) => {
-                            info!("menu selected {}; initiating HID connection", p.addr);
-                            target = Some(p.addr);
+                        Some(Pick::Connect(addr)) => {
+                            info!("menu selected {addr}; initiating HID connection");
+                            target = Some(addr);
                             next_dial = Some(Instant::now());
                             backoff = DIAL_BACKOFF_START;
+                        }
+                        // `[u]` is a BLE-only repair: on Classic the unplug in
+                        // `fix_host` already drops the bond on both sides (§7.2a).
+                        Some(Pick::Forget(addr)) => {
+                            warn!("ignoring a forget pick for {addr}: Classic has no [u]");
                         }
                         None => {}
                     }

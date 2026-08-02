@@ -220,7 +220,7 @@ async fn run(args: cli::Args) -> Result<(), AppError> {
     // menu is running (LE, non-interactive, or after the menu resolves).
     let term_coord = menu::TermCoord::default();
     let _agent = session
-        .register_agent(agent::agent(pairing_mode, term_coord.clone()))
+        .register_agent(agent::agent(pairing_mode, cfg.protocol, term_coord.clone()))
         .await
         .map_err(|e| AppError::new(1, format!("cannot register pairing agent: {e}")))?;
 
@@ -235,6 +235,9 @@ async fn run(args: cli::Args) -> Result<(), AppError> {
     // If we turn the adapter discoverable, remember it so shutdown can restore
     // the previous state (design/CONNECTION.md §6).
     let mut discoverable_reset: Option<bluer::Adapter> = None;
+    // The adapter identity we took over (alias, and on BLE the Class of Device
+    // and BR/EDR discoverability), restored on exit (design/CONNECTION.md §4.1).
+    let mut identity_reset: Option<setup::Identity> = None;
     let transport = match cfg.protocol {
         config::Protocol::Classic => {
             profile_task = register_profile(&session, &args, layout).await?;
@@ -249,21 +252,19 @@ async fn run(args: cli::Args) -> Result<(), AppError> {
                     }
                 }
             };
-            _bt = adapter.as_ref().and_then(|a| {
-                let index = a
-                    .name()
-                    .strip_prefix("hci")
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or(0);
-                match setup::apply(index) {
+            _bt = adapter
+                .as_ref()
+                .and_then(|a| match setup::apply(setup::adapter_index(a)) {
                     Ok(s) => Some(s),
                     Err(e) => {
                         warn!("adapter setup failed: {e} (needs CAP_NET_ADMIN; -n disables)");
                         None
                     }
-                }
-            });
+                });
             if let Some(a) = &adapter {
+                // The mgmt local name above is not the adapter alias, and it is
+                // the alias BlueZ reports as the device name (§4.1).
+                identity_reset = Some(setup::take_alias(a).await);
                 let _ = a.set_powered(true).await;
                 let _ = a.set_pairable(true).await;
                 // Advertise ourselves so a host can find and connect to us. Save
@@ -303,16 +304,30 @@ async fn run(args: cli::Args) -> Result<(), AppError> {
                 .await
                 .map_err(|e| AppError::new(1, format!("no default adapter for LE: {e}")))?;
             let _ = adapter.set_pairable(true).await;
-            // As on Classic, keep a configured reconnect target only if it is
-            // already bonded; the menu supplies one at runtime otherwise
-            // (design/CONNECTION.md §4, §6). The adapter is needed for the GATT
-            // server either way, so `-n` gates only the menu here.
-            let target = initiate_target(Some(&adapter), configured_target).await;
+            // Take over the adapter identity as far as `[ble] advertise` allows.
+            // Without this a connected host reads bluetoothd's GAP service and
+            // sees the machine's hostname and its computer icon, whatever the LE
+            // advertisement says (design/CONNECTION.md §4.1).
+            let (bt, identity) = setup::apply_ble_identity(&adapter, cfg.advertise)
+                .await
+                .map_err(|e| AppError::new(1, e))?;
+            _bt = bt;
+            identity_reset = Some(identity);
+            // Nothing to resolve: BLE never initiates. blooter is the GAP
+            // Peripheral, so the host is the only side that can open the link,
+            // and the advertisement is what invites a bonded one back
+            // (design/CONNECTION.md §4). The adapter is needed for the GATT
+            // server regardless, so `-n` gates only the menu here.
+            if configured_target.is_some() {
+                warn!(
+                    "[connection] reconnect is ignored on BLE: a peripheral cannot dial a \
+                     host. Pair from the host, and it will reconnect by itself."
+                );
+            }
             AnyTransport::Le(
                 Le::new(
                     adapter,
                     layout,
-                    target,
                     interactive && !args.nosetup,
                     hosts.clone(),
                     term_coord.clone(),
@@ -335,9 +350,13 @@ async fn run(args: cli::Args) -> Result<(), AppError> {
     // close, so libinput resumes from a clean state.
     drop(capture_tx);
     inputs.shutdown().await;
-    // Restore the adapter's prior discoverable state if we changed it (§6).
+    // Restore the adapter's prior discoverable state if we changed it (§6), and
+    // the identity we took over — alias, class, discoverability (§4.1).
     if let Some(a) = &discoverable_reset {
         let _ = a.set_discoverable(false).await;
+    }
+    if let Some(identity) = identity_reset {
+        identity.restore().await;
     }
     flush_stdin();
     println!("blooter stopped.");

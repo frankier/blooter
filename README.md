@@ -20,9 +20,16 @@ The binary is `target/release/blooter`.
 - **Read access to the `/dev/input/event*` devices** you want to forward
   (typically root or membership in the `input` group).
 - blooter registers a pairing agent and sets the adapter pairable (unless `-n`).
-  The interactive host menu runs alongside accepting connections: pick a host to
-  connect out to it, or just connect in from the other machine and the menu steps
-  aside.
+  How you connect depends on the transport:
+  - On **BLE** (the default), pair and connect **from the host**, in its ordinary
+    Bluetooth settings — blooter is a peripheral, so it cannot call the host or
+    start pairing. With the default `[connection] pairing = "accept"` this is
+    fully non-interactive ("Just Works"): nothing to confirm on either side, and
+    no desktop Bluetooth agent needed on the blooter machine. The interactive
+    menu runs alongside and manages hosts you have already paired.
+  - On **Classic**, the interactive host menu runs alongside accepting
+    connections: pick a host to connect out to it, or just connect in from the
+    other machine and the menu steps aside.
 
 The **Classic** transport (`[connection] protocol = "classic"`) has two extra
 requirements, which the default BLE transport does not:
@@ -39,10 +46,16 @@ requirements, which the default BLE transport does not:
 
   or simply run as root.
 
-For best host compatibility Classic also advertises a keyboard-like device class
-on the adapter (e.g. `0x000540`), set during adapter setup along with making the
-adapter discoverable (restored on exit). BLE advertises the equivalent Keyboard
-*Appearance* in its LE advertisement instead, so it needs neither.
+For best host compatibility blooter presents itself as a keyboard: adapter alias
+`blooter` and a keyboard-like device class (`0x000540`), plus — on Classic —
+making the adapter discoverable. All of it is restored on exit. BLE advertises
+the equivalent Keyboard *Appearance* in its LE advertisement as well, but that
+only reaches a host before it connects: once connected the host reads the alias
+and device class instead, which is why they are set on both transports.
+
+Setting the device class needs `CAP_NET_ADMIN`; without it blooter still fixes
+the name and carries on. `[ble] advertise` controls how much of this it does, and
+whether a missing class is an error.
 
 ## Usage
 
@@ -261,11 +274,15 @@ On **Classic**:
 
 Pointer input is relative motion (mouse/trackpoint, and touchpads mapped to
 relative motion); the keyboard covers the standard Boot usage range. There is no
-keyboard-LED output handling. On either transport blooter can also **initiate**
-the connection to an already-bonded host when a target is set via the host menu
-or `[connection] reconnect`; otherwise it only accepts. Pairing is handled by a
-built-in agent (`[connection] pairing`). See
-[design/CONNECTION.md](design/CONNECTION.md).
+keyboard-LED output handling.
+
+On **Classic** blooter can also **initiate** the connection to an already-bonded
+host when a target is set via the host menu or `[connection] reconnect`. On
+**BLE** it never does: HID-over-GATT makes blooter the peripheral and the host
+the central, so only the host can open a link or begin pairing, and blooter's
+advertisement is what invites a bonded host back. `[connection] reconnect` is
+ignored there. Pairing is handled by a built-in agent
+(`[connection] pairing`). See [design/CONNECTION.md](design/CONNECTION.md).
 
 ### Fixing a host that ignores a layout change
 
@@ -276,19 +293,21 @@ cached, and the new controller (or remote) silently never shows up. blooter warn
 marks them `stale` in the connection menu; select one and press **`[f]`** to fix
 it.
 
-What that does depends on the transport. On **BLE** it connects to the host and
-changes blooter's GATT database under it, which makes bluetoothd tell the host
-its cached copy is stale (a Service Changed indication); the host re-reads the
-layout by itself, with no re-pairing. Many hosts pick the change up on their own
-at the next connection, without `[f]`. On **Classic** it tells the host to forget
-blooter (an HID virtual-cable unplug) and drops the bond on both sides, so
-re-pairing from that host picks up the current layout.
+What that does depends on the transport. On **BLE** it changes blooter's GATT
+database under the connected host, which makes bluetoothd tell it its cached copy
+is stale (a Service Changed indication); the host re-reads the layout by itself,
+with no re-pairing. Many hosts pick the change up on their own at the next
+connection, without `[f]`. Because the indication only reaches a host that is
+connected — and blooter cannot call it — `[f]` on a host that is away just says
+so, and leaves the bond alone. On **Classic** it tells the host to forget blooter
+(an HID virtual-cable unplug) and drops the bond on both sides, so re-pairing
+from that host picks up the current layout.
 
-Either way, a host that cannot be reached (or that ignores the notification) has
-to be repaired by hand: remove blooter from its Bluetooth settings and pair
-again. Setting a fixed `[gamepad] slots = N` avoids the gamepad case entirely,
-and settling `[remote]` and `[pointer] axis_bits` before pairing widely avoids
-the rest. See [design/CONNECTION.md](design/CONNECTION.md) §7.
+A host that ignores all of that has to be repaired by hand: on BLE press **`[u]`**
+to drop blooter's bond, then remove blooter from the host's Bluetooth settings
+and pair again. Setting a fixed `[gamepad] slots = N` avoids the gamepad case
+entirely, and settling `[remote]` and `[pointer] axis_bits` before pairing widely
+avoids the rest. See [design/CONNECTION.md](design/CONNECTION.md) §7.
 
 ## Exit codes
 

@@ -4,11 +4,15 @@
 //! See design/ARCH.md §4.2, §7.
 //!
 //! A host is "connected" once it subscribes to a Report characteristic's CCCD.
-//! While waiting for that, the interactive menu is up and can pick a host to
-//! bond with and connect out to, exactly as on Classic (design/CONNECTION.md §4, §6).
+//!
+//! Unlike Classic, this transport is **purely an acceptor**. HOGP puts the HID
+//! device in the GAP Peripheral role and the host in the Central role, so the
+//! host is the only side that can open a link or start pairing; advertising
+//! connectably *is* blooter's half of reconnecting. While waiting, the
+//! interactive menu is up as a manager for hosts already bonded — not as a
+//! picker (design/CONNECTION.md §4, §6).
 
 use std::collections::HashMap;
-use std::future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -23,14 +27,15 @@ use bluer::{Adapter, Address, Uuid, UuidExt};
 use futures::FutureExt;
 use log::{info, warn};
 use tokio::sync::{Mutex, mpsc, watch};
-use tokio::time::{Instant, sleep, sleep_until};
+use tokio::time::sleep;
 
 /// Build a Bluetooth SIG 16-bit UUID as a full 128-bit [`Uuid`].
 fn uuid16(v: u16) -> Uuid {
     <Uuid as UuidExt>::from_u16(v)
 }
 
-use super::{Accept, DIAL_BACKOFF_MAX, DIAL_BACKOFF_START, Flow, Outbox, Step, Transport, step};
+use super::{Accept, Flow, Outbox, Step, Transport, step};
+use crate::menu::Pick;
 use crate::report::{InputState, RawEvent};
 use crate::sdp::{self, GAMEPAD_REPORT_ID_BASE};
 use crate::{AppError, Ctx, Signals};
@@ -118,15 +123,11 @@ impl Shared {
 
 /// The LE transport. Holds the registered GATT application and advertisement
 /// (dropping the handles unregisters them) plus the shared notification state.
-/// Optionally holds a host to connect out to (design/CONNECTION.md §4), which
-/// the interactive menu can also supply at runtime (§6).
+/// There is no outgoing-connection target: see [`Le::wait_connected`].
 pub struct Le {
     adapter: Adapter,
     shared: Arc<Shared>,
     connected_rx: watch::Receiver<bool>,
-    /// A bonded host to initiate an outgoing LE connection to; cleared once a
-    /// host subscribes, so a later disconnect does not immediately reconnect.
-    target: Option<Address>,
     /// Whether to run the interactive menu, (re)spawned each `wait_connected`
     /// cycle so it re-opens after a disconnect (§6).
     interactive: bool,
@@ -145,12 +146,10 @@ impl Le {
     /// Power the adapter, register the HOGP GATT tree and an LE advertisement of
     /// the HID service. The pairing agent (needed for the bonded link HOGP
     /// requires) is the shared one registered by `main::run` (design/CONNECTION.md
-    /// §5). `target` seeds the outgoing-connect path (§4); `interactive` enables
-    /// the menu, respawned each accept cycle (§6).
+    /// §5); `interactive` enables the menu, respawned each accept cycle (§6).
     pub async fn new(
         adapter: Adapter,
         layout: sdp::Layout,
-        target: Option<Address>,
         interactive: bool,
         hosts: Arc<std::sync::Mutex<crate::state::Hosts>>,
         term_coord: crate::menu::TermCoord,
@@ -202,7 +201,6 @@ impl Le {
             adapter,
             shared,
             connected_rx,
-            target,
             interactive,
             term_coord,
             hosts,
@@ -210,14 +208,6 @@ impl Le {
             _app,
             _adv,
         })
-    }
-
-    /// Initiate an outgoing LE connection to a host picked from the menu (or
-    /// configured). GATT server/client roles are independent of the link role,
-    /// so blooter still serves its HOGP tree to a host it dialled itself; the
-    /// session only starts once that host subscribes (design/CONNECTION.md §4).
-    async fn connect(&self, target: Address) -> bluer::Result<()> {
-        self.adapter.device(target)?.connect().await
     }
 
     /// Best-effort address of a connected host. `None` when bluetoothd lists no
@@ -246,14 +236,23 @@ impl Le {
         Accept::Connected(peer.map_or_else(|| "BLE host".to_string(), |a| a.to_string()))
     }
 
-    /// Drop our own bond to `addr` and forget its recorded fingerprint, for the
-    /// case where the host cannot be told to re-read the database.
-    async fn unbond(&self, addr: Address) {
+    /// Drop our own bond to `addr` and forget its recorded fingerprint.
+    ///
+    /// Only ever reached from the menu's explicit `[u]`. It used to be the
+    /// fallback when `[f]` could not reach a host, which was the wrong trade:
+    /// `remove_device` destroys the D-Bus object, and a host — being a central
+    /// that never advertises — can never be rediscovered, so a transient failure
+    /// removed it from the only UI that could act on it, permanently (§7.2b).
+    async fn forget_host(&mut self, addr: Address) {
         self.hosts.lock().unwrap().forget(addr);
         match self.adapter.remove_device(addr).await {
             Ok(()) => info!("removed our bond to {addr}"),
             Err(e) => warn!("could not remove our bond to {addr}: {e}"),
         }
+        println!(
+            "Dropped the bond to {addr}. Remove blooter from that host's Bluetooth \
+             settings too, then pair again from there to reconnect."
+        );
     }
 
     /// Register and then unregister a throwaway service, so bluetoothd's local
@@ -276,23 +275,31 @@ impl Le {
         Ok(())
     }
 
+    /// Whether `addr` currently has a link up, which is the precondition for
+    /// fixing it: a Service Changed indication has no queue for a client that is
+    /// away.
+    async fn is_connected(&self, addr: Address) -> bool {
+        match self.adapter.device(addr) {
+            Ok(dev) => dev.is_connected().await.unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
     /// "Fix connection" on BLE (design/CONNECTION.md §7.2b): make `addr` drop the
     /// GATT database it cached under its bond — the Report Map with it — so it
     /// re-reads the current HID layout.
     ///
-    /// Service Changed only reaches a *connected* client, so this connects out
-    /// first and then changes the database under it. A host that cannot be
-    /// reached falls back to the Classic-style repair: drop our bond and re-pair
-    /// from the host by hand.
+    /// Service Changed only reaches a *connected* client, and blooter cannot
+    /// bring that link up itself (§4), so an absent host is told to connect and
+    /// try again rather than being unbonded behind the user's back.
     async fn fix_host(&mut self, addr: Address) {
-        if let Err(e) = self.connect(addr).await {
-            warn!("could not reach {addr} to fix it: {e}");
-            self.unbond(addr).await;
-            self.target = None;
+        if !self.is_connected(addr).await {
             println!(
-                "Could not reach {addr}, so the bond here has been removed instead.\n\
-                 Remove blooter from that host's Bluetooth settings and pair again to \
-                 pick up the current device layout."
+                "{addr} is not connected, and as a Bluetooth LE peripheral blooter \
+                 cannot call it — the host has to connect.\n\
+                 Connect from {addr}, then press [f] again. Many hosts pick the change \
+                 up by themselves on the next connection; if yours does not, and [f] \
+                 does not help either, use [u] to drop the bond and pair again."
             );
             return;
         }
@@ -302,8 +309,8 @@ impl Le {
                 println!(
                     "Told {addr} its cached copy of blooter's GATT database is stale.\n\
                      It should re-read the HID layout by itself; if the new layout still \
-                     does not show up, remove blooter from that host's Bluetooth settings \
-                     and pair again."
+                     does not show up, use [u] to drop the bond, remove blooter from that \
+                     host's Bluetooth settings, and pair again."
                 );
             }
             Err(e) => warn!("could not change the GATT database to fix {addr}: {e}"),
@@ -311,12 +318,12 @@ impl Le {
     }
 }
 
-/// How a `wait_connected` cycle ended. A fix needs `&mut self`, which the
-/// concurrent connect future borrows, so it is performed once the select's
-/// borrows are gone.
+/// How a `wait_connected` cycle ended. Fixing and forgetting need `&mut self`,
+/// so they are performed once the select's borrows are gone.
 enum Done {
     Accept(Accept),
     Fix(Address),
+    Forget(Address),
 }
 
 impl Transport for Le {
@@ -352,9 +359,13 @@ impl Transport for Le {
         std::time::Duration::from_millis(15)
     }
 
-    /// Wait for a host to subscribe to a Report characteristic's CCCD. While
-    /// waiting, run the interactive menu and — if it (or the config) supplies a
-    /// target — race a backoff-gated outgoing connect against that subscribe
+    /// Wait for a host to subscribe to a Report characteristic's CCCD.
+    ///
+    /// There is nothing to race it against. blooter is the GAP Peripheral, so
+    /// the host is the only side that can open the link; the advertisement
+    /// registered in [`Le::new`] is the whole of blooter's contribution, and a
+    /// bonded host reconnects to it on its own. What runs alongside is the menu,
+    /// which manages bonded hosts rather than picking one to dial
     /// (design/CONNECTION.md §4, §6).
     async fn wait_connected(
         &mut self,
@@ -367,40 +378,26 @@ impl Transport for Le {
             return self.connected().await;
         }
 
-        // Connect and menu state live in locals so the select arm bodies can
-        // mutate them without conflicting with the shared `this` borrow the
-        // concurrent connect future takes — including the watch receiver, which
-        // is cloned rather than borrowed from `self` for the same reason.
+        // The watch receiver is cloned rather than borrowed from `self`, so the
+        // select's arms do not hold a borrow across the loop.
         let mut connected = self.connected_rx.clone();
-        let mut target = self.target;
-        let mut fix: Option<Address> = None;
-        let mut next_connect = target.map(|_| Instant::now());
-        let mut backoff = DIAL_BACKOFF_START;
         // Hosts bonded under a different descriptor are flagged in the list and
-        // fixable with `[f]` (§7).
-        let stale = self.hosts.lock().unwrap().stale(self.descriptor_fp);
+        // fixable with `[f]` (§7); `known` keeps a host in the list even after
+        // bluetoothd drops its device object (§6).
+        let (stale, known) = {
+            let hosts = self.hosts.lock().unwrap();
+            (hosts.stale(self.descriptor_fp), hosts.addresses())
+        };
         let mut menu = crate::menu::Session::spawn(
             Some(&self.adapter),
             self.interactive,
             crate::menu::Kind::Ble,
             stale,
+            known,
             &self.term_coord,
         );
 
         let done = loop {
-            let this: &Le = self;
-            let due = next_connect;
-            let connect_target = target;
-            let connect = async {
-                match (due, connect_target) {
-                    (Some(at), Some(t)) => {
-                        sleep_until(at).await;
-                        Some(this.connect(t).await)
-                    }
-                    _ => future::pending().await,
-                }
-            };
-
             tokio::select! {
                 r = connected.changed() => {
                     if r.is_err() {
@@ -413,43 +410,23 @@ impl Transport for Le {
                         break Done::Accept(self.connected().await);
                     }
                 }
-                // Outgoing connect. Success is not a session: the host still has
-                // to subscribe, so stop connecting and keep waiting above.
-                Some(outcome) = connect => match outcome {
-                    Ok(()) => {
-                        info!("connected out to {}; waiting for it to subscribe",
-                              target.expect("connected with a target"));
-                        next_connect = None;
-                    }
-                    Err(e) => {
-                        warn!("connect to host failed: {e}");
-                        next_connect = Some(Instant::now() + backoff);
-                        backoff = (backoff * 2).min(DIAL_BACKOFF_MAX);
-                    }
-                },
-                // Menu pick: start connecting to the chosen host.
+                // Menu action. Both need `&mut self`, so leave the loop and
+                // perform them once the menu task has been joined.
                 picked = menu.recv() => {
                     match picked {
-                        // A fix connects out on its own terms and must not leave
-                        // a redial target behind (§7).
-                        Some(p) if p.fix => {
-                            info!("menu selected {}; fixing connection", p.addr);
-                            fix = Some(p.addr);
-                            target = None;
-                            next_connect = None;
+                        Some(Pick::Fix(addr)) => {
+                            info!("menu selected {addr}; fixing connection");
+                            break Done::Fix(addr);
                         }
-                        Some(p) => {
-                            info!("menu selected {}; connecting to it", p.addr);
-                            target = Some(p.addr);
-                            next_connect = Some(Instant::now());
-                            backoff = DIAL_BACKOFF_START;
+                        Some(Pick::Forget(addr)) => {
+                            info!("menu selected {addr}; dropping our bond to it");
+                            break Done::Forget(addr);
+                        }
+                        // The BLE menu never offers a host to connect out to.
+                        Some(Pick::Connect(addr)) => {
+                            warn!("ignoring a connect pick for {addr}: BLE cannot initiate");
                         }
                         None => {}
-                    }
-                    // A fix needs `&mut self`, which the connect future borrows;
-                    // leave the loop and perform it after that future is gone.
-                    if let Some(addr) = fix {
-                        break Done::Fix(addr);
                     }
                 }
                 Some(ev) = rx.recv() => {
@@ -468,21 +445,18 @@ impl Transport for Le {
         // returning — ordered ahead of any further output (§6).
         menu.finish().await;
 
+        // Perform the menu's action now the menu task is joined and nothing
+        // borrows `self` any more, then go back to waiting (the menu re-opens).
         match done {
-            // Perform the fix now the menu task is joined and the connect future
-            // no longer borrows `self`, then go back to waiting.
             Done::Fix(addr) => {
                 self.fix_host(addr).await;
                 Box::pin(self.wait_connected(rx, state, ctx, signals)).await
             }
-            Done::Accept(accept) => {
-                // A link is up: stop initiating so a later drop does not
-                // immediately reconnect (§4), matching the Classic one-shot target.
-                if matches!(accept, Accept::Connected(_)) {
-                    self.target = None;
-                }
-                accept
+            Done::Forget(addr) => {
+                self.forget_host(addr).await;
+                Box::pin(self.wait_connected(rx, state, ctx, signals)).await
             }
+            Done::Accept(accept) => accept,
         }
     }
 

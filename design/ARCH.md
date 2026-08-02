@@ -344,8 +344,16 @@ cannot register them, only change the database they describe.
   classic transport sets as its Class of Device, and it stays `0x03C1` with the
   TV remote enabled too, since hosts key HID handling off the report map rather
   than the appearance (REMOTE.md §9) — and discoverable/connectable.
-  This replaces the Class-of-Device and adapter-name logic of `setup.rs`, which
-  is not run in LE mode.
+  This does **not** replace the Class-of-Device and adapter-name logic of
+  `setup.rs`, which therefore runs in LE mode too. The advertisement only
+  reaches a host *before* it connects; once connected the host reads bluetoothd's
+  GAP service, whose Device Name is the adapter alias and whose Appearance is
+  derived from the adapter's Class of Device. Leaving those alone makes a host
+  show the machine's hostname and its computer icon. `[ble] advertise` decides
+  how far blooter takes them over (CONNECTION.md §4.1). BlueZ's derivation is
+  lossy — class `0x000540` reads back as appearance `0x0540`, not `0x03C1`, and
+  there is no D-Bus way to set GAP Appearance directly — so the advertisement
+  stays the only place the correct value appears.
 - **Pairing / bonding:** HOGP requires an encrypted, bonded link before reports
   flow. The shared BlueZ pairing agent (§10.2, CONNECTION.md §5) — registered as
   the default agent, with the adapter set pairable — lets a first-time host bond
@@ -361,10 +369,13 @@ cannot register them, only change the database they describe.
   reports so the host has state; `send_report` no-ops for any report the host has
   not subscribed to. The session ends when the last subscription is dropped
   (unsubscribe or link loss).
-- **Initiating a connection:** when a target is set (host menu or `[connection]
-  reconnect`), `wait_connected` races a backoff-gated `Device.Connect()` against
-  the subscribe. A successful connect is not yet a session — the host still has
-  to subscribe (CONNECTION.md §4, §6).
+- **Initiating a connection: blooter does not, and cannot.** HOGP puts the HID
+  device in the GAP Peripheral role, so only the host can open the link or start
+  pairing; a connectable advertisement is blooter's whole half of reconnecting.
+  `Device.Connect()` would also take the BR/EDR bearer on any dual-mode host,
+  which is where `br-connection-unknown` came from. `[connection] reconnect` is
+  Classic-only, and the LE menu manages bonded hosts rather than picking one to
+  dial (CONNECTION.md §4, §6).
 - **Out of scope (as for classic, TODO.md):** output reports (keyboard LEDs) and
   boot-protocol mode; more than one bonded host at a time; and advertising
   Classic and LE simultaneously as one logical device (the transport is chosen

@@ -626,7 +626,11 @@ def wait_for_menu(term, title, timeout=10.0):
             f"\n--- screen ---\n{term.screen()}") from None
 
 
-MENU_TITLES = ("Bluetooth hosts:", "Other devices:")
+# The Classic menu's two screens, plus the BLE menu's single one. BLE is a
+# bonded-host manager rather than a host picker, so its title says so
+# (design/CONNECTION.md §6).
+BLE_MENU_TITLE = "Paired hosts (pair new ones from the host's Bluetooth settings):"
+MENU_TITLES = ("Bluetooth hosts:", "Other devices:", BLE_MENU_TITLE)
 
 
 def last_menu_block(screen):
@@ -742,7 +746,8 @@ class TestContext:
         """Start blooter and wait for the host menu to be on screen."""
         blooter = self.start_blooter(extra_args, protocol=protocol,
                                      pairing=pairing)
-        blooter.term.wait_for_text("Bluetooth hosts:")
+        title = BLE_MENU_TITLE if protocol == "ble" else "Bluetooth hosts:"
+        blooter.term.wait_for_text(title)
         blooter.term.wait_for_idle()
         return blooter.term
 
