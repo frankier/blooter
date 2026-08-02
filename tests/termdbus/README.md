@@ -48,8 +48,9 @@ harness starts **no btvirt and no bluetoothd** — the mock is the whole stack.
 
 - **Listing** — address, alias, and the `[unpaired]`/`[paired]` markers.
 - **The "Other devices" split** (§6) — audio-class devices and devices with no
-  `Name` property are filed out of the main host list, while TVs, audio-capable
-  computers and anything already paired stay in it.
+  `Name` property are filed out of the main host list, while TVs (including one
+  claiming an odd minor class), audio-capable computers and anything already
+  paired stay in it.
 - **Navigation** — arrow keys move the cursor and clamp at both ends; `[o]`/`[b]`
   enter and leave the submenu; `[r]` rescans; `[q]` skips.
 - **The pairing prompt and terminal hand-off** (§5.2) — the interesting one. An

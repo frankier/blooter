@@ -11,10 +11,12 @@
 //! discovery transport to scan on. [`Session`] wraps the spawn/cancel/join
 //! plumbing so each transport's `wait_connected` drives the menu the same way.
 //!
-//! Ineligible devices — Bluetooth audio/headsets, and devices with no real name
-//! (only a hex identifier) — are moved to an "Other devices" submenu so the main
-//! list shows just plausible HID hosts (computers/phones/TVs). Already-paired
-//! devices always stay on the main list: bonding one was a deliberate choice.
+//! Ineligible devices — Bluetooth audio/headsets and other HID peripherals, and
+//! devices with no real name (only a hex identifier) — are moved to an "Other
+//! devices" submenu so the main list shows just plausible HID hosts
+//! (computers/phones/TVs). The test is a deny-list, so an unrecognised device
+//! stays in the main list ([`is_other`]), and already-paired devices always do:
+//! bonding one was a deliberate choice.
 
 use std::future;
 use std::io::{self, Write};
@@ -28,7 +30,7 @@ use crossterm::style::Print;
 use crossterm::terminal::{self, Clear, ClearType};
 use crossterm::{execute, queue};
 use futures::StreamExt;
-use log::{info, warn};
+use log::{info, trace, warn};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
@@ -132,27 +134,46 @@ const APPEARANCE_HID: u16 = 0x0f;
 const APPEARANCE_AUDIO_SINK: u16 = 0x21;
 const APPEARANCE_AUDIO_SOURCE: u16 = 0x22;
 
-/// Minor device classes within the Audio/Video major class that are display-type
-/// devices — TVs, set-top boxes, consoles — and so plausible HID hosts, unlike
-/// the speakers and headsets that share the major class with them.
-const AV_MINOR_HOSTS: [u32; 5] = [
-    0x09, // Set-top box
-    0x0e, // Video Monitor
-    0x0f, // Video Display and Loudspeaker
-    0x10, // Video Conferencing
-    0x12, // Gaming/Toy
+/// Minor device classes within the Audio/Video major class that are genuinely
+/// speakers, microphones and cameras. Everything *else* under that major class —
+/// uncategorised (0x00), car audio (0x08), set-top boxes, monitors, video
+/// conferencing, consoles — is a plausible HID host: TVs and streaming dongles
+/// share the Audio/Video major class with headsets and are wildly inconsistent
+/// about which minor class they claim (a Google TV in the wild reports 0x08).
+const AV_MINOR_AUDIO: [u32; 9] = [
+    0x01, // Wearable Headset
+    0x02, // Hands-free
+    0x04, // Microphone
+    0x05, // Loudspeaker
+    0x06, // Headphones
+    0x07, // Portable Audio
+    0x0a, // HiFi Audio
+    0x0c, // Video Camera
+    0x0d, // Camcorder
 ];
 
 /// True if a device belongs in the "Other devices" submenu rather than the main
-/// host list. A bond outranks every heuristic: pairing is an explicit decision
-/// that this device is a host worth using, so a paired device is never filed
-/// under "Other" whatever it claims to be. Otherwise a device is "Other" if it
-/// has no real name, if its Class of Device marks it as a non-display audio
-/// device, or if its GAP Appearance marks it as another HID peripheral or an
-/// audio device. Both property checks are applied whenever the property is
-/// present — LE-only peers have no Class of Device and BR/EDR peers usually have
-/// no Appearance, so each simply falls through for the other. A named device
-/// with neither marker stays in the main list.
+/// host list.
+///
+/// This is a *deny-list*: a device is demoted only on positive evidence that it
+/// is a peripheral, and anything unrecognised stays in the main list. The bias is
+/// deliberate — a stray car stereo in the host list costs one line, while hiding
+/// a real TV costs the user the feature. An earlier allow-list of known-good
+/// classes did exactly that, since real hosts advertise classes nobody guesses in
+/// advance.
+///
+/// A bond outranks every heuristic: pairing is an explicit decision that this
+/// device is a host worth using, so a paired device is never filed under "Other"
+/// whatever it claims to be. Otherwise a device is "Other" if it has no real
+/// name, if its Class of Device marks it as a peripheral, or if its GAP
+/// Appearance marks it as another HID peripheral or an audio device. Both
+/// property checks are applied whenever the property is present — LE-only peers
+/// have no Class of Device and BR/EDR peers usually have no Appearance, so each
+/// simply falls through for the other.
+///
+/// Note that the Audio *service* class bit (bit 21) is deliberately not consulted
+/// and must not be reinstated: laptops, phones and TVs all advertise A2DP, so it
+/// distinguishes nothing.
 fn is_other(
     class: Option<u32>,
     appearance: Option<u16>,
@@ -169,21 +190,19 @@ fn is_other(
         // Major device class is bits 8-12, minor device class bits 2-7.
         let major = (c >> 8) & 0x1f;
         let minor = (c >> 2) & 0x3f;
-        // Computers and phones are hosts, and so are the display-type members of
-        // the Audio/Video major class (a TV is as good a host as a laptop).
-        let host_class = match major {
-            1 | 2 => true,
-            4 => AV_MINOR_HOSTS.contains(&minor),
+        let peripheral = match major {
+            4 => AV_MINOR_AUDIO.contains(&minor), // headset/speaker/mic/camera
+            5 => true,                            // Peripheral: keyboard, mouse, joystick
+            6 => true,                            // Imaging: printer, scanner, camera
+            7 => true,                            // Wearable
+            8 => true,                            // Toy
+            9 => true,                            // Health
+            // Miscellaneous (0), Computer (1), Phone (2), LAN (3), the non-audio
+            // half of Audio/Video (4) and Uncategorized (31) are all plausible
+            // hosts, as is any major class not yet assigned.
             _ => false,
         };
-        // Anything else in Audio/Video is a headset/speaker/camera.
-        if major == 4 && !host_class {
-            return true;
-        }
-        // The Audio *service* class flag (bit 21) only demotes a device whose
-        // major class is not itself a plausible host: laptops and TVs routinely
-        // advertise A2DP without ceasing to be hosts.
-        if !host_class && (c & (1 << 21)) != 0 {
+        if peripheral {
             return true;
         }
     }
@@ -489,7 +508,19 @@ async fn collect(adapter: &Adapter, stale: &[Address]) -> (Vec<(Row, Device)>, V
             // Only a bond carries a cached record, so only bonded hosts can be stale.
             stale: paired && stale.contains(&addr),
         };
-        if is_other(class, appearance, has_real_name, paired) {
+        let other_dev = is_other(class, appearance, has_real_name, paired);
+        // Everything the classification saw, so a misfiled host can be diagnosed
+        // from a log rather than by replaying BlueZ properties by hand. Below
+        // `-d`, at `RUST_LOG=trace`: this prints mid-menu and scribbles over the
+        // TUI, so it must not appear at a level a user might leave switched on.
+        trace!(
+            "{addr} {alias:?}: class={} appearance={} named={has_real_name} paired={paired} → {}",
+            class.map_or("none".to_string(), |c| format!("{c:#08x}")),
+            appearance.map_or("none".to_string(), |a| format!("{a:#06x}")),
+            if other_dev { "other" } else { "main" },
+            alias = row.alias,
+        );
+        if other_dev {
             other.push((row, dev));
         } else {
             main.push((row, dev));
@@ -865,28 +896,58 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    /// Classes observed on real devices, rather than values invented to match
+    /// the code: every one of these was read off a live `org.bluez.Device1`.
+    /// The Audio/Video major class (4) is the interesting one — it holds both
+    /// the headsets and the TVs, and the TVs disagree wildly about their minor
+    /// class, which is why classification must not allow-list known-good ones.
     #[test]
-    fn classify_audio_major_class() {
-        // Major class 4 (Audio/Video), e.g. a headset (minor 0x01) or a
-        // loudspeaker (minor 0x05).
-        assert!(is_other(Some(0x0024_0404), None, true, false));
-        assert!(is_other(Some(0x0000_0414), None, true, false));
+    fn classify_real_world_classes() {
+        // (class, expected `is_other`, the device it was read from)
+        let cases = [
+            (0x006c_010c, false, "garmak: laptop, A2DP bit set"),
+            (0x002e_410c, false, "PC-673942: desktop, major 1"),
+            (0x005a_020c, false, "Galaxy A56: phone, major 2"),
+            (0x001c_0424, false, "Telia TV: set-top box, minor 0x09"),
+            (0x0008_043c, false, "Samsung LED55: display, minor 0x0f"),
+            (0x000c_243c, false, "LG webOS TV: display, minor 0x0f"),
+            // The regression this deny-list exists for: a TV claiming a minor
+            // class ("car audio") no allow-list of displays would include.
+            (0x002c_0420, false, "GoogleTV6946: car audio, minor 0x08"),
+            (0x0024_0404, true, "Core Wireless Pods: earbuds, 0x01"),
+            (0x0024_0414, true, "MD 43402: loudspeaker, minor 0x05"),
+        ];
+        for (class, want, what) in cases {
+            assert_eq!(
+                is_other(Some(class), None, true, false),
+                want,
+                "{what} ({class:#08x})"
+            );
+        }
     }
 
     #[test]
-    fn classify_audio_service_bit() {
-        // The bare service bit on an otherwise uninformative class still demotes.
-        assert!(is_other(Some(1 << 21), None, true, false));
-        // But a computer advertising A2DP is still a computer.
-        assert!(!is_other(Some(0x0020_010c), None, true, false));
+    fn classify_peripheral_major_classes_are_other() {
+        // Major class 5 is Peripheral — another keyboard (0x40) or mouse (0x80)
+        // is not a host to connect *to*.
+        assert!(is_other(Some(0x0000_0540), None, true, false));
+        assert!(is_other(Some(0x0000_0580), None, true, false));
+        // Nor is a printer (6), a smartwatch (7), a toy (8) or a scale (9).
+        assert!(is_other(Some(0x0000_0680), None, true, false));
+        assert!(is_other(Some(0x0000_0704), None, true, false));
+        assert!(is_other(Some(0x0000_0804), None, true, false));
+        assert!(is_other(Some(0x0000_0904), None, true, false));
     }
 
     #[test]
-    fn classify_display_av_devices_are_hosts() {
-        // Major class 4 covers TVs too: minor 0x0F (Video Display and
-        // Loudspeaker, audio service bit set) and minor 0x09 (set-top box).
-        assert!(!is_other(Some(0x0024_043c), None, true, false));
-        assert!(!is_other(Some(0x0000_0424), None, true, false));
+    fn classify_unknown_classes_stay_on_main() {
+        // The deny-list bias: only a recognised peripheral is demoted, so an
+        // uncategorised (major 31) or miscellaneous (major 0) device — common on
+        // cheap TV boxes — stays visible, A2DP bit and all.
+        assert!(!is_other(Some(0x0020_1f00), None, true, false));
+        assert!(!is_other(Some(0x0020_0000), None, true, false));
+        // Including the bare Audio service bit, which every host sets too.
+        assert!(!is_other(Some(1 << 21), None, true, false));
     }
 
     #[test]

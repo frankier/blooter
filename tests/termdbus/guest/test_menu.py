@@ -16,6 +16,7 @@ from harness import (
     CLASS_COMPUTER_AUDIO,
     CLASS_HEADSET,
     CLASS_TV,
+    CLASS_TV_ODD_MINOR,
     Registry,
     assert_screen_contains,
     assert_menu_contains,
@@ -33,6 +34,7 @@ LAPTOP = "AA:BB:CC:DD:EE:01"
 DESKTOP = "AA:BB:CC:DD:EE:02"
 HEADSET = "AA:BB:CC:DD:EE:03"
 NAMELESS = "AA:BB:CC:DD:EE:04"
+TV = "AA:BB:CC:DD:EE:05"
 
 
 # --------------------------------------------------------------------------
@@ -91,14 +93,18 @@ def test_audio_device_moves_to_other_devices(t):
 def test_tv_and_audio_capable_computer_stay_on_main(t):
     """Sharing the Audio/Video major class with headsets does not make a TV a
     headset, and a laptop advertising A2DP is still a laptop -- only the headset
-    here belongs in the submenu."""
+    here belongs in the submenu. `my-odd-tv` is the one that matters: it claims a
+    minor class ("car audio") that says nothing about being a display, and is
+    unpaired, so nothing but the deny-list keeps it visible."""
     t.mock.add_device(LAPTOP, "my-laptop", cls=CLASS_COMPUTER_AUDIO)
     t.mock.add_device(DESKTOP, "my-tv", cls=CLASS_TV)
+    t.mock.add_device(TV, "my-odd-tv", cls=CLASS_TV_ODD_MINOR)
     t.mock.add_device(HEADSET, "my-headset", cls=CLASS_HEADSET)
     term = t.menu()
 
     assert_screen_contains(term, "my-laptop", "the A2DP laptop in the main list")
     assert_screen_contains(term, "my-tv", "the TV in the main list")
+    assert_screen_contains(term, "my-odd-tv", "the car-audio-class TV in the main list")
     assert_screen_lacks(term, "my-headset", "the headset in the main list")
     assert_menu_contains(term, "[o] Other devices (1)", "the submenu offer")
 
