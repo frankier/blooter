@@ -1,7 +1,7 @@
 //! Input sources: evdev event devices (default) and FIFO mode. See design/ARCH.md §6.
 
 use std::io::{self, Read};
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,9 +55,13 @@ impl Drop for Inputs {
 impl Inputs {
     /// Graceful shutdown. Once the capture watch channel is closed, each evdev
     /// reader releases its grab (injecting the touchpad reset) and exits; wait
-    /// briefly for that. Anything still running afterwards (e.g. the FIFO
-    /// reader, blocked in read) is aborted as before. Covers both the startup
-    /// readers and any hotplugged ones.
+    /// briefly for that. Anything still running afterwards is aborted. Covers
+    /// both the startup readers and any hotplugged ones.
+    ///
+    /// Every reader here is a plain async task, which is what makes the abort
+    /// mean anything: `abort` does nothing to a running `spawn_blocking`
+    /// closure, so a reader on its own thread would survive this and then hold
+    /// the runtime open at exit (see `spawn_fifo`).
     pub async fn shutdown(mut self) {
         let mut all = std::mem::take(&mut self.tasks);
         all.extend(self.dynamic.take());
@@ -632,49 +636,76 @@ fn spawn_fifo(
         Err(e) => return Err(e),
     }
 
+    // Opened read-write and non-blocking, then driven through `AsyncFd` exactly
+    // like the udev monitor. Both flags are load-bearing:
+    //
+    // - **non-blocking** keeps this an ordinary async task. A blocking read on
+    //   its own thread cannot be cancelled: `JoinHandle::abort` is a no-op once
+    //   a `spawn_blocking` closure is running, so shutdown's abort did nothing
+    //   and the runtime then waited for that thread forever — blooter printed
+    //   "blooter stopped." and never exited (design/ARCH.md §9).
+    // - **read-write** keeps a writer (us) on the FIFO at all times, so an idle
+    //   pipe reports "would block" rather than EOF. That removes the reopen loop
+    //   the blocking version needed, and with it the blocking `open` — which is
+    //   where shutdown actually found this task wedged, waiting for a writer
+    //   that never came.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&path)?;
+    let async_fd = AsyncFd::with_interest(file, Interest::READABLE)?;
+
     // The record layout is native `struct input_event`: timeval(16) + type(2) +
-    // code(2) + value(4) = 24 bytes on 64-bit. Bridge blocking reads onto the
-    // async channel via spawn_blocking.
-    let handle = tokio::runtime::Handle::current();
-    let task = tokio::task::spawn_blocking(move || {
+    // code(2) + value(4) = 24 bytes on 64-bit. A writer can split one across
+    // reads, so bytes accumulate until a whole record is in hand.
+    let task = tokio::spawn(async move {
         const REC: usize = std::mem::size_of::<libc::input_event>();
+        let mut buf = [0u8; REC];
+        let mut have = 0usize;
         loop {
-            // Blocking open waits for a writer; reopen after each EOF.
-            let mut file = match std::fs::File::open(&path) {
-                Ok(f) => f,
+            let mut guard = match async_fd.readable().await {
+                Ok(g) => g,
                 Err(e) => {
-                    warn!("cannot open FIFO {}: {e}", path.display());
+                    warn!("FIFO poll error on {}: {e}", path.display());
                     return;
                 }
             };
-            let mut buf = [0u8; REC];
-            loop {
-                match file.read_exact(&mut buf) {
-                    Ok(()) => {
-                        let type_ = u16::from_ne_bytes([buf[16], buf[17]]);
-                        let code = u16::from_ne_bytes([buf[18], buf[19]]);
-                        let value = i32::from_ne_bytes([buf[20], buf[21], buf[22], buf[23]]);
-                        let raw = RawEvent {
-                            type_,
-                            code,
-                            value,
-                            gamepad: None,
-                        };
-                        if debug {
-                            debug!("[fifo] type={type_} code={code} value={value}");
-                        }
-                        // Deliver onto the async channel; stop if the receiver is gone.
-                        if handle.block_on(tx.send(raw)).is_err() {
-                            return;
-                        }
+            // `try_io` clears readiness itself when the read would block.
+            let read = guard.try_io(|inner| {
+                let mut file: &std::fs::File = inner.get_ref();
+                file.read(&mut buf[have..])
+            });
+            match read {
+                Ok(Ok(0)) => guard.clear_ready(),
+                Ok(Ok(n)) => {
+                    have += n;
+                    if have < REC {
+                        continue;
                     }
-                    // EOF (no writer) or a short read: reopen and keep polling.
-                    Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                    Err(e) => {
-                        warn!("FIFO read error: {e}");
-                        break;
+                    have = 0;
+                    let type_ = u16::from_ne_bytes([buf[16], buf[17]]);
+                    let code = u16::from_ne_bytes([buf[18], buf[19]]);
+                    let value = i32::from_ne_bytes([buf[20], buf[21], buf[22], buf[23]]);
+                    let raw = RawEvent {
+                        type_,
+                        code,
+                        value,
+                        gamepad: None,
+                    };
+                    if debug {
+                        debug!("[fifo] type={type_} code={code} value={value}");
+                    }
+                    // Deliver onto the async channel; stop if the receiver is gone.
+                    if tx.send(raw).await.is_err() {
+                        return;
                     }
                 }
+                Ok(Err(e)) => {
+                    warn!("FIFO read error on {}: {e}", path.display());
+                    return;
+                }
+                Err(_would_block) => continue,
             }
         }
     });

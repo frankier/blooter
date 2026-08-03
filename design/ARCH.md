@@ -464,11 +464,15 @@ controller changes.
 
 - If the path exists it must already be a FIFO, else error out. If absent, it is
   created with `mkfifo`, mode `0600`.
-- Read on a blocking thread as raw native-endian `struct input_event` records
-  (24 bytes on 64-bit: `timeval` (16) + `u16 type` + `u16 code` + `s32 value`),
-  bridged onto the async channel. Treated as event device #0. On EOF (no
-  writer) the FIFO is reopened and polling continues. Gamepad forwarding is
-  disabled in FIFO mode.
+- Opened **read-write and non-blocking**, then read through `AsyncFd` like every
+  other input source, as raw native-endian `struct input_event` records (24 bytes
+  on 64-bit: `timeval` (16) + `u16 type` + `u16 code` + `s32 value`). A writer
+  may split a record across writes, so bytes accumulate until one is whole.
+  Treated as event device #0. Gamepad forwarding is disabled in FIFO mode.
+- Opening read-write keeps a writer on the FIFO at all times, so an idle pipe
+  reports "would block" instead of EOF; there is no reopen loop, and no blocking
+  `open` waiting for a writer. This is a shutdown requirement, not a
+  micro-optimisation — see §9.
 
 ### 6.3 Event draining
 
@@ -739,7 +743,21 @@ needs no async runtime or Bluetooth.
   grab (injecting the touchpad reset) and closes its fd; wait briefly for
   readers to finish; restore adapter class/name/SSP (`BtSetup::drop`); flush
   pending stdin if it is a TTY (so forwarded keystrokes do not spill into the
-  terminal); print `blooter stopped.`.
+  terminal); print `blooter stopped.`; then shut the runtime down with a short
+  deadline.
+- **Every input reader must be an async task, never a blocking one.**
+  `JoinHandle::abort` does nothing to a `spawn_blocking` closure that is already
+  running, and dropping a runtime waits for such threads without limit. FIFO mode
+  used to read on a blocking thread, parked in a blocking `open` waiting for a
+  writer: shutdown's abort was a no-op, and blooter printed `blooter stopped.`
+  and then hung forever, restoring nothing (`BtSetup::drop` never ran, so the
+  adapter kept blooter's class and name). §6.2 is what keeps that reader
+  cancellable.
+- The one blocking task that remains is the pairing prompt's stdin read
+  (`agent::ask`), which cannot be made cancellable. `Runtime::shutdown_timeout`
+  bounds it: an open prompt at exit costs a moment, not the process. By that
+  point the adapter is restored and the grabs are released, so nothing is lost
+  by detaching.
 
 ## 10. Configuration and adapter setup
 

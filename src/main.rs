@@ -63,13 +63,21 @@ fn main() -> ExitCode {
         }
     };
 
-    match runtime.block_on(run(args)) {
+    let status = match runtime.block_on(run(args)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             error!("{e}");
             ExitCode::from(e.code)
         }
-    }
+    };
+    // Dropping a runtime waits for every blocking task, and a blocking read
+    // cannot be cancelled: an open pairing prompt (`agent::ask`, reading stdin
+    // on a blocking thread) would otherwise hold the process open until someone
+    // pressed Enter. Give those threads a moment, then detach and exit anyway —
+    // by here the adapter is restored and the grabs are released, so there is
+    // nothing left worth waiting on (design/ARCH.md §9).
+    runtime.shutdown_timeout(Duration::from_millis(200));
+    status
 }
 
 /// A startup/runtime error carrying the desired process exit code.
