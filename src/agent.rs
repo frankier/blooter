@@ -14,17 +14,38 @@
 //!
 //! | Agent | Callbacks | Capability | Model |
 //! |---|---|---|---|
-//! | [`just_works_agent`] | none | `NoInputNoOutput` | Just Works, no interaction |
-//! | [`auto_accept_agent`] | confirm/authorize | `DisplayYesNo` | host may pick passkey entry |
+//! | [`auto_accept_agent`] | confirm/authorize | `DisplayYesNo` | answered without interaction |
 //! | [`interactive_agent`] | all of them | `KeyboardDisplay` | any model, answered on the TTY |
 //!
-//! This is why `Accept` is transport-specific. BLE needs the real
-//! `NoInputNoOutput` to get Just Works: with `DisplayYesNo` a host takes blooter
-//! for a device that can show and type digits and picks Passkey Entry, which a
-//! callback-less agent cannot answer — the host shows a PIN and blooter shows
-//! nothing. Classic keeps the `DisplayYesNo` set because `AuthorizeService` is a
-//! BR/EDR profile-authorization call that a bare agent would reject; LE never
-//! makes it.
+//! **A missing callback is a rejection, not a default.** bluer's own
+//! documentation says an all-`None` agent registers as `NoInputNoOutput` and
+//! "accepts all requests"; it does not. `Agent::call` answers every unset
+//! callback with `ReqError::Rejected`, so a callback-free agent refuses the very
+//! pairing its capability invites. BLE `accept` used to register exactly that,
+//! reasoning that `NoInputNoOutput` pins the model to Just Works and Just Works
+//! needs no answer. The first half is true; the second is not. Just Works still
+//! goes through the agent: the kernel raises a User Confirmation Request with
+//! `confirm_hint = 1` (nothing to display), bluetoothd turns that into
+//! `RequestAuthorization`, and an unset handler rejects it. On the wire that
+//! became a User Confirmation Negative Reply and `SMP Pairing Failed: Numeric
+//! comparison failed (0x0c)` — blooter refusing its own pairing, while the host
+//! reported only "connection failed".
+//!
+//! So `accept` covers both answers a non-interactive bond can need, on either
+//! transport: `RequestAuthorization` for the Just Works hint above, and
+//! `RequestConfirmation` for the numeric comparison a `DisplayYesNo` capability
+//! invites from a `KeyboardDisplay` host. Dropping either one resurrects the bug
+//! in a different association model, which is why the unit test pins both the
+//! capability and the callback set.
+//!
+//! The `DisplayYesNo` capability — and so the confirmation click the host now
+//! shows — is bluer's doing, not the protocol's. <https://github.com/bluez/bluer/pull/190>
+//! takes `request_authorization`/`authorize_service` out of the capability
+//! derivation (they are authorization policy, not I/O) and gives an all-`None`
+//! agent default accepting handlers. **Once that is merged and released, drop
+//! `request_confirmation` below**: the capability returns to `NoInputNoOutput`,
+//! no host can then select numeric comparison, and Just Works pairing needs no
+//! click on either side. It is unmerged as of bluer 0.17.4.
 
 use std::io::{self, Write};
 use std::pin::Pin;
@@ -34,7 +55,7 @@ use bluer::agent::{Agent, ReqError, ReqResult};
 use futures::FutureExt;
 use log::info;
 
-use crate::config::{PairingMode, Protocol};
+use crate::config::PairingMode;
 use crate::menu::TermCoord;
 
 type ReqFuture = Pin<Box<dyn std::future::Future<Output = ReqResult<()>> + Send>>;
@@ -52,34 +73,23 @@ pub enum Resolved {
 /// Build the agent for the resolved pairing behaviour on `protocol`. `coord`
 /// lets a prompt borrow the terminal from a running interactive menu before
 /// reading on the TTY (design/CONNECTION.md §5/§6).
-pub fn agent(mode: Resolved, protocol: Protocol, coord: TermCoord) -> Agent {
-    match (mode, protocol) {
-        (Resolved::Accept, Protocol::Ble) => just_works_agent(),
-        (Resolved::Accept, Protocol::Classic) => auto_accept_agent(),
-        (Resolved::Prompt, _) => interactive_agent(coord),
+pub fn agent(mode: Resolved, coord: TermCoord) -> Agent {
+    match mode {
+        Resolved::Accept => auto_accept_agent(),
+        Resolved::Prompt => interactive_agent(coord),
     }
 }
 
-/// A pairing agent with no callbacks at all, which registers as
-/// `NoInputNoOutput` and so pins the negotiated model to **Just Works**: BlueZ
-/// bonds without ever calling back. This is what makes BLE pairing work with
-/// nothing but blooter running — no tray, no prompt, nothing to answer.
+/// A pairing agent that answers every question a non-interactive bond can raise,
+/// and additionally authorizes incoming service connections — which Classic
+/// needs, since bluetoothd asks before letting an untrusted device reach the HID
+/// PSMs, and which LE simply never calls.
 ///
-/// It must stay callback-free. Any handler added here changes the advertised
-/// capability and lets the host choose a model that needs answering.
-fn just_works_agent() -> Agent {
-    Agent {
-        request_default: true,
-        ..Default::default()
-    }
-}
-
-/// A pairing agent that accepts bonding without interaction, and additionally
-/// authorizes incoming service connections — which Classic needs, since
-/// bluetoothd asks before letting an untrusted device reach the HID PSMs.
-///
-/// Providing those callbacks registers as `DisplayYesNo`, so a Classic host may
-/// still pick a passkey model; SSP numeric comparison is confirmed silently here.
+/// Providing these callbacks registers as `DisplayYesNo`. Both accepting
+/// callbacks are load-bearing: `RequestAuthorization` answers the Just Works
+/// hint, `RequestConfirmation` answers the numeric comparison a `KeyboardDisplay`
+/// host picks against this capability. Both are confirmed silently — that is
+/// what `accept` means.
 fn auto_accept_agent() -> Agent {
     fn ok() -> ReqFuture {
         async move { Ok(()) }.boxed()
@@ -274,21 +284,36 @@ mod tests {
     }
 
     /// The capability is a side effect of the callback set, so a stray handler
-    /// would silently change how every host pairs. BLE in particular *must* be
-    /// `NoInputNoOutput`: that is the whole reason it can pair non-interactively.
+    /// would silently change how every host pairs.
     #[test]
     fn each_mode_registers_the_intended_capability() {
         let coord = TermCoord::default();
-        for (mode, protocol, want) in [
-            (Resolved::Accept, Protocol::Ble, "NoInputNoOutput"),
-            (Resolved::Accept, Protocol::Classic, "DisplayYesNo"),
-            (Resolved::Prompt, Protocol::Ble, "KeyboardDisplay"),
-            (Resolved::Prompt, Protocol::Classic, "KeyboardDisplay"),
+        for (mode, want) in [
+            (Resolved::Accept, "DisplayYesNo"),
+            (Resolved::Prompt, "KeyboardDisplay"),
         ] {
-            let a = agent(mode, protocol, coord.clone());
-            assert_eq!(capability(&a), want, "{mode:?} on {protocol:?}");
+            let a = agent(mode, coord.clone());
+            assert_eq!(capability(&a), want, "{mode:?}");
             assert!(a.request_default, "the agent must be the default one");
         }
+    }
+
+    /// An unset callback is answered with `Rejected`, so `accept` has to cover
+    /// *every* model its capability can invite or it refuses its own pairing:
+    /// `RequestAuthorization` is the Just Works hint (`confirm_hint = 1`) and
+    /// `RequestConfirmation` is the numeric comparison a `KeyboardDisplay` host
+    /// picks against `DisplayYesNo`. Dropping either reintroduces an
+    /// `SMP Pairing Failed: Numeric comparison failed` that looks like a host
+    /// problem from every angle except this one.
+    #[test]
+    fn accept_answers_every_non_interactive_model() {
+        let a = agent(Resolved::Accept, TermCoord::default());
+        assert!(a.request_authorization.is_some(), "just works (hinted)");
+        assert!(a.request_confirmation.is_some(), "numeric comparison");
+        assert!(
+            a.authorize_service.is_some(),
+            "classic service authorization"
+        );
     }
 
     /// Prompting is only useful if blooter can answer every model itself, which

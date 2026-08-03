@@ -220,7 +220,7 @@ async fn run(args: cli::Args) -> Result<(), AppError> {
     // menu is running (LE, non-interactive, or after the menu resolves).
     let term_coord = menu::TermCoord::default();
     let _agent = session
-        .register_agent(agent::agent(pairing_mode, cfg.protocol, term_coord.clone()))
+        .register_agent(agent::agent(pairing_mode, term_coord.clone()))
         .await
         .map_err(|e| AppError::new(1, format!("cannot register pairing agent: {e}")))?;
 

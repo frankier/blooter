@@ -254,25 +254,58 @@ changes how every host pairs:
 | confirm / authorize | `DisplayYesNo` | numeric comparison, **or passkey entry** |
 | all of them | `KeyboardDisplay` | any model |
 
-This is why `accept` is transport-specific. An agent that answers only
-confirmations registers as `DisplayYesNo`, which tells the host blooter can show
-and type digits; a host then reasonably picks **Passkey Entry**, calls
-`RequestPasskey`, gets no handler, and pairing fails with a PIN on the host's
-screen and nothing on blooter's. That was a real bug, and the comment claiming
-those callbacks kept the capability at `NoInputNoOutput` was simply wrong.
+The second row is the trap, and the first row is a worse one. **An unset callback
+is a rejection, not a default.** bluer documents an all-`None` agent as
+`NoInputNoOutput` and "accepts all requests"; `Agent::call` in fact answers every
+unset callback with `ReqError::Rejected`. So the capability invites a model the
+agent then refuses.
+
+BLE `accept` registered exactly that agent, on the reasoning that
+`NoInputNoOutput` pins the model to Just Works and Just Works needs no answer.
+The first half is true; the second is not. **Just Works still goes through the
+agent**: the kernel raises a User Confirmation Request with `confirm_hint = 1`
+(there is nothing to display), bluetoothd turns that into `RequestAuthorization`,
+and the unset handler rejected it. Confirmed on the wire — a User Confirmation
+Negative Reply followed by `SMP Pairing Failed: Numeric comparison failed
+(0x0c)`. blooter was refusing its own pairing while the host reported nothing
+more useful than "connection failed", and the symptom looked exactly like a
+broken host or a broken controller.
 
 ### 5.1 `accept` (the default)
 
-Bond without interaction. What that takes differs by transport:
+Bond without interaction. One agent now serves both transports, setting
+`request_authorization`, `request_confirmation` and `authorize_service` (so
+`DisplayYesNo`). Each is load-bearing:
 
-- **BLE** registers an agent with **no callbacks at all**, which is the only way
-  to get a true `NoInputNoOutput` and pin the model to **Just Works**. This is
-  what lets blooter pair with nothing else running — no desktop tray, no prompt,
-  nothing to answer. It must stay callback-free.
-- **Classic** keeps `request_confirmation` / `request_authorization` /
-  `authorize_service` (so `DisplayYesNo`), because bluetoothd calls
-  `AuthorizeService` before letting an untrusted device reach the HID PSMs and a
-  bare agent would reject it. LE never makes that call.
+- **`RequestAuthorization`** answers the hinted Just Works case above. Without it
+  a non-interactive bond cannot complete at all.
+- **`RequestConfirmation`** answers the numeric comparison a `KeyboardDisplay`
+  host picks against `DisplayYesNo`. Since the capability is no longer
+  `NoInputNoOutput`, this is the *common* path, not a corner case.
+- **`AuthorizeService`** is what bluetoothd calls before letting an untrusted
+  device reach the Classic HID PSMs. LE never makes that call, so carrying it on
+  both transports costs nothing and removes the transport split.
+
+The cost of leaving `NoInputNoOutput` behind is honest and worth stating: a
+`KeyboardDisplay` host now negotiates numeric comparison and shows a *confirm*
+dialog, where true Just Works showed none. blooter answers its own half
+silently; the host's half is one click.
+
+That cost is bluer's, not the protocol's, and upstream has a fix in flight:
+[bluer#190](https://github.com/bluez/bluer/pull/190) drops `request_authorization`
+and `authorize_service` from the capability derivation — they are local
+authorization policy, not I/O capability — and gives an all-`None` agent default
+accepting handlers for both. With it, `request_authorization` + `authorize_service`
+publishes `NoInputNoOutput` again and Just Works pairing needs no click on either
+side. It is unmerged and unreleased (0.17.4 is current), so `accept` keeps
+`request_confirmation` and lives with numeric comparison for now.
+
+**When bluer#190 lands, drop `request_confirmation` from
+[`auto_accept_agent`](../src/agent.rs) and zero-click pairing comes back.** Under
+`NoInputNoOutput` no host can select numeric comparison, so that handler stops
+being a safety net and becomes the only thing forcing the extra click. Until
+then the alternative is registering the agent object directly on D-Bus to
+decouple capability from callbacks (§10) — more code than the trade is worth.
 
 `accept` is also what `prompt_if_possible` falls back to when stdin is not a TTY.
 
@@ -612,7 +645,78 @@ change it from run to run. `[remote] enabled` and `[pointer] axis_bits` are
 one-off decisions rather than per-run ones: settle them before pairing widely,
 and every bond afterwards carries the layout you want.
 
-## 8. Scenario matrix
+## 8. Recovering a broken setup
+
+§7 repairs one specific, *detectable* divergence: a host whose cached descriptor
+no longer matches ours. It generalises. Bonding state lives on two machines and
+in two daemons, blooter owns only one half of it, and every one of the failures
+below leaves that half looking perfectly healthy. **When the two halves disagree,
+blooter is the only party that can see it is happening, so it has to say so.**
+
+The principle: *a setup that cannot work should never present as one that is
+merely waiting.* "Advertising as blooter" is the same message whether a host is
+about to connect or can never connect again, and that is the bug — the user is
+told to keep waiting for something that will not happen.
+
+### 8.1 The states that actually occur
+
+Each of these was observed on a real pair of machines, not postulated:
+
+- **Half a bond.** The host aborts pairing (or the user deletes the device
+  there) while bluetoothd here keeps the bond, or the reverse. The side that
+  kept it reports `Paired: yes` and waits; the side that dropped it cannot
+  reconnect, because its peer refuses an encrypted link it has no key for. Both
+  sides look fine in isolation.
+- **A bond on the wrong transport.** A host bonded while blooter ran Classic
+  holds a BR/EDR record (UUID `0x1124`, class `0x0540`). Switch
+  `[connection] protocol` to `ble` and that host still dials BR/EDR — BlueZ
+  fails it with `br-connection-create-socket` — while blooter advertises HOGP
+  beside it, unreachable. Changing `protocol` invalidates every existing bond,
+  and nothing currently says so.
+- **A stale instance.** An earlier blooter that did not exit still holds its
+  GATT application, advertisement and default agent on the adapter. A second
+  instance registers a second set; hosts then negotiate against whichever agent
+  bluetoothd last made default, and pairing fails in ways that track nothing the
+  user did. Exiting cleanly is the fix, but *detecting* the duplicate is what
+  turns an inexplicable failure into a one-line message.
+- **An environment that cannot do the job.** No `input` group membership (every
+  `/dev/input/event*` unreadable, so `-x` grabs nothing and no input is ever
+  forwarded), or no `CAP_NET_ADMIN` (the Class of Device silently stays wrong,
+  §4.1). Both are startup-time facts and neither needs a host to discover.
+
+### 8.2 What blooter owes the user
+
+1. **Check at startup, not on first failure.** Adapter reachable, no duplicate
+   instance, at least one input device open under `-x`, and — the one that
+   matters most — every bonded host's transport matching the configured
+   `protocol`. All of it is local; none of it needs a host to show up.
+2. **Name the machine and the fix.** Not "connection failed" but which host,
+   which side holds the stale half, and the exact remedy: *remove blooter from
+   that host's Bluetooth settings, then pair again from there.* A repair the
+   user cannot perform from blooter's side must say so plainly, because a
+   peripheral cannot reach out and fix a central (§4).
+3. **Offer to do blooter's half.** The menu already has `[u]` (§7.2b). Anything
+   blooter can do alone belongs behind a keystroke; anything it cannot must be
+   spelled out as host-side instructions.
+4. **Never repair destructively behind the user's back.** Dropping a bond to
+   "clean up" strands a host that a peripheral can never re-reach (this is the
+   trade §7.2b already got wrong once). Detection is free and always on; repair
+   is explicit.
+5. **Degrade loudly, not silently.** A best-effort step that fails and changes
+   observable behaviour (no device class, no state file, no grabbed devices)
+   must be visible at startup, not at debug level.
+
+### 8.3 Why this is not just better error strings
+
+The information needed is not in the error. `AuthenticationFailed` on the host
+and a serene `Paired: yes` here are both accurate reports of one machine's view;
+the fault is only visible in the *disagreement*, and blooter is the only process
+positioned to notice it — it knows the configured protocol, the bond list, its
+own descriptor fingerprint and its own history with each host (§7.1). That is
+the same asymmetry §7 already exploits, applied to the bond itself rather than
+to the descriptor cached under it.
+
+## 9. Scenario matrix
 
 "Accept-only" = §3.1 / §4; "Initiate" = §3.2. Every BLE row is accept-only: the
 peripheral role leaves nothing to initiate (§4).
@@ -632,16 +736,16 @@ says, `accept` unless set. `prompt_if_possible` is the mode-sensitive value
 only starts at all on the interactive rows. What `accept` *registers* does vary
 by transport, and has to (§5.1).
 
-## 9. Implementation touch-points
+## 10. Implementation touch-points
 
 - **`config.rs`** — `[connection] pairing`
   (`accept`/`prompt_if_possible`/`prompt`, default `accept`),
   `[connection] reconnect` (address string, optional, Classic-only) and
   `[ble] advertise` (`auto`/`alias`/`alias_cod`/`alias_cod_hide`, default
   `auto`, §4.1).
-- **`agent.rs`** — the shared agent, chosen by `(mode, protocol)`:
-  `just_works_agent` (no callbacks → `NoInputNoOutput`, BLE `accept`),
-  `auto_accept_agent` (Classic `accept`, keeps `AuthorizeService`) and
+- **`agent.rs`** — the shared agent, chosen by `mode` alone (the transport split
+  is gone, §5.1): `auto_accept_agent` (authorize + confirm + authorize-service →
+  `DisplayYesNo`, `accept`) and
   `interactive_agent` (every callback → `KeyboardDisplay`, `prompt`). Registered
   in `main::run`, keeping the handle alive for the process. The capability is a
   side effect of the callback set, so a unit test pins it (§5).
