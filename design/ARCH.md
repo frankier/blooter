@@ -21,7 +21,8 @@ configuration-file and adapter-setup support. The source is organized as:
 | `report.rs` | Session state and event → HID-report translation, including pointer accumulation (§5, §7). |
 | `keymap.rs` | Linux keycode ↔ HID usage tables and gamepad button/axis codes (§7.2, §7.4). |
 | `config.rs` | TOML configuration: hotkey chords, gamepad and pointer options (§10). |
-| `state.rs` | Per-host record of the descriptor each host bonded under (CONNECTION.md §7). |
+| `state.rs` | Per-host record of the descriptor and transport each host bonded under (CONNECTION.md §7, §8.5). |
+| `divergence.rs` | Noticing that the two halves of a bond no longer agree, and saying so — startup audit and runtime watch, never repair (CONNECTION.md §8). |
 | `setup.rs` | Adapter class/name/SSP setup and the interactive host menu (§10). |
 
 The report *bytes* (`report.rs`) and the whole input pipeline are transport-agnostic; only delivery and discovery differ between Classic and LE. The transport is chosen by the `[connection] protocol` config key — `"ble"` (default) or `"classic"` (§4, §10).

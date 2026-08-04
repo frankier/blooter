@@ -8,9 +8,17 @@
 //! force at each host's last session lets blooter mark such hosts stale and
 //! offer the "fix connection" action rather than silently misbehaving.
 //!
-//! The file is one `<address> <fingerprint>` line per host; unparsable lines are
-//! skipped, and every failure is non-fatal (the feature degrades to "no stale
-//! markers", never to a startup error).
+//! The transport each bond was made over is recorded here too, because
+//! bluetoothd does not expose it: a bond is a link key on Classic and an LTK on
+//! BLE, neither carries over to the other, and a host bonded under the wrong one
+//! can never connect (design/CONNECTION.md §8.1). Knowing which is what lets
+//! that be said at startup rather than waited out.
+//!
+//! The file is one `<address> <fingerprint> [protocol]` line per host;
+//! unparsable lines are skipped, a line without the third field reads as "the
+//! transport is not known" (a file written by an older blooter), and every
+//! failure is non-fatal (the feature degrades to "no stale markers", never to a
+//! startup error).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -18,12 +26,24 @@ use std::path::PathBuf;
 use bluer::Address;
 use log::debug;
 
-/// Descriptor fingerprints of the hosts blooter has connected to, keyed by
-/// address. Loaded at startup and rewritten whenever an entry changes.
+use crate::config::Protocol;
+
+/// What blooter remembers about one host between runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Record {
+    /// The descriptor fingerprint in force at that host's last session.
+    pub fingerprint: u32,
+    /// The transport its bond was made over; `None` for a record written before
+    /// this was tracked, which is never reported as a mismatch.
+    pub protocol: Option<Protocol>,
+}
+
+/// What blooter knows about the hosts it has connected to, keyed by address.
+/// Loaded at startup and rewritten whenever an entry changes.
 #[derive(Default)]
 pub struct Hosts {
     path: Option<PathBuf>,
-    map: HashMap<Address, u32>,
+    map: HashMap<Address, Record>,
 }
 
 /// `$XDG_STATE_HOME/blooter/hosts`, else `$HOME/.local/state/blooter/hosts`,
@@ -53,9 +73,14 @@ impl Hosts {
         Hosts { path, map }
     }
 
-    /// Record (and persist) the fingerprint `addr` is now bonded under.
-    pub fn set(&mut self, addr: Address, fingerprint: u32) {
-        if self.map.insert(addr, fingerprint) != Some(fingerprint) {
+    /// Record (and persist) the fingerprint and transport `addr` is now bonded
+    /// under.
+    pub fn set(&mut self, addr: Address, fingerprint: u32, protocol: Protocol) {
+        let record = Record {
+            fingerprint,
+            protocol: Some(protocol),
+        };
+        if self.map.insert(addr, record) != Some(record) {
             self.save();
         }
     }
@@ -75,11 +100,20 @@ impl Hosts {
         let mut stale: Vec<Address> = self
             .map
             .iter()
-            .filter(|(_, fp)| **fp != current)
+            .filter(|(_, r)| r.fingerprint != current)
             .map(|(addr, _)| *addr)
             .collect();
         stale.sort_by_key(|a| a.0); // stable order for logs and menu markers
         stale
+    }
+
+    /// Every record, in the same stable address order `stale` and `addresses`
+    /// give. The startup audit walks these against bluetoothd's bonds
+    /// (design/CONNECTION.md §8.2).
+    pub fn records(&self) -> Vec<(Address, Record)> {
+        let mut records: Vec<(Address, Record)> = self.map.iter().map(|(a, r)| (*a, *r)).collect();
+        records.sort_by_key(|(a, _)| a.0);
+        records
     }
 
     /// Every host with a record, whatever its fingerprint. The BLE menu unions
@@ -96,8 +130,12 @@ impl Hosts {
     fn save(&self) {
         let Some(path) = &self.path else { return };
         let mut text = String::new();
-        for (addr, fp) in &self.map {
-            text.push_str(&format!("{addr} {fp:08x}\n"));
+        for (addr, r) in &self.map {
+            text.push_str(&format!("{addr} {:08x}", r.fingerprint));
+            if let Some(p) = r.protocol {
+                text.push_str(&format!(" {}", protocol_name(p)));
+            }
+            text.push('\n');
         }
         let res = path
             .parent()
@@ -109,14 +147,34 @@ impl Hosts {
     }
 }
 
-/// Parse `<address> <hex fingerprint>` lines, skipping anything malformed.
-fn parse(text: &str) -> HashMap<Address, u32> {
+/// The name a transport is written under, and read back by [`parse`].
+pub fn protocol_name(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::Classic => "classic",
+        Protocol::Ble => "ble",
+    }
+}
+
+/// Parse `<address> <hex fingerprint> [protocol]` lines, skipping anything
+/// malformed. A missing or unrecognised protocol field reads as "not known",
+/// which is how a file written by an older blooter parses.
+fn parse(text: &str) -> HashMap<Address, Record> {
     text.lines()
         .filter_map(|line| {
-            let (addr, fp) = line.split_once(' ')?;
+            let mut fields = line.split_whitespace();
+            let addr = fields.next()?.parse().ok()?;
+            let fingerprint = u32::from_str_radix(fields.next()?, 16).ok()?;
+            let protocol = match fields.next() {
+                Some("classic") => Some(Protocol::Classic),
+                Some("ble") => Some(Protocol::Ble),
+                _ => None,
+            };
             Some((
-                addr.trim().parse().ok()?,
-                u32::from_str_radix(fp.trim(), 16).ok()?,
+                addr,
+                Record {
+                    fingerprint,
+                    protocol,
+                },
             ))
         })
         .collect()
@@ -130,20 +188,41 @@ mod tests {
         Address::new([0, 0, 0, 0, 0, n])
     }
 
+    fn record(fingerprint: u32) -> Record {
+        Record {
+            fingerprint,
+            protocol: None,
+        }
+    }
+
     #[test]
     fn parses_and_skips_junk() {
-        let map =
-            parse("00:00:00:00:00:01 deadbeef\nnonsense\n\n00:00:00:00:00:02 0000000f\nzz ff\n");
+        let map = parse(
+            "00:00:00:00:00:01 deadbeef classic\nnonsense\n\n\
+             00:00:00:00:00:02 0000000f ble\nzz ff\n",
+        );
         assert_eq!(map.len(), 2);
-        assert_eq!(map[&addr(1)], 0xdead_beef);
-        assert_eq!(map[&addr(2)], 0x0f);
+        assert_eq!(map[&addr(1)].fingerprint, 0xdead_beef);
+        assert_eq!(map[&addr(1)].protocol, Some(Protocol::Classic));
+        assert_eq!(map[&addr(2)].fingerprint, 0x0f);
+        assert_eq!(map[&addr(2)].protocol, Some(Protocol::Ble));
+    }
+
+    #[test]
+    fn a_line_without_a_transport_is_unknown_not_a_mismatch() {
+        // What a file written by an older blooter looks like: the fingerprint
+        // still applies, the transport is simply not known, and "unknown" must
+        // never be reported as bonded over the wrong one.
+        let map = parse("00:00:00:00:00:01 deadbeef\n00:00:00:00:00:02 0f nonsense\n");
+        assert_eq!(map[&addr(1)], record(0xdead_beef));
+        assert_eq!(map[&addr(2)], record(0x0f));
     }
 
     #[test]
     fn stale_lists_only_mismatches() {
         let mut hosts = Hosts::default();
-        hosts.map.insert(addr(1), 1);
-        hosts.map.insert(addr(2), 2);
+        hosts.map.insert(addr(1), record(1));
+        hosts.map.insert(addr(2), record(2));
         let stale = hosts.stale(2);
         assert_eq!(stale, vec![addr(1)]);
         // A host with no record is unknown, not stale.
@@ -152,9 +231,25 @@ mod tests {
     }
 
     #[test]
+    fn set_records_the_transport() {
+        let mut hosts = Hosts::default();
+        hosts.set(addr(1), 7, Protocol::Ble);
+        assert_eq!(
+            hosts.records(),
+            vec![(
+                addr(1),
+                Record {
+                    fingerprint: 7,
+                    protocol: Some(Protocol::Ble),
+                }
+            )]
+        );
+    }
+
+    #[test]
     fn forget_drops_the_record() {
         let mut hosts = Hosts::default();
-        hosts.map.insert(addr(1), 7);
+        hosts.map.insert(addr(1), record(7));
         hosts.forget(addr(1));
         assert!(!hosts.map.contains_key(&addr(1)));
     }

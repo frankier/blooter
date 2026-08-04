@@ -6,6 +6,7 @@
 mod agent;
 mod cli;
 mod config;
+mod divergence;
 mod input;
 mod keymap;
 mod menu;
@@ -252,6 +253,9 @@ async fn run(args: cli::Args) -> Result<(), AppError> {
     // The adapter identity we took over (alias, and on BLE the Class of Device
     // and BR/EDR discoverability), restored on exit (design/CONNECTION.md §4.1).
     let mut identity_reset: Option<setup::Identity> = None;
+    // The adapter the §8 divergence checks run against, kept out of whichever
+    // transport takes ownership of it below (design/CONNECTION.md §8.2).
+    let audit_adapter: Option<bluer::Adapter>;
     let transport = match cfg.protocol {
         config::Protocol::Classic => {
             profile_task = register_profile(&session, &args, layout).await?;
@@ -300,6 +304,7 @@ async fn run(args: cli::Args) -> Result<(), AppError> {
             // accept cycle; its pick runs concurrently with the accept loop and
             // an incoming connection can preempt it (design/CONNECTION.md §3.2, §6).
             let target = initiate_target(adapter.as_ref(), configured_target).await;
+            audit_adapter = adapter.clone();
             AnyTransport::Classic(
                 Classic::bind(
                     target,
@@ -338,6 +343,7 @@ async fn run(args: cli::Args) -> Result<(), AppError> {
                      host. Pair from the host, and it will reconnect by itself."
                 );
             }
+            audit_adapter = Some(adapter.clone());
             AnyTransport::Le(
                 Le::new(
                     adapter,
@@ -351,6 +357,19 @@ async fn run(args: cli::Args) -> Result<(), AppError> {
             )
         }
     };
+
+    // What blooter owes the user when the two halves of a bond disagree
+    // (design/CONNECTION.md §8.2): said *before* the "ready" line, so a setup
+    // that cannot work is never presented as one that is merely waiting. The
+    // watcher then covers the damage that happens while blooter is running.
+    divergence::audit(audit_adapter.as_ref(), cfg.protocol, &hosts).await;
+    if let Some(adapter) = &audit_adapter {
+        tokio::spawn(divergence::watch(
+            adapter.clone(),
+            hosts.clone(),
+            cfg.protocol,
+        ));
+    }
 
     println!("The HID-Client is now ready to accept connections from another machine");
 

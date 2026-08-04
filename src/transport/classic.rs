@@ -360,9 +360,14 @@ impl Transport for Classic {
                 self.ctrl = Some(ctrl_sock);
                 self.intr = Some(intr_sock);
                 self.peer = Some(peer);
-                // Remember which descriptor this host is now bonded under, so a
-                // later change to it can be detected (§7).
-                self.hosts.lock().unwrap().set(peer, self.descriptor_fp);
+                // Remember which descriptor — and which transport — this host is
+                // now bonded under, so a later change to either can be detected
+                // (§7, §8.2).
+                self.hosts.lock().unwrap().set(
+                    peer,
+                    self.descriptor_fp,
+                    crate::config::Protocol::Classic,
+                );
                 // A link is up (either direction): stop initiating so an
                 // intentional drop or a link loss does not immediately redial
                 // (design/CONNECTION.md §3.2). The host can dial back, or restart
@@ -437,6 +442,15 @@ impl Transport for Classic {
         let peer = self.peer.take();
         if unplugged && let Some(addr) = peer {
             info!("{addr} unplugged us (virtual cable); dropping our bond to match");
+            // The line above is an account of what blooter did; this one is the
+            // thing the user has to be told (design/CONNECTION.md §8.2). An
+            // unplug is the one place a host's decision to forget blooter
+            // actually reaches us, so it is said plainly rather than left to be
+            // inferred from a connection that silently stops working.
+            warn!(
+                "{addr} has removed blooter — it no longer knows us, so it will not connect. \
+                 Pair again from that host's Bluetooth settings."
+            );
             self.unbond(addr).await;
         }
         flow

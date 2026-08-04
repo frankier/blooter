@@ -763,11 +763,55 @@ on two genuinely separate machines, and three things are asserted per row: the
 symptom, the detection §8.2 owes the user, and — the one that matters — that
 performing exactly the steps blooter printed ends at a working keyboard.
 
-The detection assertions are marked expected-fail, because §8.2 is a commitment
-and not yet an implementation. **When it is implemented, those markers come
-off**; the suite reports an expected-fail that starts passing as `XPASS`
-precisely so the work gets noticed. The symptom and remedy assertions in the
-same rows pass today.
+The detection assertions were marked expected-fail for as long as §8.2 was a
+commitment and not an implementation, so that the suite would report an
+expected-fail that started passing as `XPASS` and the work would get noticed.
+`divergence.rs` is what retired them, and D1, D2, D6 and D7 are ordinary
+assertions now. What is still expected-fail-shaped, and simply not written,
+is the rest of §8.2.1: the duplicate-instance check, `input` group membership
+under `-x`, and the missing `CAP_NET_ADMIN` case (§4.1).
+
+### 8.5 Where the signals actually come from
+
+`divergence.rs`, in two entry points, because the facts arrive at two different
+times. Worth writing down because the strength of the four signals differs, and
+one of them is not a signal at all.
+
+**At startup (`audit`), entirely local.** Two checks, both against the record
+`state.rs` keeps per host:
+
+- **The transport of each bond against `[connection] protocol`.** bluetoothd
+  does not expose which bearer a bond was made over, so blooter records it
+  itself as the bond is made — the `hosts` file is `<address> <fingerprint>
+  <protocol>`, and a line without the third field (written by an older blooter)
+  reads as "not known" and is never reported as a mismatch. This is the check
+  §8.2.1 calls the one that matters most, and it is exact.
+- **A recorded host bluetoothd no longer holds a bond for.** Our half went away
+  — a wipe, a `bluetoothctl remove` here, a reinstall — while the host's half
+  almost certainly did not, and a host holding a key for a peer that has
+  forgotten it cannot reconnect on either transport.
+
+**While running (`watch`), from bluetoothd's device events.** Three, in
+descending order of how much they know:
+
+1. **Our half disappears under us.** `Paired` goes false, or the device object
+   is removed. Certain. Removals blooter performed itself are silent, because
+   `[u]` and `[f]` drop the state record *before* the bond, so the record is
+   already gone when the event lands.
+2. **A link that will not stay up.** A bonded host whose connection dies within
+   a few seconds did not fail to connect; it failed to *encrypt*, which is what
+   a host that no longer has the key looks like from here. Real, but only
+   available when the host still tries.
+3. **Nothing at all.** On BLE, a host deleting blooter from its Bluetooth
+   settings sends nothing — SMP has no "I have forgotten you" — and a central
+   that no longer knows blooter never dials it again. Silence is the entire
+   symptom. §8's principle is precisely that silence must not keep being
+   reported as "advertising as blooter", so after a stretch of holding bonds
+   with nothing connected, blooter says what that may mean and how to act on it.
+   This is an inference and is phrased as the conditional it is — it is the one
+   place in §8 where blooter is reasoning rather than observing.
+
+Nothing here repairs anything, per §8.2 point 4.
 
 ## 9. Scenario matrix
 
@@ -824,12 +868,19 @@ by transport, and has to (§5.1).
   spawn/cancel/join handle.
 - **`transport/mod.rs`** — the dial backoff constants, used by Classic's
   initiator path (BLE has none).
-- **`state.rs`** — the per-host descriptor-fingerprint file backing §7.1, plus
-  `addresses()` for the BLE menu's union (§6).
+- **`state.rs`** — the per-host `<address> <fingerprint> <protocol>` file backing
+  §7.1 and the transport check of §8.5, plus `addresses()` for the BLE menu's
+  union (§6) and `records()` for the startup audit.
+- **`divergence.rs`** — §8 detection, never repair: `audit` at startup (bond
+  transport vs configured protocol, recorded hosts with no bond behind them) and
+  `watch` for the life of the process (our half removed out of band, a link that
+  dies at encryption, and the idle advisory that covers BLE's silence). §8.5.
 - **`setup.rs`** — adapter identity: the mgmt class/name/SSP guard, `take_alias`
   (both transports) and `apply_ble_identity` (the `[ble] advertise` policy,
   §4.1). Restored on exit.
-- **`main.rs`** — resolve the pairing mode against the TTY right after loading
+- **`main.rs`** — run `divergence::audit` before the "ready to accept" line and
+  spawn `divergence::watch` for the process's life (§8.5); resolve the pairing
+  mode against the TTY right after loading
   the config (so `prompt` without one exits early); register the agent for the
   configured protocol; power/pairable the adapter, take over its identity, and
   (Classic) make it discoverable, all restored on exit; resolve a bonded

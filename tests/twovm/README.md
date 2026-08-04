@@ -127,12 +127,12 @@ and nothing asserts on rendering. The TUI itself remains `tests/termdbus`'s job.
 Every scenario has exactly one host in the menu, so row 0 is already selected and
 `[f]`/`[u]` need no navigation.
 
-**Expected failures are part of the specification.** CONNECTION.md §8.2 is a
-design commitment that is not yet fully implemented. Its detection assertions are
-written here and marked `xfail` rather than omitted (design/TESTS.md §6.1) — they
-are §8's executable form, and an xfail that starts passing is reported as `XPASS`
-so the marker gets removed. The symptom and remedy assertions in the same rows
-pass today and guard against regression meanwhile.
+**Expected failures are part of the specification.** CONNECTION.md §8.2 was a
+design commitment before it was an implementation, and its detection assertions
+were written here and marked `xfail` rather than omitted (design/TESTS.md §6.1) —
+they are §8's executable form, and an xfail that starts passing is reported as
+`XPASS` so the marker gets removed. That is how the D1/D2/D6/D7 detection rows
+became ordinary assertions; write the next one the same way.
 
 ## Reading a failure
 
@@ -225,6 +225,17 @@ behaviours no other suite can see:
   regardless. It is also the truer model of the reboot J4 stands in for. If the
   bridge does go, `restart_daemon` rebuilds it and says so, so one lost radio
   costs one test rather than the rest of the run.
+- **"Genuinely unpaired" was a bond store short.** `reset` wiped both bond
+  stores between rows but not blooter's *own* record of the hosts it has bonded
+  with (`state.rs`), and a record left behind by the previous row is precisely
+  the divergence §8.2 exists to report: our half missing, the host's presumably
+  not. So the moment the detection of CONNECTION.md §8.5 landed, the next row's
+  blooter announced it at startup, before that row had damaged anything, and
+  D2, D6 and D7 went green in nine seconds each on the *previous* row's
+  leftovers. `reset` calls `dev.wipe_state()` now. The general shape is worth
+  keeping in mind when adding a row: a suite whose whole subject is state that
+  outlives a process has to enumerate *every* place that state lives, and
+  "unbond both adapters" is only two of the three here.
 
 ## Deliberate deviations from design/TESTS.md
 
@@ -274,6 +285,6 @@ def test_something(t, protocol):
 ```
 
 Every test starts from genuinely unpaired adapters: the runner wipes both bond
-stores before each one. There is no `btmgmt pair` preamble anywhere in this
+stores — and blooter's own host record — before each one. There is no `btmgmt pair` preamble anywhere in this
 suite — that preamble is exactly what `tests/btvirt` has to do, and exactly why
 it can never test the bond.

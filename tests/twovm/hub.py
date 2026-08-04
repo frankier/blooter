@@ -276,6 +276,9 @@ class DevVm(Vm):
     def state_hosts(self):
         return self.call("state_hosts")
 
+    def wipe_state(self):
+        return self.call("wipe_state")
+
     # -- uinput -------------------------------------------------------------
 
     def make_uinput(self, keyboard_keys, mouse_keys, mouse_rels):
@@ -635,7 +638,10 @@ def reset(dev, host):
 
     Every scenario in §5 and §6 starts from unbonded adapters -- there is no
     `btmgmt pair` preamble anywhere in this suite, because the bond is the thing
-    under test.
+    under test. blooter's own record of the hosts it has bonded with goes too:
+    leaving it behind is leaving a one-sided bond behind, which the §8.2
+    detection reports at the next startup, and every detection row would then be
+    satisfied by the previous row's leftovers rather than by its own damage.
     """
     dev.stop_blooter()
     try:
@@ -647,6 +653,7 @@ def reset(dev, host):
     dev.ensure_radio()
     host.ensure_radio()
     dev.unbond_all()
+    dev.wipe_state()
     host.unbond_all()
     host.start_agent()
 

@@ -407,7 +407,10 @@ impl Le {
     async fn connected(&self) -> Accept {
         let peer = self.peer().await;
         if let Some(addr) = peer {
-            self.hosts.lock().unwrap().set(addr, self.descriptor_fp);
+            self.hosts
+                .lock()
+                .unwrap()
+                .set(addr, self.descriptor_fp, crate::config::Protocol::Ble);
         }
         Accept::Connected(peer.map_or_else(|| "BLE host".to_string(), |a| a.to_string()))
     }

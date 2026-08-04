@@ -227,12 +227,16 @@ effect but is run on both to prove BLE is unaffected.
 
 ### 6.1 A note on what "detection" may assert today
 
-CONNECTION.md §8.2 is a design commitment, not yet fully implemented. The
-detection assertions should be written **now and allowed to fail**, marked
+CONNECTION.md §8.2 was a design commitment before it was an implementation, and
+the detection assertions were written **then and allowed to fail**, marked
 expected-fail, rather than omitted — they are the specification of §8, and an
-expected-fail that starts passing is how the work gets recognised as done. The
-symptom and remedy assertions in the same rows pass today and guard against
-regression meanwhile.
+expected-fail that starts passing is how the work gets recognised as done. That
+is exactly how it went: `src/divergence.rs` (CONNECTION.md §8.5) turned D1, D2,
+D6 and D7's detection rows into ordinary assertions.
+
+The policy stands for whatever §8.2 still owes — the duplicate-instance check,
+`input` group membership under `-x`, `CAP_NET_ADMIN`. Write the row, mark it
+expected-fail, and let the `XPASS` be what announces the work.
 
 ## 7. Harness
 

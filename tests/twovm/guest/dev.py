@@ -287,6 +287,7 @@ class DevAgent(RoleAgent):
             "frame": self.frame,
             "remove_bond": self.remove_bond,
             "state_hosts": self.state_hosts,
+            "wipe_state": self.wipe_state,
             "make_uinput": self.make_uinput,
             "uinput_key": self.uinput_key,
             "uinput_rel": self.uinput_rel,
@@ -451,10 +452,30 @@ class DevAgent(RoleAgent):
         """
         return self.shell(["bluetoothctl", "remove", address], timeout=20.0)
 
+    def _state_path(self):
+        return os.path.join(rundir(), "state", "blooter", "hosts")
+
     def state_hosts(self):
-        """blooter's per-host descriptor fingerprints (CONNECTION.md §7.1)."""
-        path = os.path.join(rundir(), "state", "blooter", "hosts")
-        return _read(path)
+        """blooter's per-host record: descriptor fingerprint and bond transport
+        (CONNECTION.md §7.1, §8.5)."""
+        return _read(self._state_path())
+
+    def wipe_state(self):
+        """Forget every host blooter remembers -- part of `reset`.
+
+        Unbonding both adapters is not enough to start a scenario from
+        genuinely unpaired. blooter keeps its *own* record of the hosts it has
+        bonded with, and a record left behind by the previous test is a bond
+        blooter's half of which is now missing -- exactly the divergence §8.2
+        exists to report, so the next test's blooter announces it at startup
+        before that test has done anything. Every detection row would then be
+        satisfied by the *previous* row's leftovers.
+        """
+        try:
+            os.remove(self._state_path())
+        except FileNotFoundError:
+            pass
+        return True
 
     # -- teardown -----------------------------------------------------------
 

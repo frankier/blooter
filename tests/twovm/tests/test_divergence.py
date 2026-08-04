@@ -8,10 +8,10 @@ Three things are asserted per row, and the third is the one that matters:
 
 1. **The symptom**, so a regression that changes the failure mode is caught.
 2. **Detection** -- blooter notices and says which host and which problem
-   (CONNECTION.md §8.2). Those assertions are marked `xfail` (§6.1): §8.2 is a
-   design commitment that is not yet fully implemented, and writing them now
-   makes the section executable rather than aspirational. An xfail that starts
-   passing is how the work gets recognised as done.
+   (CONNECTION.md §8.2). These were `xfail` for as long as §8.2 was a design
+   commitment rather than an implementation (§6.1), which is what made the
+   section executable rather than aspirational; `src/divergence.rs` is what
+   retired the markers.
 3. **The remedy works** -- perform exactly the steps blooter printed and end at
    a working keyboard and mouse. *This is the assertion that keeps blooter's
    advice honest*: a message telling the user to do something that does not fix
@@ -179,7 +179,7 @@ def test_d1_host_removes_bond_ble_muted(t):
     t.expect_working_input()
 
 
-@both_transports(xfail="CONNECTION.md §8.2 detection is not implemented yet")
+@both_transports
 def test_d1_detection(t, protocol):
     """blooter must name the host and the problem, not sit there saying it is
     advertising (CONNECTION.md §8.2: *a setup that cannot work should never
@@ -243,7 +243,7 @@ def test_d2_dev_removes_bond(t, protocol):
     t.expect_working_input()
 
 
-@both_transports(xfail="CONNECTION.md §8.2 detection is not implemented yet")
+@both_transports
 def test_d2_detection(t, protocol):
     """A host that holds a key blooter no longer has must be named, with the
     host-side remedy spelled out -- §8.2's "a repair the user cannot perform
@@ -364,7 +364,7 @@ def test_d6_dev_storage_wiped(t, protocol):
     t.expect_working_input()
 
 
-@tests.test(xfail="CONNECTION.md §8.2 detection is not implemented yet")
+@tests.test
 def test_d6_detection(t):
     """§8.2.1: check at startup, not on first failure. A blooter that starts
     with no bonds at all where hosts are expecting one has everything it needs
@@ -416,7 +416,7 @@ def test_d7_transport_switch_invalidates_bonds(t):
         f"the new bond is not an LE bond, so the transport did not really change: {bond}"
 
 
-@tests.test(xfail="CONNECTION.md §8.2 detection is not implemented yet")
+@tests.test
 def test_d7_detection(t):
     """§8.2.1's headline check: *every bonded host's transport matching the
     configured protocol*. It is entirely local -- blooter knows the configured
