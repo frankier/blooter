@@ -364,11 +364,16 @@ cannot register them, only change the database they describe.
   wire bytes of §5; the id selects the characteristic, the remainder is the
   notification value). Notifications are best-effort/unacknowledged, matching the
   classic interrupt-channel semantics.
-- **Connection tracking:** a host is "connected" once it subscribes to any Report
-  characteristic's CCCD. On the first connect blooter pushes initial zeroed
-  reports so the host has state; `send_report` no-ops for any report the host has
-  not subscribed to. The session ends when the last subscription is dropped
-  (unsubscribe or link loss).
+- **Connection tracking:** a host is "connected" once it has *both* a link up
+  (`Device.Connected`, watched on D-Bus) and a subscription to any Report
+  characteristic's CCCD. Both halves are needed because neither implies the
+  other: the link comes up well before the host subscribes, and a *bonded* host's
+  subscription outlives its link — bluetoothd preserves the CCC state across a
+  disconnect and restores it on reconnect, and so never calls `StopNotify`
+  (`att_disconnected` in bluez's `src/gatt-database.c`). On connect blooter
+  pushes initial zeroed reports so the host has state; `send_report` no-ops for
+  any report the host has not subscribed to. The session ends when the link drops
+  or the last subscription is dropped.
 - **Initiating a connection: blooter does not, and cannot.** HOGP puts the HID
   device in the GAP Peripheral role, so only the host can open the link or start
   pairing; a connectable advertisement is blooter's whole half of reconnecting.

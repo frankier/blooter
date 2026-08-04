@@ -167,13 +167,28 @@ behaviours no other suite can see:
   the cache not being refreshed or the gamepad collection simply not producing
   a separate input device is not yet established. The assertion is left failing
   rather than weakened, because it is the one D8 exists to make.
-- **A BLE link that drops without a CCCD unsubscribe leaves the session open.**
-  `test_disconnect_then_reconnect_ble` and the BLE `[u]` remedy both fail on
-  this: after the host disconnects, blooter logs nothing, never returns to
-  `wait_connected`, and so neither re-advertises nor re-opens the menu. This is
-  a suspected blooter bug rather than a harness artifact — Classic recovers from
-  the identical sequence — but it has not been root-caused, and the failing
-  tests are left failing rather than adjusted to pass.
+- **A BLE link that drops without a CCCD unsubscribe left the session open** —
+  found by `test_disconnect_then_reconnect_ble` and the BLE `[u]` remedy, and
+  the clearest case for the suite existing at all: after the host disconnected,
+  blooter logged nothing, never returned to `wait_connected`, and so neither
+  re-advertised nor re-opened the menu, while Classic recovered from the
+  identical sequence. The cause was that the LE transport took a CCCD
+  subscription as proof of a link. It is not one: bluetoothd calls `StopNotify`
+  — the only thing that ends bluer's notification session — when a CCCD is
+  written to zero, or when it tears down the CCC state of a device that went
+  away, and for a *bonded* device it deliberately does neither
+  (`att_disconnected` in bluez's `src/gatt-database.c` returns before
+  `clear_ccc_state`, so the subscription survives the disconnect and is restored
+  on the next connection). HOGP links are always bonded, so blooter's
+  disconnected edge could never fire. `Le::watch_links` now supplies the other
+  half of the edge from bluetoothd's own `Device.Connected`, and a session ends
+  when the link goes rather than when the subscription does. Six BLE rows went
+  green with it (`disconnect_then_reconnect`, `d3`, `d4`, `d5`, `d6`, `d9`), and
+  the two that still fail — `d1_host_removes_bond_ble` and
+  `d8_stale_descriptor_ble_advice` — now fail *past* the disconnect: the menu
+  re-opens and takes the key, and what defeats them is the first bullet above,
+  a bonded central reconnecting on its own before the key is pressed. Making
+  `t.host.disconnect()` keep the host away is a harness change, not a blooter one.
 
 ## Deliberate deviations from design/TESTS.md
 

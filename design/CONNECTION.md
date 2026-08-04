@@ -158,17 +158,35 @@ Resolved design points:
 ## 4. BLE link establishment
 
 BLE has no accept syscall: the host connects at the GATT layer and blooter is
-"connected" once it subscribes to any Report characteristic's CCCD, disconnected
-when the last subscription drops (`transport/le.rs`, design/ARCH.md §4.2).
+"connected" once it holds *both* a link and a subscription to any Report
+characteristic's CCCD, disconnected when either goes (`transport/le.rs`,
+design/ARCH.md §4.2).
 
 ```mermaid
 stateDiagram-v2
     [*] --> Advertising
-    Advertising --> Subscribed: first CCCD subscribe (subscribers 0→1)
-    Subscribed --> Subscribed: subscribe/unsubscribe (more reports)
-    Subscribed --> Advertising: last CCCD drop (subscribers 1→0) / link loss
+    Advertising --> Linked: Device.Connected → true
+    Linked --> Advertising: link drops
+    Linked --> Session: first CCCD subscribe
+    Session --> Session: subscribe/unsubscribe (more reports)
+    Session --> Linked: last CCCD drop
+    Session --> Advertising: link drops (subscription is kept)
     Advertising --> Shutdown: signal / exit hotkey
 ```
+
+**The subscription is not the link, and tracking only it was a real bug.** A
+CCCD subscription looks like the natural connectedness signal, but it does not
+end when the link does: bluetoothd calls `StopNotify` on a CCCD write of zero,
+or when it tears down the CCC state of a device that went away — and for a
+*bonded* device it deliberately does neither, keeping the subscription across the
+disconnect and restoring it on the next connection (`att_disconnected` in bluez's
+`src/gatt-database.c` returns before `clear_ccc_state`; the same restoration §7.2b
+relies on). HOGP links are always bonded, so a host that just goes away — sleeps,
+or walks out of range — used to leave blooter in `run_session` forever, neither
+re-advertising nor re-opening the menu. `Le::watch_links` supplies the link half
+of the edge from `Device.Connected`; keeping the notifiers registered meanwhile
+matches what bluetoothd does with the CCC state, since a reconnecting host is
+under no obligation to re-write a CCCD it knows is persisted.
 
 **There is no initiator path, and there must not be one.** This is the one place
 where BLE is not a mirror of Classic, and the asymmetry is structural rather
@@ -491,7 +509,7 @@ stateDiagram-v2
     MenuNav --> Waiting: refreshed list
     Waiting --> Fixing: [f] on a bonded host
     Waiting --> Forgetting: [u] on a bonded host
-    Waiting --> Incoming: a host subscribes to a Report CCCD
+    Waiting --> Incoming: a host connects and subscribes to a Report CCCD
     Waiting --> Skipped: [q] / Enter / closed
 
     Fixing --> Waiting: Service Changed, or advice if it is away (§7.2b)
@@ -770,8 +788,9 @@ by transport, and has to (§5.1).
   link, and an incoming connection preempts an open menu.
 - **`transport/le.rs`** — acceptor only: no target, no `connect`, no backoff.
   Holds the interactive flag, the `TermCoord` and the shared `state::Hosts`;
-  `wait_connected` spawns the menu each cycle and waits on the CCCD subscribe
-  beside it (§4), recording the fingerprint of each host that subscribes and
+  `wait_connected` spawns the menu each cycle and waits beside it on the
+  link-plus-subscription edge that `watch_links` and the notify callbacks feed
+  (§4), recording the fingerprint of each host that subscribes and
   performing `[f]` (`fix_host`, connected hosts only) or `[u]` (`forget_host`)
   once the menu task is joined (§7.2b).
 - **`menu.rs`** — the interactive `crossterm` TUI, in two shapes (§6). Classic:

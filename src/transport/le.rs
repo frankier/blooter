@@ -3,7 +3,10 @@
 //! and pushes input reports as GATT notifications on per-report characteristics.
 //! See design/ARCH.md §4.2, §7.
 //!
-//! A host is "connected" once it subscribes to a Report characteristic's CCCD.
+//! A host is "connected" once it has both a link up and a subscription to a
+//! Report characteristic's CCCD. Both halves are needed: bluetoothd preserves a
+//! bonded host's subscription across a disconnect, so the subscription alone
+//! never ends — see the note on [`Shared`].
 //!
 //! Unlike Classic, this transport is **purely an acceptor**. HOGP puts the HID
 //! device in the GAP Peripheral role and the host in the Central role, so the
@@ -12,9 +15,9 @@
 //! interactive menu is up as a manager for hosts already bonded — not as a
 //! picker (design/CONNECTION.md §4, §6).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bluer::adv::{Advertisement, AdvertisementHandle, Type};
@@ -23,9 +26,9 @@ use bluer::gatt::local::{
     CharacteristicNotifyMethod, CharacteristicRead, CharacteristicWrite, CharacteristicWriteMethod,
     Descriptor, DescriptorRead, Service,
 };
-use bluer::{Adapter, Address, Uuid, UuidExt};
-use futures::FutureExt;
-use log::{info, warn};
+use bluer::{Adapter, AdapterEvent, Address, Device, DeviceEvent, DeviceProperty, Uuid, UuidExt};
+use futures::{FutureExt, StreamExt};
+use log::{debug, info, warn};
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::time::sleep;
 
@@ -78,33 +81,94 @@ const CHURN_UUID: u128 = 0x626c_6f74_6572_4348_554e_0000_0000_0000;
 /// removing it, so each Service Changed indication reaches the host.
 const CHURN_SETTLE: Duration = Duration::from_secs(1);
 
-/// State shared between the GATT notify callbacks and [`Transport::send_report`].
-/// Maps each report id to the notification session opened when a host subscribes
-/// to that Report characteristic's CCCD, and tracks how many are active so the
-/// connected/disconnected edge can be signalled to the session loop.
+/// The two independent facts a HOGP session needs, and which together make up
+/// the `connected` edge the session loop waits on.
+///
+/// They have to be tracked separately because **neither one implies the other**:
+/// a bonded host's CCCD subscription outlives its link (see [`Shared`]), and a
+/// link is up well before the host subscribes.
+#[derive(Default)]
+struct Link {
+    /// A host has subscribed to at least one Report characteristic's CCCD.
+    subscribed: bool,
+    /// bluetoothd has a device with `Connected = true`.
+    up: bool,
+}
+
+/// State shared between the GATT notify callbacks, the link watcher and
+/// [`Transport::send_report`]. Maps each report id to the notification session
+/// opened when a host subscribes to that Report characteristic's CCCD, and
+/// tracks the link so the connected/disconnected edge can be signalled to the
+/// session loop.
+///
+/// **A subscription is not a link.** bluetoothd only calls `StopNotify` — the
+/// only thing that resolves bluer's [`CharacteristicNotifier::stopped`] — when a
+/// CCCD is written to zero, or when it tears down the CCC state of a device that
+/// went away. For a *bonded* device it deliberately does neither: bluez's
+/// `att_disconnected` (`src/gatt-database.c`) returns before `clear_ccc_state`
+/// so the subscription is preserved across the disconnect and restored on the
+/// next connection. HOGP links are always bonded, so a host that simply drops
+/// the link — the ordinary case: it sleeps, or moves out of range — leaves the
+/// notification session looking wide open, and blooter used to sit in
+/// `run_session` forever, neither re-advertising nor re-opening the menu.
+///
+/// The remedy is [`Le::watch_links`], which supplies [`Link::up`] from
+/// bluetoothd's own `Device.Connected`. Keeping the notifiers *registered*
+/// meanwhile is deliberate and matches what bluez does with the CCC state: on
+/// reconnect the host is under no obligation to re-write a CCCD it knows is
+/// persisted, so the restored subscription is all either side has.
 struct Shared {
-    notifiers: Mutex<HashMap<u8, CharacteristicNotifier>>,
-    subscribers: AtomicUsize,
+    notifiers: Mutex<HashMap<u8, (u64, CharacteristicNotifier)>>,
+    /// Hands out a token per subscription, so a notifier's watcher only ever
+    /// retracts *its own* subscription (see [`Shared::subscribe`]).
+    next_token: AtomicU64,
+    link: std::sync::Mutex<Link>,
     connected_tx: watch::Sender<bool>,
 }
 
 impl Shared {
-    /// Record a new notification session for `report_id`, signalling
-    /// "connected" on the first subscription. Spawns a watcher that removes the
-    /// session (and signals "disconnected" when the last one goes) once the host
-    /// unsubscribes or drops the link.
+    /// Apply `f` to the link state and signal the session loop if that changed
+    /// whether a host is connected. Only real edges are sent, so a second
+    /// subscription during a live session wakes nobody.
+    fn update(&self, f: impl FnOnce(&mut Link)) {
+        let mut link = self.link.lock().unwrap();
+        f(&mut link);
+        let connected = link.subscribed && link.up;
+        self.connected_tx.send_if_modified(|c| {
+            if *c == connected {
+                false
+            } else {
+                *c = connected;
+                true
+            }
+        });
+    }
+
+    /// Record a new notification session for `report_id`. Spawns a watcher that
+    /// removes it once the host writes its CCCD back to zero — the *only* thing
+    /// this signals, per the note on [`Shared`]; a dropped link arrives through
+    /// [`Le::watch_links`] instead.
     async fn subscribe(self: &Arc<Self>, report_id: u8, notifier: CharacteristicNotifier) {
         let stopped = notifier.stopped();
-        self.notifiers.lock().await.insert(report_id, notifier);
-        if self.subscribers.fetch_add(1, Ordering::SeqCst) == 0 {
-            let _ = self.connected_tx.send(true);
-        }
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
+        self.notifiers.lock().await.insert(report_id, (token, notifier));
+        self.update(|l| l.subscribed = true);
+
         let this = self.clone();
         tokio::spawn(async move {
             stopped.await;
-            this.notifiers.lock().await.remove(&report_id);
-            if this.subscribers.fetch_sub(1, Ordering::SeqCst) == 1 {
-                let _ = this.connected_tx.send(false);
+            let mut notifiers = this.notifiers.lock().await;
+            // Re-subscribing to a report replaces its notifier, which drops
+            // bluez's end of the old one and so fires the old `stopped()`. The
+            // token check keeps that from retracting the live subscription.
+            if notifiers.get(&report_id).is_some_and(|(t, _)| *t == token) {
+                notifiers.remove(&report_id);
+                let empty = notifiers.is_empty();
+                drop(notifiers);
+                if empty {
+                    debug!("host unsubscribed from every report");
+                    this.update(|l| l.subscribed = false);
+                }
             }
         });
     }
@@ -113,11 +177,24 @@ impl Shared {
     /// when the host has not subscribed to that report (design/ARCH.md §4.2).
     async fn notify(&self, report_id: u8, payload: &[u8]) {
         let mut notifiers = self.notifiers.lock().await;
-        if let Some(n) = notifiers.get_mut(&report_id)
+        if let Some((_, n)) = notifiers.get_mut(&report_id)
             && n.notify(payload.to_vec()).await.is_err()
         {
             notifiers.remove(&report_id);
+            if notifiers.is_empty() {
+                drop(notifiers);
+                self.update(|l| l.subscribed = false);
+            }
         }
+    }
+}
+
+/// Aborts the link watcher when the transport goes away.
+struct TaskGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -140,6 +217,8 @@ pub struct Le {
     descriptor_fp: u32,
     _app: ApplicationHandle,
     _adv: AdvertisementHandle,
+    /// Feeds `Link::up` from bluetoothd's `Device.Connected` (see [`Shared`]).
+    _links: TaskGuard,
 }
 
 impl Le {
@@ -165,9 +244,14 @@ impl Le {
         let (connected_tx, connected_rx) = watch::channel(false);
         let shared = Arc::new(Shared {
             notifiers: Mutex::new(HashMap::new()),
-            subscribers: AtomicUsize::new(0),
+            next_token: AtomicU64::new(0),
+            link: std::sync::Mutex::new(Link::default()),
             connected_tx,
         });
+        let _links = TaskGuard(tokio::spawn(Self::watch_links(
+            adapter.clone(),
+            shared.clone(),
+        )));
 
         let app = Application {
             services: vec![
@@ -207,7 +291,77 @@ impl Le {
             descriptor_fp,
             _app,
             _adv,
+            _links,
         })
+    }
+
+    /// Track whether *any* device has a link to us, and feed that to
+    /// [`Shared::update`] as [`Link::up`].
+    ///
+    /// This is the half of the connected edge a CCCD subscription cannot give
+    /// (see the note on [`Shared`]): bluetoothd keeps a bonded host's
+    /// subscription across a disconnect, so `Device.Connected` is the only
+    /// account of the link blooter gets. As a peripheral there is at most one
+    /// central at a time, so "some device is connected" is the whole question —
+    /// which also means the answer does not depend on identifying the host,
+    /// something a GATT notify callback has no way to do.
+    ///
+    /// If the event stream cannot be opened at all the watcher gives up with
+    /// `up` latched on, degrading to subscription-only detection rather than
+    /// wedging every session shut.
+    async fn watch_links(adapter: Adapter, shared: Arc<Shared>) {
+        let mut events = match adapter.events().await {
+            Ok(events) => events,
+            Err(e) => {
+                warn!("cannot watch device connections ({e}); a dropped link may go unnoticed");
+                shared.update(|l| l.up = true);
+                return;
+            }
+        };
+
+        // Each device gets a task streaming its properties; they report here so
+        // this loop holds the whole picture.
+        let (tx, mut rx) = mpsc::channel::<(Address, bool)>(16);
+        for addr in adapter.device_addresses().await.unwrap_or_default() {
+            if let Ok(device) = adapter.device(addr) {
+                tokio::spawn(watch_device(device, tx.clone()));
+            }
+        }
+
+        let mut up: HashSet<Address> = HashSet::new();
+        loop {
+            tokio::select! {
+                event = events.next() => match event {
+                    Some(AdapterEvent::DeviceAdded(addr)) => {
+                        if let Ok(device) = adapter.device(addr) {
+                            tokio::spawn(watch_device(device, tx.clone()));
+                        }
+                    }
+                    // Removal ends the device's own stream, which reports it.
+                    Some(_) => {}
+                    None => break, // adapter gone
+                },
+                Some((addr, connected)) = rx.recv() => {
+                    let was = !up.is_empty();
+                    if connected {
+                        up.insert(addr);
+                    } else {
+                        up.remove(&addr);
+                    }
+                    match (was, !up.is_empty()) {
+                        (false, true) => {
+                            debug!("{addr} connected");
+                            shared.update(|l| l.up = true);
+                        }
+                        (true, false) => {
+                            info!("the link to {addr} is down; ending the session");
+                            shared.update(|l| l.up = false);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 
     /// Best-effort address of a connected host. `None` when bluetoothd lists no
@@ -318,6 +472,33 @@ impl Le {
     }
 }
 
+/// Report one device's `Connected` transitions to [`Le::watch_links`] until the
+/// device is removed, which counts as a disconnection.
+///
+/// The stream is opened *before* the initial state is read, so a change racing
+/// startup is seen as an event rather than lost between the two.
+async fn watch_device(device: Device, tx: mpsc::Sender<(Address, bool)>) {
+    let addr = device.address();
+    let Ok(mut events) = device.events().await else {
+        return;
+    };
+    if tx
+        .send((addr, device.is_connected().await.unwrap_or(false)))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    while let Some(event) = events.next().await {
+        if let DeviceEvent::PropertyChanged(DeviceProperty::Connected(connected)) = event
+            && tx.send((addr, connected)).await.is_err()
+        {
+            return;
+        }
+    }
+    let _ = tx.send((addr, false)).await;
+}
+
 /// How a `wait_connected` cycle ended. Fixing and forgetting need `&mut self`,
 /// so they are performed once the select's borrows are gone.
 enum Done {
@@ -359,7 +540,7 @@ impl Transport for Le {
         std::time::Duration::from_millis(15)
     }
 
-    /// Wait for a host to subscribe to a Report characteristic's CCCD.
+    /// Wait for a host to have both a link up and a Report CCCD subscribed.
     ///
     /// There is nothing to race it against. blooter is the GAP Peripheral, so
     /// the host is the only side that can open the link; the advertisement
@@ -405,7 +586,7 @@ impl Transport for Le {
                     }
                     if *connected.borrow_and_update() {
                         if menu.is_open() {
-                            info!("a host subscribed; using it and closing the menu");
+                            info!("a host connected and subscribed; using it and closing the menu");
                         }
                         break Done::Accept(self.connected().await);
                     }
