@@ -17,13 +17,42 @@ See ../README.md for why a VM (and not a container) is required.
 
 import os
 import re
-import signal
 import socket
 import struct
 import subprocess
 import sys
-import time
-import traceback
+
+# tests/common lives two directories up; both integration suites import it from
+# their guest, where only this repo is mounted.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))))
+
+# Several of these are unused here and re-exported for test_connection.py,
+# which imports its whole vocabulary from this module.
+from common import (  # noqa: E402,F401  (path set up immediately above)
+    BTN_LEFT,
+    BluezStack,
+    EV_KEY,
+    EV_REL,
+    EV_SYN,
+    HarnessError,
+    KEY_A,
+    KEY_B,
+    KEY_LEFTMETA,
+    KEY_T,
+    KEY_VOLUMEUP,
+    Process,
+    REL_X,
+    REL_Y,
+    Registry,
+    SYN_REPORT,
+    input_event,
+    log,
+    run_btmgmt as btmgmt_index,
+    set_rundir,
+    wait_for,
+)
+from common.evdev import CONSUMER_TV, CONSUMER_VOLUME_UP  # noqa: E402,F401
 
 AF_BLUETOOTH = 31
 BTPROTO_L2CAP = 0
@@ -47,198 +76,40 @@ SOL_BLUETOOTH = 274
 BT_SECURITY = 4
 BT_SECURITY_LOW = 1
 
-# evdev event types/codes (linux/input-event-codes.h).
-EV_SYN = 0x00
-EV_KEY = 0x01
-EV_REL = 0x02
-# SYN_REPORT: end of an input frame. blooter only emits a report at a frame
-# boundary (design/ARCH.md §7.2c), so every injected event needs one after it.
-SYN_REPORT = 0x00
-KEY_A = 30
-KEY_B = 48
-KEY_T = 20
-KEY_LEFTMETA = 125
-KEY_VOLUMEUP = 115
-# Consumer-page usages (design/REMOTE.md §2).
-CONSUMER_VOLUME_UP = 0x0E9
-CONSUMER_TV = 0x089
-BTN_LEFT = 0x110
-REL_X = 0x00
-REL_Y = 0x01
-
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))
-RUNDIR = "/tmp/blooter-btvirt"
-
-BLUETOOTHD = "/usr/libexec/bluetooth/bluetoothd"
-# Built alongside btvirt: see ../build-btvirt.sh for why the packaged one is
-# not good enough.
-BTMGMT = os.environ.get("BTMGMT", "/usr/bin/btmgmt")
-DBUS_DAEMON = "/usr/bin/dbus-daemon"
-
-
-class HarnessError(Exception):
-    """Setup failed -- distinct from a test assertion failing."""
-
-
-def log(msg):
-    print(f"    | {msg}", flush=True)
+RUNDIR = set_rundir("/tmp/blooter-btvirt")
 
 
 def btmgmt(index, *args, timeout=30.0):
-    """Run a btmgmt subcommand and return its combined output.
-
-    stdin is /dev/null and a timeout is always set: btmgmt drops into an
-    interactive prompt for anything it does not recognise as a one-shot command
-    (`paired`, for one), which would otherwise hang the whole suite.
-    """
-    argv = [BTMGMT, "--index", str(index)] + [str(a) for a in args]
-    try:
-        result = subprocess.run(argv, capture_output=True, text=True,
-                                stdin=subprocess.DEVNULL, timeout=timeout,
-                                check=False)
-    except subprocess.TimeoutExpired:
-        # Silence here once cost an afternoon: every call timing out looks like
-        # an empty reply, three levels down.
-        log(f"btmgmt {' '.join(argv[3:])} timed out after {timeout}s")
-        return ""
-    return result.stdout + result.stderr
-
-
-def wait_for(predicate, timeout, what, interval=0.05):
-    """Poll until `predicate()` is truthy. Everything in this harness is
-    asynchronous startup, so nothing gets a fixed sleep."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        value = predicate()
-        if value:
-            return value
-        time.sleep(interval)
-    raise HarnessError(f"timed out after {timeout}s waiting for {what}")
-
-
-# --------------------------------------------------------------------------
-# input_event synthesis
-# --------------------------------------------------------------------------
-
-# Native `struct input_event`: timeval(16) + type(2) + code(2) + value(4) = 24
-# bytes on 64-bit, which is what input.rs::spawn_fifo parses.
-_INPUT_EVENT = struct.Struct("@llHHi")
-assert _INPUT_EVENT.size == 24, f"unexpected input_event size {_INPUT_EVENT.size}"
-
-
-def input_event(type_, code, value):
-    return _INPUT_EVENT.pack(0, 0, type_, code, value)
+    return btmgmt_index(index, *args, timeout=timeout)
 
 
 # --------------------------------------------------------------------------
 # Stack components
 # --------------------------------------------------------------------------
 
-class Process:
-    """A child process with its output captured to a file, so a failure can
-    show what the component actually said."""
-
-    def __init__(self, name, argv, env=None, stdin_pipe=False):
-        self.name = name
-        self.argv = argv
-        self.log_path = os.path.join(RUNDIR, f"{name}.log")
-        self._log = open(self.log_path, "wb")
-        self.proc = subprocess.Popen(
-            argv,
-            stdout=self._log,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.PIPE if stdin_pipe else subprocess.DEVNULL,
-            env=env,
-            start_new_session=True,
-        )
-
-    def write_stdin(self, text):
-        """Feed a line to a process started with `stdin_pipe=True`."""
-        if self.proc.stdin is None:
-            raise HarnessError(f"{self.name} was not started with a stdin pipe")
-        self.proc.stdin.write(text.encode())
-        self.proc.stdin.flush()
-
-    def output(self):
-        try:
-            with open(self.log_path, "rb") as fh:
-                return fh.read().decode("utf-8", "replace")
-        except OSError:
-            return ""
-
-    def alive(self):
-        return self.proc.poll() is None
-
-    def match_count(self, pattern):
-        return len(re.findall(pattern, self.output()))
-
-    def wait_for_output(self, pattern, timeout, what=None, after=0):
-        """Wait until `pattern` has matched more than `after` times.
-
-        `after` matters whenever the same line can be logged once per session:
-        a plain "has it appeared?" check is satisfied by the *previous*
-        session's line and returns immediately.
-        """
-        what = what or f"{self.name} output matching {pattern!r}"
-
-        def check():
-            if not self.alive():
-                raise HarnessError(
-                    f"{self.name} exited (rc={self.proc.returncode}) while waiting "
-                    f"for {what}\n--- {self.name} output ---\n{self.output()}"
-                )
-            return self.match_count(pattern) > after
-
-        return wait_for(check, timeout, what)
-
-    def stop(self, sig=signal.SIGTERM, timeout=5.0):
-        if self.proc.poll() is None:
-            try:
-                os.killpg(os.getpgid(self.proc.pid), sig)
-            except (ProcessLookupError, PermissionError):
-                try:
-                    self.proc.send_signal(sig)
-                except ProcessLookupError:
-                    pass
-            try:
-                self.proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    self.proc.kill()
-                self.proc.wait(timeout=timeout)
-        try:
-            self._log.close()
-        except OSError:
-            pass
-        return self.proc.returncode
-
-
-class Stack:
+class Stack(BluezStack):
     """btvirt + dbus + bluetoothd. Started once and shared by every test; only
     blooter itself is restarted per test, which keeps the suite quick and means
     a test exercises a fresh accept loop against a warm stack."""
 
     def __init__(self, btvirt_path):
+        super().__init__(disable_plugins=("input",))
         self.btvirt_path = btvirt_path
-        self.procs = []
         self.addresses = {}
 
     def _spawn(self, name, argv, env=None):
-        proc = Process(name, argv, env=env)
-        self.procs.append(proc)
-        return proc
+        return self.spawn(name, argv, env=env)
 
     def start(self):
         os.makedirs(RUNDIR, exist_ok=True)
         self._start_btvirt()
-        self._start_dbus()
+        self.start_dbus()
         # bluetoothd adopts the controllers and applies its own persisted
         # settings, clobbering anything set before it starts -- so controller
         # configuration has to come after it is up, not before.
-        self._start_bluetoothd()
+        self.start_bluetoothd()
         self._configure_controllers()
         self.pair_controllers()
 
@@ -319,54 +190,13 @@ class Stack:
         log("controllers bonded")
 
     def _current_settings(self, index):
-        out = btmgmt(index, "info")
-        match = re.search(r"current settings:\s*(.*)", out)
-        return match.group(1).strip() if match else ""
+        return self.current_settings(index)
 
     def _read_address(self, index):
-        out = btmgmt(index, "info")
-        match = re.search(r"addr ([0-9A-Fa-f:]{17})", out)
-        if not match:
-            raise HarnessError(f"cannot read hci{index} address from:\n{out}")
-        addr = match.group(1).upper()
-        if addr == "00:00:00:00:00:00":
-            raise HarnessError(f"hci{index} has no usable address")
-        return addr
-
-    # -- dbus + bluetoothd --------------------------------------------------
-
-    def _start_dbus(self):
-        # A private system bus: the guest has no running one, and this keeps the
-        # test's bluetoothd off any bus the host might share in.
-        for path in ("/run/dbus", "/var/run/dbus"):
-            os.makedirs(path, exist_ok=True)
-        # virtme-ng exports the host filesystem read-only, so bluetoothd cannot
-        # write its adapter state. Give it a throwaway tmpfs -- which also means
-        # bonds never outlive the run.
-        subprocess.run(["mount", "-t", "tmpfs", "tmpfs", "/var/lib/bluetooth"],
-                       capture_output=True, check=False)
-        log("starting private system bus")
-        self._spawn("dbus", [DBUS_DAEMON, "--system", "--nofork", "--nopidfile"])
-        wait_for(lambda: os.path.exists("/run/dbus/system_bus_socket"),
-                 10.0, "the system bus socket")
-        os.environ["DBUS_SYSTEM_BUS_ADDRESS"] = \
-            "unix:path=/run/dbus/system_bus_socket"
-
-    def _start_bluetoothd(self):
-        # `-P input` disables the built-in input plugin, which would otherwise
-        # own the HID UUID and make blooter's profile registration fail (see the
-        # error text in main.rs::register_profile).
-        log("starting bluetoothd (-P input)")
-        bt = self._spawn("bluetoothd", [BLUETOOTHD, "--nodetach", "-P", "input", "-d"])
-        bt.wait_for_output(r"Bluetooth management interface|Starting SDP server",
-                           15.0, "bluetoothd to come up")
-        # bluetoothd re-powers controllers on adoption; wait until it has taken
-        # hci0, otherwise blooter may race it for the default adapter.
-        bt.wait_for_output(r"hci0", 15.0, "bluetoothd to adopt hci0")
+        return self.read_address(index)
 
     def _connections(self, index):
-        out = btmgmt(index, "con")
-        return re.findall(r"([0-9A-Fa-f:]{17})", out)
+        return self.connections(index)
 
     def reset_link_state(self):
         """Drop any link left up by the previous test.
@@ -385,18 +215,6 @@ class Stack:
                      10.0, "the previous link to drop")
         except HarnessError:
             log("WARNING: link did not drop cleanly; continuing")
-
-    def stop(self):
-        for proc in reversed(self.procs):
-            proc.stop()
-        self.procs = []
-
-    def dump_logs(self):
-        for proc in self.procs:
-            out = proc.output().strip()
-            if out:
-                print(f"\n--- {proc.name} ({proc.log_path}) ---", flush=True)
-                print("\n".join(out.splitlines()[-40:]), flush=True)
 
 
 class Blooter:
@@ -752,51 +570,8 @@ def assert_report(got, expected, what):
 
 
 # --------------------------------------------------------------------------
-# Minimal test runner (the guest has no pytest)
+# Per-test state (the runner itself is common.Registry)
 # --------------------------------------------------------------------------
-
-class Registry:
-    def __init__(self):
-        self.tests = []
-
-    def test(self, func):
-        self.tests.append(func)
-        return func
-
-    def run(self, stack, binary, only=None):
-        passed, failed, skipped = [], [], []
-        for func in self.tests:
-            name = func.__name__
-            if only and only not in name:
-                skipped.append(name)
-                continue
-            print(f"\n>>> {name}", flush=True)
-            stack.reset_link_state()
-            ctx = TestContext(stack, binary)
-            start = time.monotonic()
-            try:
-                func(ctx)
-            except Exception as exc:  # noqa: BLE001 - reported, not swallowed
-                elapsed = time.monotonic() - start
-                failed.append((name, exc))
-                print(f"<<< FAIL {name} ({elapsed:.1f}s): "
-                      f"{type(exc).__name__}: {exc}", flush=True)
-                traceback.print_exc()
-                ctx.dump_diagnostics()
-            else:
-                elapsed = time.monotonic() - start
-                passed.append(name)
-                print(f"<<< pass {name} ({elapsed:.1f}s)", flush=True)
-            finally:
-                ctx.cleanup()
-
-        print("\n" + "=" * 60, flush=True)
-        print(f"passed: {len(passed)}   failed: {len(failed)}"
-              + (f"   skipped: {len(skipped)}" if skipped else ""), flush=True)
-        for name, exc in failed:
-            print(f"  FAILED {name}: {type(exc).__name__}: {exc}", flush=True)
-        return 1 if failed else 0
-
 
 class TestContext:
     """Per-test state: a fresh blooter and any hosts it connected to."""

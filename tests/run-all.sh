@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Run every blooter test suite.
 #
-#   ./run-all.sh            # unit tests, then both integration suites
-#   ./run-all.sh btvirt     # just one suite (btvirt | termdbus | unit)
+#   ./run-all.sh            # unit tests, then every integration suite
+#   ./run-all.sh btvirt     # just one suite (unit | btvirt | termdbus | twovm)
 #
 # Each suite keeps running even if an earlier one fails, so one invocation
 # reports the whole picture rather than stopping at the first problem.
@@ -42,6 +42,10 @@ run_suite btvirt "$HERE/btvirt/run.sh"
 
 # Interactive menu and pairing prompt, on a PTY against a mocked BlueZ.
 run_suite termdbus "$HERE/termdbus/run.sh"
+
+# Bonding, and the ways two bond stores stop agreeing. Last because it is much
+# the slowest: two VMs, and every test pairs from scratch.
+run_suite twovm "$HERE/twovm/run.sh"
 
 echo
 echo "################################################################"

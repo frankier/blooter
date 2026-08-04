@@ -453,7 +453,10 @@ def main():
             print(f"\nSTACK SETUP FAILED: {exc}", file=sys.stderr, flush=True)
             stack.dump_logs()
             return 2
-        return tests.run(stack, binary, only=only)
+        # The link (not the bond) is reset before each test: one bluetoothd and
+        # one pair of controllers are shared by the whole run.
+        return tests.run(lambda: harness.TestContext(stack, binary),
+                         only=only, setup=stack.reset_link_state)
     finally:
         stack.stop()
 

@@ -716,6 +716,20 @@ own descriptor fingerprint and its own history with each host (§7.1). That is
 the same asymmetry §7 already exploits, applied to the bond itself rather than
 to the descriptor cached under it.
 
+### 8.4 The executable form
+
+`tests/twovm` is this section written as assertions (design/TESTS.md §6). Each
+of the states in §8.1 is produced there by damaging one bond store out of band,
+on two genuinely separate machines, and three things are asserted per row: the
+symptom, the detection §8.2 owes the user, and — the one that matters — that
+performing exactly the steps blooter printed ends at a working keyboard.
+
+The detection assertions are marked expected-fail, because §8.2 is a commitment
+and not yet an implementation. **When it is implemented, those markers come
+off**; the suite reports an expected-fail that starts passing as `XPASS`
+precisely so the work gets noticed. The symptom and remedy assertions in the
+same rows pass today.
+
 ## 9. Scenario matrix
 
 "Accept-only" = §3.1 / §4; "Initiate" = §3.2. Every BLE row is accept-only: the

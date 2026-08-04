@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build btvirt and btmgmt from bluez source. No root required -- nothing is
-# installed, we just want the two binaries.
+# Build the bluez tools both integration suites need, from bluez source. No root
+# required -- nothing is installed, we just want the binaries.
 #
 # btvirt is the emulator, which Fedora's bluez package does not ship (Debian has
 # it in bluez-test-tools; Fedora has no equivalent). btmgmt *is* packaged
@@ -17,9 +17,18 @@ SRC="$BUILD/bluez-$VERSION"
 TARBALL="bluez-$VERSION.tar.xz"
 URL="https://mirrors.edge.kernel.org/pub/linux/bluetooth/$TARBALL"
 
-if [[ -x "$SRC/emulator/btvirt" && -x "$SRC/tools/btmgmt" \
-      && -x "$SRC/tools/btgatt-client" ]]; then
-    echo "btvirt, btmgmt and btgatt-client already built in: $SRC"
+# One source tree serves both integration suites. `tests/twovm` adds the last
+# two: btproxy bridges each guest's /dev/vhci onto the radio, and btmon is what
+# makes a two-VM pairing failure diagnosable at all (design/TESTS.md §7.5).
+TARGETS=(emulator/btvirt tools/btmgmt tools/btgatt-client tools/btproxy
+         monitor/btmon)
+
+missing_targets=()
+for target in "${TARGETS[@]}"; do
+    [[ -x "$SRC/$target" ]] || missing_targets+=("$target")
+done
+if ((${#missing_targets[@]} == 0)); then
+    echo "all bluez tools already built in: $SRC"
     exit 0
 fi
 
@@ -64,18 +73,17 @@ echo "==> configuring (--enable-testing is what builds emulator/btvirt)"
     --disable-mesh \
     --disable-cups \
     --disable-manpages \
-    --disable-systemd \
-    --disable-monitor \
     --disable-udev >/dev/null
 
-echo "==> building emulator/btvirt, tools/btmgmt and tools/btgatt-client"
-# btgatt-client is the LE counterpart of the suite's raw-L2CAP FakeHost: it
-# speaks ATT over its own socket on hci1, so the BLE tests need no second
-# bluetoothd (tests/btvirt/README.md).
-make -j"$(nproc)" emulator/btvirt tools/btmgmt tools/btgatt-client
+echo "==> building ${TARGETS[*]}"
+# btgatt-client is the LE counterpart of the btvirt suite's raw-L2CAP FakeHost:
+# it speaks ATT over its own socket on hci1, so the BLE tests there need no
+# second bluetoothd (tests/btvirt/README.md).
+make -j"$(nproc)" "${TARGETS[@]}"
 
 echo
 echo "btvirt built: $SRC/emulator/btvirt"
 "$SRC/emulator/btvirt" --help 2>&1 | head -20 || true
-echo "btmgmt built: $SRC/tools/btmgmt"
-echo "btgatt-client built: $SRC/tools/btgatt-client"
+for target in "${TARGETS[@]:1}"; do
+    echo "built: $SRC/$target"
+done
