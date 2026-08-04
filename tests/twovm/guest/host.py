@@ -20,6 +20,7 @@ import glob
 import os
 import re
 import selectors
+import signal
 import time
 
 from base import RoleAgent
@@ -28,6 +29,7 @@ from common import (
     PtyProcess,
     log,
     parse_input_events,
+    run_btmgmt,
     wait_for,
 )
 from common.evdev import INPUT_EVENT
@@ -37,6 +39,13 @@ BLUETOOTHCTL = os.environ.get("BLUETOOTHCTL", "/usr/bin/bluetoothctl")
 
 class Bluetoothctl:
     """A scripted conversation with `bluetoothctl`."""
+
+    #: Set when a command neither succeeded nor failed within its timeout. The
+    #: command is still queued inside bluetoothctl, so everything sent
+    #: afterwards waits behind it -- including in *later tests*, which then all
+    #: fail at "pair reported neither", nowhere near the row that wedged it.
+    #: `HostAgent._ctl` rebuilds the conversation when it sees this.
+    wedged = False
 
     def __init__(self):
         self.proc = PtyProcess("bluetoothctl", [BLUETOOTHCTL])
@@ -92,6 +101,7 @@ class Bluetoothctl:
         except HarnessError:
             # A bluetoothctl command that neither succeeded nor failed said
             # *something*, and that something is the whole diagnosis.
+            self.wedged = True
             raise HarnessError(
                 f"{line!r} reported neither {combined} within {timeout}s:\n"
                 + "\n".join(self.proc.output().splitlines()[-25:])) from None
@@ -197,6 +207,7 @@ class HostAgent(RoleAgent):
             "await_device": self.await_device,
             "pair": self.pair,
             "trust": self.trust,
+            "away": self.away,
             "connect": self.connect,
             "disconnect": self.disconnect,
             "remove": self.remove,
@@ -246,6 +257,17 @@ class HostAgent(RoleAgent):
     def _ctl(self):
         if self.ctl is None:
             raise HarnessError("start_agent has not been called")
+        if self.ctl.wedged:
+            # A command is still pending, and the pending one is almost always a
+            # connect to a peer that no longer has the key -- which bluetoothd
+            # keeps retrying long after the test has given up, blocking
+            # everything sent afterwards. A fresh bluetoothctl is not enough,
+            # because what is stuck is on bluetoothd's side of the bus; the
+            # whole stack goes. Without this, one row that wedges takes every
+            # row after it with it, all failing at "pair reported neither" and
+            # none of them near the cause.
+            log("bluetoothctl never answered its last command; restarting the stack")
+            self.restart_stack()
         return self.ctl
 
     # -- discovery and bonding ----------------------------------------------
@@ -286,6 +308,23 @@ class HostAgent(RoleAgent):
         over.
         """
         ctl = self._ctl()
+        # Cancel anything still in flight towards that address first. A connect
+        # that failed (the ordinary outcome of a one-sided bond, and what the
+        # divergence rows probe with) can leave this controller in the
+        # initiating state, and an LE scan started underneath one finds nothing
+        # at all -- which shows up here as "the host never discovered dev", a
+        # long way from its cause.
+        # "not available" counts as an answer -- most pairings start from a
+        # host that has never heard of this address, and waiting out a timeout
+        # for that would add fifteen seconds to every row.
+        try:
+            ctl.run(
+                f"disconnect {address}",
+                expect=r"Disconnection successful|not available"
+                       r"|Failed to disconnect",
+                timeout=15.0)
+        except HarnessError:
+            pass  # said nothing at all: carry on and let `pair` be the judge
         self.await_device(address, timeout=timeout)
         ctl.run(f"pair {address}", expect=r"Pairing successful",
                 fail=r"Failed to pair", timeout=timeout)
@@ -302,6 +341,40 @@ class HostAgent(RoleAgent):
                         expect=r"Changing .*succeeded", fail=r"Failed to set",
                         timeout=20.0)
         return self.info(address)
+
+    def away(self, address, on=True, timeout=60.0):
+        """Take this host off the air, or bring it back, without touching bonds.
+
+        The rows that test what blooter says about a host that is *not there*
+        need it to stay not-there, and none of the gentler ways work: a bonded
+        peer reconnects by itself (that is what bonding is for, and on LE the
+        kernel does it from its accept list without asking bluetoothd), while
+        `block` makes bluetoothd tear the HOG profile down and mark it
+        `unavailable` -- after which unblocking never rebuilds the uhid device
+        and the host is a keyboard that reports nothing.
+
+        So the host's stack goes down instead: its device is dropped from the
+        kernel's accept list, then bluetoothd is killed. Nothing reconnects,
+        no bond is touched, and bringing it back is the same restart J4 already
+        relies on -- which re-probes the profile properly.
+        """
+        if on:
+            try:
+                self.disconnect(address, timeout=20.0)
+            except HarnessError:
+                pass  # already down
+            for addr_type in ("0", "1"):
+                run_btmgmt(0, "del-device", "-t", addr_type, address)
+            self.reader.close()
+            if self.ctl is not None:
+                self.ctl.stop()
+                self.ctl = None
+            self.stack.quiesce()
+            self.stack.stop_bluetoothd(sig=signal.SIGKILL)
+            return True
+        self.stack.restart_daemon()
+        self.start_agent()
+        return True
 
     def connect(self, address, timeout=45.0):
         self._ctl().run(f"connect {address}", expect=r"Connection successful",

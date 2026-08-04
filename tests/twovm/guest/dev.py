@@ -282,6 +282,7 @@ class DevAgent(RoleAgent):
             "wait_blooter_output": self.wait_blooter_output,
             "menu_key": self.menu_key,
             "key": self.key,
+            "chord": self.chord,
             "rel": self.rel,
             "frame": self.frame,
             "remove_bond": self.remove_bond,
@@ -346,6 +347,23 @@ class DevAgent(RoleAgent):
         self._running().send(
             input_event(EV_KEY, code, 1 if pressed else 0)
             + input_event(EV_SYN, SYN_REPORT, 0))
+
+    def chord(self, codes, which=None, hold=0.05):
+        """Fire a hotkey chord: press `codes` in order, release in reverse.
+
+        Order matters -- blooter starts matching on the chord's *first* key and
+        fires on the last keydown (design/ARCH.md §7.3) -- and so does the path:
+        a chord over the FIFO exercises the same matcher as one over evdev, but
+        only the evdev one is available when blooter was started with `-e`.
+        """
+        press = (lambda c, down: self.uinput_key(which, c, down)) if which \
+            else (lambda c, down: self.key(c, down))
+        for code in codes:
+            press(code, True)
+            time.sleep(hold)
+        for code in reversed(codes):
+            press(code, False)
+            time.sleep(hold)
 
     def rel(self, code, value):
         self._running().send(input_event(EV_REL, code, value)

@@ -30,6 +30,11 @@ KEY_VOLUMEUP = 115
 # blooter's default capture-toggle chord (cli.rs USAGE).
 KEY_LEFTSHIFT = 42
 KEY_RIGHTSHIFT = 54
+# ...and its default drop_connection chord (config.rs DEFAULTS), which on BLE is
+# what re-opens the bonded-host menu over a live link (CONNECTION.md §6.2).
+KEY_LEFTCTRL = 29
+KEY_LEFTALT = 56
+DROP_CONNECTION_CHORD = (KEY_LEFTCTRL, KEY_LEFTALT, KEY_LEFTSHIFT)
 
 BTN_LEFT = 0x110
 BTN_RIGHT = 0x111

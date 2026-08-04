@@ -637,9 +637,12 @@ Hotkeys are configurable chords (§10); the built-in defaults are:
   is forwarded (an all-keys-up report and neutral gamepad reports are sent
   first so nothing stays latched host-side), and `-x` exclusive grabs are
   released so input reaches the local session again. A new host connection
-  re-enables capture. `drop_connection` (drop the current host connection and
-  return to accepting) and the separate `capture_on`/`capture_off` chords exist
-  but are disabled by default.
+  re-enables capture. The separate `capture_on`/`capture_off` chords exist but
+  are disabled by default.
+- **Left Ctrl, Left Alt, Left Shift** — `drop_connection`: end the session and go back to
+  accepting. On Classic that drops the link; on BLE it *mutes* the host, keeping
+  the link up so the bonded-host menu can act on it (design/CONNECTION.md §6.2),
+  which is also why it is bound by default there.
 
 **Order.** The **first** key a chord names must be pressed first — that is what
 starts matching the chord — after which its remaining keys may be pressed in any

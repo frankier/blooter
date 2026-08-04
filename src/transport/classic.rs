@@ -243,6 +243,9 @@ impl Transport for Classic {
             // Classic builds its list by scanning, so it needs no remembered
             // hosts (that union is the BLE menu's, §6).
             Vec::new(),
+            // ...and no muted host: dropping a Classic session drops the link
+            // rather than muting it (§6.2).
+            None,
             &self.term_coord,
         );
 
@@ -314,6 +317,11 @@ impl Transport for Classic {
                         // `fix_host` already drops the bond on both sides (§7.2a).
                         Some(Pick::Forget(addr)) => {
                             warn!("ignoring a forget pick for {addr}: Classic has no [u]");
+                        }
+                        // Nothing to resume: a dropped Classic session dropped
+                        // the link with it, so the host is simply gone (§6.2).
+                        Some(Pick::Resume(addr)) => {
+                            warn!("ignoring a resume pick for {addr}: Classic has no muted state");
                         }
                         None => {}
                     }

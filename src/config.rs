@@ -48,6 +48,10 @@ impl Step {
 pub struct Chord {
     pub steps: Vec<Step>,
     pub action: Action,
+    /// The spec this was parsed from, kept so a message can name the chord the
+    /// user actually has (`drop_connection` is printed by the BLE transport,
+    /// design/CONNECTION.md §6.2) rather than guessing at the default.
+    pub spec: Box<str>,
 }
 
 /// The full hotkey table. Falls back to the built-in right-shift defaults for
@@ -284,7 +288,11 @@ pub const MAX_CHORDS: usize = DEFAULTS.len() + MAX_REMOTE_BINDINGS;
 /// The recognized `[hotkeys]` keys and their built-in defaults. An empty
 /// string means the hotkey is disabled.
 const DEFAULTS: [(&str, &str); 5] = [
-    ("drop_connection", ""),
+    // Bound by default because on BLE it is the only way back to the menu: a
+    // connected host preempts it, and a bonded central reconnects on its own,
+    // so without a chord to drop the session the bonded-host manager — and with
+    // it `[f]` and `[u]` — can be unreachable (design/CONNECTION.md §6.2).
+    ("drop_connection", "leftcontrol+leftalt+leftshift"),
     ("exit", "leftcontrol+leftalt+rightshift"),
     ("capture_toggle", "leftshift+rightshift"),
     ("capture_on", ""),
@@ -310,6 +318,7 @@ impl Default for Hotkeys {
             .map(|(key, spec)| Chord {
                 steps: parse_chord_spec(spec).expect("built-in default chords parse"),
                 action: action_for(key),
+                spec: (*spec).into(),
             })
             .collect();
         Hotkeys { chords }
@@ -325,6 +334,15 @@ impl Hotkeys {
     /// buffer instead of being forwarded straight away (design/ARCH.md §7.3).
     pub fn starts(&self, code: u16) -> bool {
         self.chords.iter().any(|c| c.steps[0].matches(code))
+    }
+
+    /// The spec of the chord bound to `action`, for a message that has to tell
+    /// the user which keys to press. `None` when the action is unbound.
+    pub fn spec_for(&self, action: Action) -> Option<&str> {
+        self.chords
+            .iter()
+            .find(|c| c.action == action)
+            .map(|c| &*c.spec)
     }
 
     /// Fold in further chords — the `[remote]` bindings, which are matched by
@@ -476,9 +494,10 @@ impl<'de> FromToml<'de> for RemoteSection {
                 continue;
             };
             match chord_item(value) {
-                Ok(Some(steps)) => chords.push(Chord {
+                Ok(Some((steps, spec))) => chords.push(Chord {
                     steps,
                     action: Action::Consumer(usage),
+                    spec,
                 }),
                 Ok(None) => {} // explicitly disabled with ""
                 Err(e) => {
@@ -759,9 +778,10 @@ impl<'de> FromToml<'de> for Hotkeys {
         let mut chords = Vec::new();
         for (key, default) in DEFAULTS {
             match th.optional_mapped(key, chord_item) {
-                Some(Some(steps)) => chords.push(Chord {
+                Some(Some((steps, spec))) => chords.push(Chord {
                     steps,
                     action: action_for(key),
+                    spec,
                 }),
                 Some(None) => {} // explicitly disabled with ""
                 None => {
@@ -772,6 +792,7 @@ impl<'de> FromToml<'de> for Hotkeys {
                             steps: parse_chord_spec(default)
                                 .expect("built-in default chords parse"),
                             action: action_for(key),
+                            spec: default.into(),
                         });
                     }
                 }
@@ -782,14 +803,18 @@ impl<'de> FromToml<'de> for Hotkeys {
     }
 }
 
+/// A parsed chord and the spec text it came from, which [`Chord`] keeps so a
+/// message can name the keys the user actually bound.
+type ParsedChord = (Vec<Step>, Box<str>);
+
 /// Extract one hotkey value: a chord string, or `""` (`None`) for disabled.
-fn chord_item(item: &Item<'_>) -> Result<Option<Vec<Step>>, toml_spanner::Error> {
+fn chord_item(item: &Item<'_>) -> Result<Option<ParsedChord>, toml_spanner::Error> {
     let spec = item.as_str().ok_or_else(|| item.expected(&"a string"))?;
     if spec.is_empty() {
         return Ok(None);
     }
     parse_chord_spec(spec)
-        .map(Some)
+        .map(|steps| Some((steps, spec.into())))
         .map_err(|e| toml_spanner::Error::custom_at(e, item))
 }
 
@@ -851,8 +876,17 @@ mod tests {
         assert!(!hk.starts(keymap::KEY_A));
         assert!(hk.starts(keymap::KEY_LEFTCTRL));
         assert!(hk.starts(keymap::KEY_LEFTSHIFT));
-        // drop_connection is disabled by default.
-        assert_eq!(steps(&hk, Action::DropConnection), None);
+        assert_eq!(
+            steps(&hk, Action::DropConnection),
+            Some(
+                [
+                    Step::One(keymap::KEY_LEFTCTRL),
+                    Step::One(keymap::KEY_LEFTALT),
+                    Step::One(keymap::KEY_LEFTSHIFT),
+                ]
+                .as_slice()
+            )
+        );
         assert_eq!(
             steps(&hk, Action::Exit),
             Some(

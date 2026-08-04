@@ -93,6 +93,14 @@ struct Link {
     subscribed: bool,
     /// bluetoothd has a device with `Connected = true`.
     up: bool,
+    /// The user ended the session with `drop_connection` while this link was up.
+    ///
+    /// On BLE that mutes the host rather than disconnecting it: blooter stops
+    /// routing to it and the bonded-host menu re-opens, but the link — and so
+    /// `Device.Connected`, which `[f]` needs (§7.2b) — stays up, and the host
+    /// cannot race the user by reconnecting, because it never left
+    /// (design/CONNECTION.md §6.2). `[enter]` in the menu unmutes it.
+    muted: bool,
 }
 
 /// State shared between the GATT notify callbacks, the link watcher and
@@ -133,7 +141,12 @@ impl Shared {
     fn update(&self, f: impl FnOnce(&mut Link)) {
         let mut link = self.link.lock().unwrap();
         f(&mut link);
-        let connected = link.subscribed && link.up;
+        // A mute lasts only as long as the link it mutes: a host that really
+        // goes away and comes back gets an ordinary session.
+        if !link.up {
+            link.muted = false;
+        }
+        let connected = link.subscribed && link.up && !link.muted;
         self.connected_tx.send_if_modified(|c| {
             if *c == connected {
                 false
@@ -151,7 +164,10 @@ impl Shared {
     async fn subscribe(self: &Arc<Self>, report_id: u8, notifier: CharacteristicNotifier) {
         let stopped = notifier.stopped();
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
-        self.notifiers.lock().await.insert(report_id, (token, notifier));
+        self.notifiers
+            .lock()
+            .await
+            .insert(report_id, (token, notifier));
         self.update(|l| l.subscribed = true);
 
         let this = self.clone();
@@ -215,6 +231,10 @@ pub struct Le {
     hosts: Arc<std::sync::Mutex<crate::state::Hosts>>,
     /// Fingerprint of the descriptor this run advertises.
     descriptor_fp: u32,
+    /// The `drop_connection` chord as configured, so the note explaining how to
+    /// get the menu back names the keys the user actually has (§6.2). `None`
+    /// when the hotkey is disabled.
+    drop_chord: Option<String>,
     _app: ApplicationHandle,
     _adv: AdvertisementHandle,
     /// Feeds `Link::up` from bluetoothd's `Device.Connected` (see [`Shared`]).
@@ -232,6 +252,7 @@ impl Le {
         interactive: bool,
         hosts: Arc<std::sync::Mutex<crate::state::Hosts>>,
         term_coord: crate::menu::TermCoord,
+        drop_chord: Option<String>,
     ) -> Result<Self, AppError> {
         // Same fingerprint `main` warns about at startup, derived here from the
         // descriptor this transport actually serves (§7).
@@ -289,6 +310,7 @@ impl Le {
             term_coord,
             hosts,
             descriptor_fp,
+            drop_chord,
             _app,
             _adv,
             _links,
@@ -388,6 +410,32 @@ impl Le {
             self.hosts.lock().unwrap().set(addr, self.descriptor_fp);
         }
         Accept::Connected(peer.map_or_else(|| "BLE host".to_string(), |a| a.to_string()))
+    }
+
+    /// Whether the user muted the live link with `drop_connection` (§6.2).
+    fn is_muted(&self) -> bool {
+        self.shared.link.lock().unwrap().muted
+    }
+
+    /// Say, on the terminal, why the menu is not there — and how to get it back.
+    /// A connected host preempts the menu (§6.2) and a bonded central reconnects
+    /// on its own, so without this the menu can simply appear to be missing.
+    fn note_menu_preempted(&self, peer: &str) {
+        if !self.interactive {
+            return;
+        }
+        match &self.drop_chord {
+            Some(chord) => println!(
+                "{peer} is connected, so the host menu is closed. Press {chord} to \
+                 end the session and bring it back — the host stays connected, so \
+                 [f] still works from there."
+            ),
+            None => println!(
+                "{peer} is connected, so the host menu is closed. Bind \
+                 [hotkeys] drop_connection in the config to be able to end a \
+                 session and get it back."
+            ),
+        }
     }
 
     /// Drop our own bond to `addr` and forget its recorded fingerprint.
@@ -505,6 +553,7 @@ enum Done {
     Accept(Accept),
     Fix(Address),
     Forget(Address),
+    Resume(Address),
 }
 
 impl Transport for Le {
@@ -533,6 +582,32 @@ impl Transport for Le {
         }
     }
 
+    /// End the session without ending the link: mute it (see [`Link::muted`]).
+    ///
+    /// Disconnecting would be the obvious reading of `drop_connection`, and is
+    /// what Classic does — but on BLE it would achieve nothing the user wants.
+    /// A bonded central reconnects to the advertisement within seconds, so the
+    /// menu the drop exists to reveal would be preempted again before a key
+    /// could be pressed; and `[f]` needs the host *connected* (§7.2b), which a
+    /// disconnect is precisely the wrong way to arrange. Muting stops the
+    /// reports, re-opens the menu, and leaves the link where `[f]` needs it
+    /// (design/CONNECTION.md §6.2).
+    async fn drop_session(&self) {
+        self.shared.update(|l| l.muted = true);
+        let peer = self
+            .peer()
+            .await
+            .map_or_else(|| "the host".to_string(), |a| a.to_string());
+        info!("muted {peer}: the link stays up, the session does not");
+        if self.interactive {
+            println!(
+                "Session with {peer} ended; it is still connected, just muted. \
+                 The host menu is back: [enter] resumes it, [f] fixes a stale \
+                 layout, [u] forgets it."
+            );
+        }
+    }
+
     /// LE connection intervals are typically 7.5–30 ms, and a notify is queued
     /// on D-Bus rather than paced by the radio, so batch a little harder than
     /// Classic (design/ARCH.md §7.2c).
@@ -556,7 +631,13 @@ impl Transport for Le {
         signals: &mut Signals,
     ) -> Accept {
         if *self.connected_rx.borrow_and_update() {
-            return self.connected().await;
+            // A host was already there: no menu is opened at all, so say so
+            // rather than leaving the user waiting for one (§6.2).
+            let accept = self.connected().await;
+            if let Accept::Connected(peer) = &accept {
+                self.note_menu_preempted(peer);
+            }
+            return accept;
         }
 
         // The watch receiver is cloned rather than borrowed from `self`, so the
@@ -569,15 +650,25 @@ impl Transport for Le {
             let hosts = self.hosts.lock().unwrap();
             (hosts.stale(self.descriptor_fp), hosts.addresses())
         };
+        // A muted host is still connected, so it is listed as one the user can
+        // resume — the other half of `drop_connection` (§6.2).
+        let muted = match self.is_muted() {
+            true => self.peer().await,
+            false => None,
+        };
         let mut menu = crate::menu::Session::spawn(
             Some(&self.adapter),
             self.interactive,
             crate::menu::Kind::Ble,
             stale,
             known,
+            muted,
             &self.term_coord,
         );
 
+        // The host whose arrival closed the menu, so the note goes out after the
+        // menu has restored the terminal.
+        let mut preempted: Option<String> = None;
         let done = loop {
             tokio::select! {
                 r = connected.changed() => {
@@ -585,10 +676,18 @@ impl Transport for Le {
                         break Done::Accept(Accept::Shutdown); // sender gone (shutting down)
                     }
                     if *connected.borrow_and_update() {
-                        if menu.is_open() {
+                        let open = menu.is_open();
+                        if open {
                             info!("a host connected and subscribed; using it and closing the menu");
                         }
-                        break Done::Accept(self.connected().await);
+                        let accept = self.connected().await;
+                        if open && let Accept::Connected(peer) = &accept {
+                            // Held rather than printed here: the note has to
+                            // come out after `menu.finish()` has restored the
+                            // terminal, or it lands inside the menu's redraw.
+                            preempted = Some(peer.clone());
+                        }
+                        break Done::Accept(accept);
                     }
                 }
                 // Menu action. Both need `&mut self`, so leave the loop and
@@ -603,11 +702,23 @@ impl Transport for Le {
                             info!("menu selected {addr}; dropping our bond to it");
                             break Done::Forget(addr);
                         }
+                        Some(Pick::Resume(addr)) => {
+                            info!("menu selected {addr}; resuming the muted session");
+                            break Done::Resume(addr);
+                        }
                         // The BLE menu never offers a host to connect out to.
                         Some(Pick::Connect(addr)) => {
                             warn!("ignoring a connect pick for {addr}: BLE cannot initiate");
                         }
-                        None => {}
+                        // Closed with `[q]`/Enter. If a host is muted the user
+                        // has finished with the menu the mute was for, so the
+                        // link goes back to being a session rather than being
+                        // left silent with no menu to un-silence it from.
+                        None => {
+                            if let Some(addr) = muted {
+                                break Done::Resume(addr);
+                            }
+                        }
                     }
                 }
                 Some(ev) = rx.recv() => {
@@ -625,6 +736,9 @@ impl Transport for Le {
         // Preempt the menu and wait for it to restore the terminal before
         // returning — ordered ahead of any further output (§6).
         menu.finish().await;
+        if let Some(peer) = &preempted {
+            self.note_menu_preempted(peer);
+        }
 
         // Perform the menu's action now the menu task is joined and nothing
         // borrows `self` any more, then go back to waiting (the menu re-opens).
@@ -636,6 +750,19 @@ impl Transport for Le {
             Done::Forget(addr) => {
                 self.forget_host(addr).await;
                 Box::pin(self.wait_connected(rx, state, ctx, signals)).await
+            }
+            // Unmute: the link never went away, so the session simply picks up
+            // where `drop_connection` left it (§6.2).
+            Done::Resume(addr) => {
+                self.shared.update(|l| l.muted = false);
+                info!("resuming the muted session with {addr}");
+                if *self.connected_rx.borrow_and_update() {
+                    self.connected().await
+                } else {
+                    // The host left while the menu was up, so there is nothing
+                    // to resume: go back to waiting for it.
+                    Box::pin(self.wait_connected(rx, state, ctx, signals)).await
+                }
             }
             Done::Accept(accept) => accept,
         }

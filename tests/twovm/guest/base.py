@@ -15,6 +15,7 @@ initiative.
 
 import os
 import re
+import signal
 import subprocess
 import time
 
@@ -93,8 +94,8 @@ class GuestStack(BluezStack):
         log(f"hci0: {self.address}  [{settings}]")
         return self.address
 
-    def quiesce(self):
-        """Take the adapter down cleanly before bluetoothd is stopped.
+    def quiesce(self, power_off=False):
+        """Drop the links cleanly before bluetoothd is stopped.
 
         The emulated radio is not a chip: it is `btvirt` on the other side of a
         TCP connection, and `btproxy` feeds what arrives from it into
@@ -105,12 +106,19 @@ class GuestStack(BluezStack):
         look nothing like the cause ("Invalid Index", "bluetoothd never adopted
         hci0").
 
-        Powering off first drops the links in order, while the bridge is still
-        healthy, so nothing is left in flight.
+        Disconnecting first closes that race. **Powering off does not, and made
+        it worse**: `vhci_write` refuses a packet whenever the HCI device is
+        down, so a controller that is powered off but still bridged kills
+        btproxy at the peer's very next transmission -- and on LE the peer
+        transmits constantly, because blooter advertises. That is what took the
+        bridge out under `restart_stack` and `wipe_bonds`; the power-off is
+        therefore opt-in, for the one caller that genuinely needs it (changing
+        the adapter's bearers, which the kernel only allows while down).
         """
         for peer in self.connections(0):
             run_btmgmt(0, "disconnect", peer)
-        run_btmgmt(0, "power", "off")
+        if power_off:
+            run_btmgmt(0, "power", "off")
         # A moment for the peer to see the disconnection and stop sending; the
         # race this is closing is measured in packets, not seconds.
         time.sleep(1.0)
@@ -191,8 +199,10 @@ class GuestStack(BluezStack):
             return self.current_settings(0)
 
         # Same care as a bluetoothd restart, for the same reason: powering the
-        # adapter down under a live link loses the bridge (see `quiesce`).
-        self.quiesce()
+        # adapter down under a live link loses the bridge (see `quiesce`). This
+        # is the one caller that has to power off at all -- the bearers are only
+        # settable while the controller is down.
+        self.quiesce(power_off=True)
         if protocol == "ble":
             run_btmgmt(0, "bredr", "off")
             run_btmgmt(0, "le", "on")
@@ -214,7 +224,39 @@ class GuestStack(BluezStack):
         this suite's README.
         """
         self.quiesce()
-        self.stop_bluetoothd()
+        self.restart_daemon()
+        return self.address
+
+    def restart_daemon(self, wipe=False):
+        """Stop bluetoothd, optionally wipe its storage, and start it again.
+
+        Shared by the restart and the wipe because they differ by exactly one
+        line -- and because the failure they share is worth handling in one
+        place: if the bridge went down with the daemon, waiting 60 s for a
+        controller that no longer exists reports "bluetoothd never adopted
+        hci0", which says nothing about what happened. Rebuilding the bridge
+        here keeps the *next* test running (its address changes, so this one is
+        lost either way) and names the cause while it is still legible.
+        """
+        # SIGKILL, not SIGTERM, and this is the whole reason the restart used to
+        # take the radio with it: a bluetoothd that exits cleanly powers down
+        # the adapters it powered up, and `vhci_write` refuses every packet
+        # while the controller is down -- so the peer's next transmission (on
+        # LE, its next advertisement, milliseconds away) makes btproxy fail its
+        # write and tear the bridge down. Killed, bluetoothd never runs that
+        # path, the controller stays up, and the bridge lives. It is also the
+        # closer model of what this stands in for: a host that reboots does not
+        # ask its daemon nicely either, and every bond is already on disk,
+        # written when it was made.
+        self.stop_bluetoothd(sig=signal.SIGKILL)
+        if wipe:
+            self.wipe_storage()
+        if not os.path.isdir("/sys/class/bluetooth/hci0"):
+            self.respawn_radio()
+            raise HarnessError(
+                "the emulated radio went down with bluetoothd; the bridge has "
+                f"been rebuilt (this guest is now {self.address}), so the rest "
+                "of the run continues, but this test is a casualty")
         # Generous: the replacement has to wait for the outgoing instance's
         # `org.bluez` bus name to be released before it can adopt anything, and
         # a restart that is merely slow must not read as one that failed.
@@ -343,12 +385,23 @@ class RoleAgent:
 
     def wipe_bonds(self):
         """Delete every stored bond and restart bluetoothd onto the empty store
-        (design/TESTS.md D6 -- what a reinstall looks like)."""
+        (design/TESTS.md D6 -- what a reinstall looks like).
+
+        The *kernel* has to be told too. bluetoothd's storage is only half of
+        where a bond lives; the link keys and LTKs it loaded are in the
+        controller's key list, and a reinstall would come back to a kernel that
+        never had them. Without this the wiped side happily accepts an encrypted
+        reconnect from a host it no longer has any record of -- which reads as
+        D6 failing to diverge, and is really the harness leaving half the bond
+        in place.
+        """
+        addresses = list(self.bonded())
         self.stack.quiesce()
-        self.stack.stop_bluetoothd()
-        self.stack.wipe_storage()
-        self.stack.start_bluetoothd(timeout=60.0)
-        self.stack.configure_adapter()
+        self.stack.stop_bluetoothd(sig=signal.SIGKILL)
+        for address in addresses:
+            for addr_type in ("0", "1"):
+                run_btmgmt(0, "unpair", "-t", addr_type, address)
+        self.stack.restart_daemon(wipe=True)
         return self.bonded()
 
     # -- queries ------------------------------------------------------------

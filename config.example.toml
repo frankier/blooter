@@ -22,9 +22,11 @@
 
 [hotkeys]
 
-# Drop the current host connection and return to accepting new ones. Disabled
-# by default; bind a chord here if you want it.
-#drop_connection = ""
+# Drop the current host session and return to accepting connections — which on
+# BLE also brings the bonded-host menu back, since a connected host preempts it
+# and a bonded host reconnects by itself (design/CONNECTION.md §6.2). Set to ""
+# to disable.
+#drop_connection = "leftcontrol+leftalt+leftshift"
 
 # Terminate blooter cleanly.
 #exit = "leftcontrol+leftalt+rightshift"

@@ -28,7 +28,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))   # tests/, for `common`
 sys.path.insert(0, HERE)                    # tests/twovm/, for `tests`
 
-from common import HarnessError, Process, log, set_rundir, wait_for  # noqa: E402
+from common import (  # noqa: E402
+    DROP_CONNECTION_CHORD,
+    HarnessError,
+    Process,
+    log,
+    set_rundir,
+    wait_for,
+)
+
+# The BLE menu's footer, drawn once the bonded-host list is up. Waiting for this
+# rather than for the menu task to start is what makes a keypress land.
+MENU_FOOTER = r"\[u\] Forget host"
 
 BTVIRT = os.environ.get("BTVIRT", "")
 BTVIRT_PORT = os.environ.get("BTVIRT_PORT", "45550")
@@ -240,6 +251,10 @@ class DevVm(Vm):
         self.key(code, True)
         self.key(code, False)
 
+    def chord(self, codes, which=None):
+        """Fire a hotkey chord, over the FIFO or (with `which`) over uinput."""
+        return self.call("chord", _timeout=60.0, codes=list(codes), which=which)
+
     def rel(self, code, value):
         return self.call("rel", code=code, value=value)
 
@@ -319,6 +334,21 @@ class HostVm(Vm):
 
     def trust(self, address, on=True):
         return self.call("trust", _timeout=90.0, address=address, on=on)
+
+    def stay_away(self, address):
+        """Take the host off the air until `come_back`, bonds untouched.
+
+        A plain `disconnect` does not do that -- a bonded host reconnects by
+        itself, which is what made the rows needing blooter's menu with no host
+        around fail (README, "What the first run turned up"). Blocking the
+        device does keep it away, but it also makes bluetoothd drop the HOG
+        profile for good, so the host comes back deaf; taking its whole stack
+        down is what leaves it able to return as itself.
+        """
+        return self.call("away", _timeout=180.0, address=address, on=True)
+
+    def come_back(self, address):
+        return self.call("away", _timeout=240.0, address=address, on=False)
 
     def info(self, address):
         return self.call("info", _timeout=60.0, address=address)
@@ -447,8 +477,29 @@ class TestContext:
         self.host = host
         self.name = name
 
+    # Which input path this run's blooter is reading, so a hotkey chord goes
+    # where the events will actually reach it (`-e` means uinput, not the FIFO).
+    uinput = False
+
     def start_blooter(self, protocol="classic", **kwargs):
+        self.uinput = kwargs.get("fifo", True) is False
         return self.dev.start_blooter(protocol=protocol, **kwargs)
+
+    def mute_host(self, timeout=45.0):
+        """Fire `drop_connection` and wait for the bonded-host menu to be back.
+
+        On BLE this does not disconnect: the host stays connected and is muted,
+        which is the only reliable way to *reach* the menu there -- an incoming
+        connection preempts it and a bonded central reconnects on its own
+        (CONNECTION.md §6.2). It is also what makes `[f]` usable, since a
+        Service Changed indication needs a live link (§7.2b).
+        """
+        menus = self.dev.count(MENU_FOOTER)
+        self.dev.chord(DROP_CONNECTION_CHORD,
+                       which="keyboard" if self.uinput else None)
+        self.dev.wait_log(MENU_FOOTER, timeout=timeout, after=menus,
+                          what="the menu to re-open over the muted link")
+        return self
 
     # -- the full round trip ------------------------------------------------
 
@@ -499,17 +550,34 @@ class TestContext:
         self.host.open_inputs(self.KEYBOARD, self.MOUSE)
         return nodes
 
+    def inject_key(self, code, pressed):
+        """Press or release a key on whichever input path blooter is reading.
+
+        The FIFO in most rows, uinput in the ones that need the evdev path
+        (§4.1) -- and a row that starts blooter with `-e` has no FIFO at all, so
+        this is not a convenience: without it the shared assertions below can
+        only be used by half the suite.
+        """
+        if self.uinput:
+            return self.dev.uinput_key("keyboard", code, pressed)
+        return self.dev.key(code, pressed)
+
+    def inject_rel(self, axis, value):
+        if self.uinput:
+            return self.dev.uinput_rel("mouse", axis, value)
+        return self.dev.rel(axis, value)
+
     def expect_key(self, code, timeout=5.0):
         """Inject a key on dev; assert the host's evdev reports it."""
-        self.dev.key(code, True)
+        self.inject_key(code, True)
         got = self.host.read_events(timeout=timeout)
         _assert_event(got, self.KEYBOARD, 0x01, code, 1, "key press")
-        self.dev.key(code, False)
+        self.inject_key(code, False)
         got = self.host.read_events(timeout=timeout)
         _assert_event(got, self.KEYBOARD, 0x01, code, 0, "key release")
 
     def expect_motion(self, axis, value, timeout=5.0):
-        self.dev.rel(axis, value)
+        self.inject_rel(axis, value)
         got = self.host.read_events(timeout=timeout)
         _assert_event(got, self.MOUSE, 0x02, axis, value, "pointer motion")
 
@@ -587,8 +655,36 @@ def reset(dev, host):
 # Entry point
 # --------------------------------------------------------------------------
 
+def parse_args(argv):
+    """`[filter] [--repeat N]` -- the whole command line.
+
+    `--repeat` is for pinning down a flake and is never the default: two VMs and
+    a real pairing per test make a repeated run expensive, so it is asked for
+    per invocation rather than paid for by everyone.
+    """
+    only, repeat = None, 1
+    args = list(argv)
+    while args:
+        arg = args.pop(0)
+        if arg in ("--repeat", "-n"):
+            if not args:
+                raise HarnessError("--repeat needs a count")
+            repeat = int(args.pop(0))
+        elif arg.startswith("--repeat="):
+            repeat = int(arg.split("=", 1)[1])
+        elif only is None:
+            only = arg
+        else:
+            raise HarnessError(f"unexpected argument: {arg}")
+    return only, repeat
+
+
 def main():
-    only = sys.argv[1] if len(sys.argv) > 1 else None
+    try:
+        only, repeat = parse_args(sys.argv[1:])
+    except (HarnessError, ValueError) as exc:
+        print(f"usage: hub.py [filter] [--repeat N]  ({exc})", file=sys.stderr)
+        return 2
     set_rundir(os.environ.get("RUNDIR", "/tmp/blooter-twovm"))
 
     try:
@@ -623,7 +719,7 @@ def main():
             host.btmon_start(name)
             return TestContext(dev, host, name)
 
-        return scenarios.tests.run(make_context, only=only,
+        return scenarios.tests.run(make_context, only=only, repeat=repeat,
                                    setup=lambda: reset(dev, host))
     except HarnessError as exc:
         print(f"\nSETUP FAILED: {exc}", file=sys.stderr, flush=True)

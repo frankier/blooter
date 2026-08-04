@@ -119,6 +119,12 @@ async fn run(args: cli::Args) -> Result<(), AppError> {
             None => config::Config::default(),
         },
     };
+    // The chord that drops a session, kept as text for the BLE note that says
+    // how to get the menu back (design/CONNECTION.md §6.2).
+    let drop_chord = cfg
+        .hotkeys
+        .spec_for(config::Action::DropConnection)
+        .map(str::to_string);
     let hotkeys = cfg.hotkeys;
 
     // Resolved before anything is set up, so a `pairing = "prompt"` with no TTY
@@ -339,6 +345,7 @@ async fn run(args: cli::Args) -> Result<(), AppError> {
                     interactive && !args.nosetup,
                     hosts.clone(),
                     term_coord.clone(),
+                    drop_chord,
                 )
                 .await?,
             )

@@ -8,11 +8,11 @@
 #
 #   ./run.sh                     # whole suite
 #   ./run.sh cold_pair           # only tests whose name contains "cold_pair"
+#   ./run.sh d1 --repeat 5       # that selection, five times, to pin a flake
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-FILTER="${1:-}"
 
 BLUEZ_VERSION="${BLUEZ_VERSION:-5.87}"
 BUILD="$ROOT/tests/btvirt/build/bluez-$BLUEZ_VERSION"
@@ -53,4 +53,4 @@ echo
 echo "##### 3/3  running tests (two VMs) #####"
 # hub.py starts btvirt -t, boots both VMs, sequences their connection to the
 # radio (order fixes addresses -- design/TESTS.md §2.3) and runs the suite.
-exec python3 "$HERE/hub.py" $FILTER
+exec python3 "$HERE/hub.py" "$@"

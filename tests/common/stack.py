@@ -10,6 +10,7 @@ parameters.
 
 import os
 import re
+import signal
 import subprocess
 
 from .process import HarnessError, Process, log, rundir, wait_for
@@ -132,9 +133,9 @@ class BluezStack:
                                f"bluetoothd to adopt {adopt}")
         return bt
 
-    def stop_bluetoothd(self):
+    def stop_bluetoothd(self, sig=signal.SIGTERM):
         if self.bluetoothd is not None:
-            self.bluetoothd.stop()
+            self.bluetoothd.stop(sig=sig)
             if self.bluetoothd in self.procs:
                 self.procs.remove(self.bluetoothd)
             self.bluetoothd = None

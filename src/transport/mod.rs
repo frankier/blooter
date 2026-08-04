@@ -310,6 +310,12 @@ pub trait Transport {
     /// does nothing.
     async fn on_connected(&self, _state: &InputState) {}
 
+    /// Called when the `drop_connection` hotkey ends a session, before the loop
+    /// returns to accepting. Classic needs nothing — returning from
+    /// `run_session` drops its L2CAP sockets, which *is* the disconnect — while
+    /// LE mutes the still-live link instead (design/CONNECTION.md §6.2).
+    async fn drop_session(&self) {}
+
     /// Release all inputs host-side: an all-keys-up keyboard report, a neutral
     /// report for every advertised gamepad and — with `[remote]` on — a
     /// nothing-held consumer report, so nothing stays latched when a session is
@@ -399,6 +405,7 @@ pub async fn step<T: Transport>(
                 state.clear_mouse();
                 t.release_all(state).await;
                 state.clear_consumer();
+                t.drop_session().await;
                 return Step::Return(Flow::Continue);
             }
             Outcome::Exit => {
@@ -467,6 +474,13 @@ impl Transport for AnyTransport {
         match self {
             Self::Classic(t) => t.on_connected(state).await,
             Self::Le(t) => t.on_connected(state).await,
+        }
+    }
+
+    async fn drop_session(&self) {
+        match self {
+            Self::Classic(t) => t.drop_session().await,
+            Self::Le(t) => t.drop_session().await,
         }
     }
 

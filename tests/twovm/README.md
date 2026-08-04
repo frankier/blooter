@@ -40,7 +40,14 @@ ordinary `hci0`.
 ```sh
 ./run.sh                # whole suite
 ./run.sh cold_pair      # only tests whose name contains "cold_pair"
+./run.sh d1 --repeat 5  # that selection, five times over
 ```
+
+`--repeat` is for pinning down a flake and is never the default — two VMs and a
+real pairing per test make a repeated run expensive. A row counts as failed if
+any iteration failed, and the summary says how many (`FAILED foo (3/5 runs)`),
+because a row that fails 3 times in 5 is a race and one that fails 5 in 5 is a
+defect, and the two want different work.
 
 Prerequisites are the same as `tests/btvirt` (`virtme-ng`, `glib2-devel`,
 `readline-devel`), with one extra consideration: this suite boots **two** VMs at
@@ -143,12 +150,29 @@ the life of the VM.
 Recorded because it is the point of the suite, and because two of these are
 behaviours no other suite can see:
 
-- **`[f]` and `[u]` need the host to be away.** An incoming connection preempts
-  the menu and blooter takes it as the user's intent (CONNECTION.md §6.2), so a
-  menu key pressed during a session is discarded. Any test of a menu remedy has
-  to drop the link first — and on Classic the host must still be *reachable*,
-  since `fix_host` dials its control PSM.
-- **D1 does not diverge on Classic.** Removing the device on the host reaches
+- **The BLE menu was unreachable, and `drop_connection` is what fixed it.** An
+  incoming connection preempts the menu (CONNECTION.md §6.2), so a key pressed
+  during a session is discarded — and on BLE a bonded central reconnects on its
+  own, within seconds, so "disconnect the host, then press the key" is a race
+  the user often loses. Worse, `[f]` *needs* the host connected (§7.2b), which
+  made "connected and at the menu" a state no real session could reach; that is
+  what `test_d8_stale_descriptor_ble_reread` was `xfail`-ed for. `drop_connection`
+  now **mutes** on BLE instead of disconnecting: the session ends and the menu
+  re-opens over a link that is still up, so nothing can preempt it and `[f]` has
+  the connected client it needs. `[enter]` on the muted row resumes.
+  `test_d1_host_removes_bond_ble_muted` is the same remedy as its neighbour with
+  the timing taken out, and the re-read row is now an ordinary assertion.
+- **A host that has to *stay* away has to be blocked, not disconnected.** For
+  the one row that is about the away-path advice (§7.2b step 2), `disconnect`
+  is not enough for the reason above, so `t.host.stay_away()` takes the host's
+  whole stack down — accept-list entry dropped (`btmgmt del-device`; a bonded LE
+  peer is auto-connected by the *kernel*, which does not consult bluetoothd),
+  then bluetoothd killed — and `come_back()` restarts it. Blocking the device
+  was tried first and is worse than useless here: bluetoothd tears the HOG
+  profile down and marks it `unavailable`, and unblocking never rebuilds the
+  uhid device, so the host returns deaf. Neither bond is touched either way,
+  which is what separates this from `remove`.
+- **D1 does not always diverge on Classic.** Removing the device on the host reaches
   blooter as a HIDP virtual-cable unplug and `run_session` drops our half to
   match (§7.2a), so no one-sided bond forms and a plain re-pair is the whole
   remedy. BLE has no unplug, and does diverge.
@@ -160,13 +184,16 @@ behaviours no other suite can see:
   existing bond, blooter names the host at startup and says to press `[f]` —
   the §7.1 detection, confirmed against a host that really did cache the old
   descriptor.
-- **The Classic `[f]` unplug works; the host still shows the old layout.**
-  Pressing `[f]` does drop both halves of the bond as §7.2a describes, and the
-  re-pair that follows succeeds — but the host ends up with the same two input
-  devices it had before, so the new gamepad slot never appears. Whether that is
-  the cache not being refreshed or the gamepad collection simply not producing
-  a separate input device is not yet established. The assertion is left failing
-  rather than weakened, because it is the one D8 exists to make.
+- **The Classic `[f]` unplug works, and the new gamepad was there all along.**
+  D8 spent a long time reporting that the host "still shows the old layout"
+  after the unplug and re-pair. It did not: `hidinput_allocate` (kernel
+  `hid-input.c`) suffixes an input device per application collection —
+  "Keyboard", "Mouse", "Consumer Control" — and has **no case for a gamepad or
+  joystick**, so that node is named after the HID device alone, plain
+  `blooter`. The row was looking for names starting with `"blooter "`, which is
+  exactly the one name it could never match. Worth recording as the shape of
+  mistake this suite invites: an assertion made through a filter is only as
+  true as the filter.
 - **A BLE link that drops without a CCCD unsubscribe left the session open** —
   found by `test_disconnect_then_reconnect_ble` and the BLE `[u]` remedy, and
   the clearest case for the suite existing at all: after the host disconnected,
@@ -184,11 +211,20 @@ behaviours no other suite can see:
   half of the edge from bluetoothd's own `Device.Connected`, and a session ends
   when the link goes rather than when the subscription does. Six BLE rows went
   green with it (`disconnect_then_reconnect`, `d3`, `d4`, `d5`, `d6`, `d9`), and
-  the two that still fail — `d1_host_removes_bond_ble` and
-  `d8_stale_descriptor_ble_advice` — now fail *past* the disconnect: the menu
-  re-opens and takes the key, and what defeats them is the first bullet above,
-  a bonded central reconnecting on its own before the key is pressed. Making
-  `t.host.disconnect()` keep the host away is a harness change, not a blooter one.
+  the two that failed after it — `d1_host_removes_bond_ble` and
+  `d8_stale_descriptor_ble_advice` — failed *past* the disconnect, on the menu
+  being unreachable; both are covered by the first bullet above.
+- **A clean `bluetoothd` shutdown took the emulated radio with it.** Every row
+  that restarts the daemon (J4, D6) was losing `hci0`, and the error — "never
+  adopted hci0" — pointed nowhere near the cause. bluetoothd powers down the
+  adapters it powered up on the way out, `vhci_write` refuses every packet while
+  a controller is down, and the peer keeps transmitting (on LE it advertises
+  continuously), so btproxy failed its next write and tore the bridge down. The
+  restart is a `SIGKILL` now: bluetoothd never runs its power-down path, the
+  bridge lives, and the bonds — written when they were made — are on disk
+  regardless. It is also the truer model of the reboot J4 stands in for. If the
+  bridge does go, `restart_daemon` rebuilds it and says so, so one lost radio
+  costs one test rather than the rest of the run.
 
 ## Deliberate deviations from design/TESTS.md
 
@@ -201,11 +237,11 @@ behaviours no other suite can see:
 - **D8 uses uinput rather than the FIFO.** `[gamepad] slots` has no effect in
   FIFO mode (`main.rs` forces the advertised count to zero there), so the one row
   that is about the descriptor changing has to come in over evdev.
-- **D8's BLE re-read is `xfail`.** `Le::fix_host` requires `Device.Connected`,
-  but `wait_connected` cancels and joins the menu the moment a host connects — so
-  the state in which `[f]` does anything is not obviously reachable from a real
-  session. The advice path (`[f]` with the host away says so and touches no bond)
-  is asserted and passes.
+- **D8's BLE re-read goes through `drop_connection`.** `Le::fix_host` requires
+  `Device.Connected`, and the menu only exists while no session is running, so
+  the row mutes the host (§6.2) to get both at once. That is a real user action,
+  not a harness trick — it is the documented way to reach the menu on BLE — which
+  is why the row is an ordinary assertion rather than the `xfail` it used to be.
 
 ## What this still cannot cover
 

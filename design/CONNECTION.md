@@ -511,12 +511,14 @@ stateDiagram-v2
     Waiting --> Forgetting: [u] on a bonded host
     Waiting --> Incoming: a host connects and subscribes to a Report CCCD
     Waiting --> Skipped: [q] / Enter / closed
+    Waiting --> Connected: [enter] on a muted host (resume)
 
     Fixing --> Waiting: Service Changed, or advice if it is away (§7.2b)
     Forgetting --> Waiting: bond dropped, record forgotten
     Incoming --> Connected: menu cancelled + joined (terminal restored)
     Skipped --> Waiting: keep advertising
     Connected --> Waiting: session ended → menu re-opens
+    Connected --> Waiting: drop_connection → host muted, link kept
 ```
 
 - **Menu pick (Classic).** `menu::run` lists eligible hosts (plus the
@@ -525,7 +527,22 @@ stateDiagram-v2
   `wait_connected` then dials that host (§3.2), still racing inbound.
 - **Incoming preempts.** If a host connects while the menu is open, blooter fires
   the cancel signal, the menu restores the terminal and exits, and blooter uses
-  the incoming connection — taken as the user's intent — logging a note.
+  the incoming connection — taken as the user's intent — logging a note. On BLE
+  it also *prints* one, naming the configured `drop_connection` chord, because
+  there the menu is otherwise unreachable: a bonded central reconnects on its
+  own, within seconds and repeatedly, so a user who wants the menu has no other
+  way to ask for it. A host that is already connected when `wait_connected` is
+  entered gets the same note and no menu.
+- **`drop_connection` mutes on BLE, disconnects on Classic.** Returning from
+  `run_session` on Classic drops the L2CAP sockets, which is a real disconnect
+  and the end of it. On BLE the same act would be self-defeating: the central
+  would reconnect before a key could be pressed, and `[f]` needs the host
+  *connected* (§7.2b). So `Le::drop_session` sets `Link::muted` instead —
+  `connected` (subscribed ∧ up ∧ ¬muted) goes false, the session ends, the menu
+  re-opens, and the link stays exactly where `[f]` needs it. The muted host is
+  listed as `connected, muted`; `[enter]` on it clears the mute and the session
+  resumes. A mute lasts only as long as the link it mutes: if the host really
+  goes away, it is cleared, and its return is an ordinary session.
 - **Skip / non-interactive.** `[q]`/Enter (or no TTY) leaves blooter accepting;
   on Classic it also keeps dialing any bonded configured target.
 - **Pre-emptability.** The menu is fully async on the tokio runtime; every await
@@ -616,7 +633,11 @@ characteristics.)
 **On demand, via `[f]`.** `Le::fix_host`, for hosts that do not act on the hash.
 A Service Changed indication only reaches a *connected* client and there is no
 queue for one that is away, so this needs a live link — which blooter cannot
-bring up itself (§4). Hence:
+bring up itself (§4). The menu, meanwhile, is only open while no session is
+running, which for a long time made "connected *and* at the menu" a state no real
+session reached. `drop_connection` is what reconciles the two: on BLE it mutes
+the host rather than disconnecting it (§6.2), so the menu comes back over a link
+that is still up and `[f]` has the connected client it needs. Hence:
 
 1. **If the host is connected:** register a throwaway service
    (`626c6f74-6572-4348-554e-…`) and, a second later, unregister it

@@ -96,6 +96,10 @@ struct Row {
     /// this host is still using a cached copy that no longer matches what
     /// blooter sends (design/CONNECTION.md §7). Fixable with `[f]`.
     stale: bool,
+    /// The link to this host is up but the user dropped the session over it
+    /// (`drop_connection`), which on BLE mutes the host rather than
+    /// disconnecting it (design/CONNECTION.md §6.2). Enter resumes it.
+    muted: bool,
     /// blooter remembers bonding this host, but bluetoothd has no device object
     /// for it any more. Kept in the list rather than dropped, so a host cannot
     /// silently vanish from the only UI that can act on it.
@@ -115,6 +119,10 @@ pub enum Pick {
     /// Drop blooter's bond to this host. Always an explicit user choice — never
     /// something a failed operation does on its own (§7.2b).
     Forget(Address),
+    /// Resume the session on a host that is still connected but muted. BLE only
+    /// — that is the transport where `drop_connection` mutes rather than
+    /// disconnects (§6.2).
+    Resume(Address),
 }
 
 /// What a keypress asks the event loop to do. Cursor moves and screen switches
@@ -129,6 +137,8 @@ enum Action {
     Fix(usize),
     /// Drop the bond to the device at this index (§7.2b).
     Forget(usize),
+    /// Resume the muted session on the device at this index (§6.2).
+    Resume(usize),
     Rescan,
     Skip,
 }
@@ -244,6 +254,15 @@ fn is_other(
 }
 
 /// Map a keypress to an [`Action`], applying cursor/screen changes in place.
+/// [`Action::Resume`] if the row at `idx` is a muted host, otherwise
+/// [`Action::None`] — the only thing selecting a row can mean on BLE.
+fn resume_at(state: &MenuState, idx: usize) -> Action {
+    match state.rows().get(idx) {
+        Some(r) if r.muted => Action::Resume(idx),
+        _ => Action::None,
+    }
+}
+
 fn on_key(state: &mut MenuState, key: KeyEvent) -> Action {
     let len = state.rows().len();
     match key.code {
@@ -259,8 +278,9 @@ fn on_key(state: &mut MenuState, key: KeyEvent) -> Action {
             }
             Action::None
         }
-        // Number keys pick a host to connect to where that means something; on
-        // BLE there is nothing to connect to, so they only move the cursor.
+        // Number keys pick a host to connect to where that means something. On
+        // BLE there is nothing to connect to, so they move the cursor — and
+        // resume the host if it is one the user muted (§6.2).
         KeyCode::Char(c @ '1'..='9') => {
             let idx = (c as usize) - ('1' as usize);
             match (idx < len, state.kind.picks_hosts()) {
@@ -268,15 +288,22 @@ fn on_key(state: &mut MenuState, key: KeyEvent) -> Action {
                 (true, true) => Action::Select(idx),
                 (true, false) => {
                     state.selected = idx;
-                    Action::None
+                    resume_at(state, idx)
                 }
             }
         }
         KeyCode::Enter => {
-            if len > 0 && state.kind.picks_hosts() {
+            if len == 0 {
+                Action::Skip
+            } else if state.kind.picks_hosts() {
                 Action::Select(state.selected)
             } else {
-                Action::Skip
+                // On BLE Enter is "resume" on a muted host and "close" on
+                // anything else: there is nothing to connect to.
+                match resume_at(state, state.selected) {
+                    Action::None => Action::Skip,
+                    resume => resume,
+                }
             }
         }
         KeyCode::Char('o') | KeyCode::Char('O') => {
@@ -345,7 +372,9 @@ fn render_lines(state: &MenuState) -> Vec<String> {
     }
     for (i, r) in rows.iter().enumerate() {
         let marker = if i == state.selected { '>' } else { ' ' };
-        let st = if r.connected {
+        let st = if r.muted {
+            "connected, muted"
+        } else if r.connected {
             "connected"
         } else if r.paired {
             "paired"
@@ -375,7 +404,11 @@ fn render_lines(state: &MenuState) -> Vec<String> {
     let footer = match (state.screen, ble) {
         (_, true) => {
             let forget = if bonded { "[u] Forget host   " } else { "" };
-            format!("{fix}{forget}[r] Refresh   [q] Close")
+            let resume = match selected {
+                Some(r) if r.muted => "[enter] Resume   ",
+                _ => "",
+            };
+            format!("{resume}{fix}{forget}[r] Refresh   [q] Close")
         }
         (Screen::Main, false) if state.other.is_empty() => format!("{fix}[r] Rescan   [q] Skip"),
         (Screen::Main, false) => format!(
@@ -575,6 +608,8 @@ async fn collect(adapter: &Adapter, stale: &[Address]) -> (Vec<(Row, Device)>, V
             rssi: dev.rssi().await.ok().flatten(),
             // Only a bond carries a cached record, so only bonded hosts can be stale.
             stale: paired && stale.contains(&addr),
+            // Classic drops the link outright, so it has no muted state (§6.2).
+            muted: false,
             forgotten_by_bluez: false,
         };
         let other_dev = is_other(class, appearance, has_real_name, paired);
@@ -606,7 +641,12 @@ async fn collect(adapter: &Adapter, stale: &[Address]) -> (Vec<(Row, Device)>, V
 /// is the point. `RemoveDevice` deletes the D-Bus object outright, and a host
 /// that is not advertising can never be rediscovered, so a list built from
 /// bluetoothd alone can lose a host permanently (design/CONNECTION.md §6).
-async fn collect_bonded(adapter: &Adapter, stale: &[Address], known: &[Address]) -> Vec<Row> {
+async fn collect_bonded(
+    adapter: &Adapter,
+    stale: &[Address],
+    known: &[Address],
+    muted: Option<Address>,
+) -> Vec<Row> {
     let live = adapter.device_addresses().await.unwrap_or_default();
     let mut rows = Vec::new();
     for &addr in &live {
@@ -623,6 +663,7 @@ async fn collect_bonded(adapter: &Adapter, stale: &[Address], known: &[Address])
             paired: true,
             rssi: None,
             stale: stale.contains(&addr),
+            muted: muted == Some(addr),
             forgotten_by_bluez: false,
         });
     }
@@ -639,6 +680,7 @@ async fn collect_bonded(adapter: &Adapter, stale: &[Address], known: &[Address])
             paired: true,
             rssi: None,
             stale: stale.contains(&addr),
+            muted: false,
             forgotten_by_bluez: true,
         });
     }
@@ -671,13 +713,14 @@ async fn scan(
     kind: Kind,
     stale: &[Address],
     known: &[Address],
+    muted: Option<Address>,
     cancel: &mut oneshot::Receiver<()>,
 ) -> Option<MenuState> {
     if !kind.picks_hosts() {
         return Some(MenuState {
             kind,
             screen: Screen::Main,
-            main: collect_bonded(adapter, stale, known).await,
+            main: collect_bonded(adapter, stale, known, muted).await,
             other: Vec::new(),
             main_devs: Vec::new(),
             other_devs: Vec::new(),
@@ -803,6 +846,7 @@ enum Chosen {
     Connect(Device),
     Fix(Address),
     Forget(Address),
+    Resume(Address),
 }
 
 /// The interactive loop, in raw mode. Returns what the user chose, or `None` on
@@ -812,6 +856,7 @@ async fn menu_loop(
     kind: Kind,
     stale: &[Address],
     known: &[Address],
+    muted: Option<Address>,
     suspend_rx: &mut mpsc::Receiver<SuspendReq>,
     cancel: &mut oneshot::Receiver<()>,
 ) -> Option<Chosen> {
@@ -823,7 +868,7 @@ async fn menu_loop(
         true => draw_lines(&mut out, &scanning_line(), 0).ok()?,
         false => 0,
     };
-    let mut state = scan(adapter, kind, stale, known, cancel).await?;
+    let mut state = scan(adapter, kind, stale, known, muted, cancel).await?;
     loop {
         prev = draw_lines(&mut out, &render_lines(&state), prev).ok()?;
         tokio::select! {
@@ -853,7 +898,7 @@ async fn menu_loop(
                             if kind.picks_hosts() {
                                 prev = draw_lines(&mut out, &scanning_line(), prev).ok()?;
                             }
-                            state = scan(adapter, kind, stale, known, cancel).await?;
+                            state = scan(adapter, kind, stale, known, muted, cancel).await?;
                         }
                         Action::Select(i) => {
                             return state.devs().get(i).cloned().map(Chosen::Connect);
@@ -865,6 +910,9 @@ async fn menu_loop(
                         }
                         Action::Forget(i) => {
                             return state.rows().get(i).map(|r| Chosen::Forget(r.addr));
+                        }
+                        Action::Resume(i) => {
+                            return state.rows().get(i).map(|r| Chosen::Resume(r.addr));
                         }
                     }
                 }
@@ -905,6 +953,7 @@ async fn run(
     kind: Kind,
     stale: Vec<Address>,
     known: Vec<Address>,
+    muted: Option<Address>,
     coord: TermCoord,
     mut cancel: oneshot::Receiver<()>,
 ) -> Option<Pick> {
@@ -915,7 +964,18 @@ async fn run(
     // Raw mode is confined to the navigation loop; the guard drops (restoring the
     // terminal) before any pairing prompt/logs in `finalize`.
     let picked = match TermGuard::enter() {
-        Ok(_guard) => menu_loop(&adapter, kind, &stale, &known, &mut suspend_rx, &mut cancel).await,
+        Ok(_guard) => {
+            menu_loop(
+                &adapter,
+                kind,
+                &stale,
+                &known,
+                muted,
+                &mut suspend_rx,
+                &mut cancel,
+            )
+            .await
+        }
         Err(_) => None,
     };
     coord.deregister();
@@ -927,6 +987,7 @@ async fn run(
             .map(Pick::Connect),
         Some(Chosen::Fix(addr)) => Some(Pick::Fix(addr)),
         Some(Chosen::Forget(addr)) => Some(Pick::Forget(addr)),
+        Some(Chosen::Resume(addr)) => Some(Pick::Resume(addr)),
         None => None,
     }
 }
@@ -962,6 +1023,7 @@ impl Session {
         kind: Kind,
         stale: Vec<Address>,
         known: Vec<Address>,
+        muted: Option<Address>,
         coord: &TermCoord,
     ) -> Self {
         let (Some(adapter), true) = (adapter, interactive) else {
@@ -976,7 +1038,7 @@ impl Session {
         let adapter = adapter.clone();
         let coord = coord.clone();
         let task = tokio::spawn(async move {
-            if let Some(pick) = run(adapter, kind, stale, known, coord, cancel_rx).await {
+            if let Some(pick) = run(adapter, kind, stale, known, muted, coord, cancel_rx).await {
                 let _ = pick_tx.send(pick).await;
             }
         });
@@ -1037,6 +1099,7 @@ mod tests {
             connected,
             paired,
             rssi,
+            muted: false,
             forgotten_by_bluez: false,
         }
     }
@@ -1303,6 +1366,24 @@ mod tests {
         let mut s = state(vec![row("Laptop", false, true, None)], vec![]);
         assert_eq!(on_key(&mut s, key(KeyCode::Char('1'))), Action::Select(0));
         assert_eq!(on_key(&mut s, key(KeyCode::Enter)), Action::Select(0));
+    }
+
+    /// ...with one exception: a host the user muted with `drop_connection` is
+    /// still connected, so selecting it means "resume", not "connect" (§6.2).
+    #[test]
+    fn ble_selects_a_muted_host_to_resume_it() {
+        let mut muted = row("Laptop", true, true, None);
+        muted.muted = true;
+        let mut s = ble(vec![muted, row("TV", false, true, None)]);
+        assert_eq!(on_key(&mut s, key(KeyCode::Enter)), Action::Resume(0));
+        assert_eq!(on_key(&mut s, key(KeyCode::Char('1'))), Action::Resume(0));
+        let lines = render_lines(&s);
+        assert!(lines[1].contains("[connected, muted]"), "{}", lines[1]);
+        assert!(lines.last().unwrap().contains("[enter] Resume"));
+        // The other row is an ordinary bonded host: Enter still just closes.
+        assert_eq!(on_key(&mut s, key(KeyCode::Char('2'))), Action::None);
+        assert_eq!(on_key(&mut s, key(KeyCode::Enter)), Action::Skip);
+        assert!(!render_lines(&s).last().unwrap().contains("[enter]"));
     }
 
     /// `[u]` is the only way a bond is ever dropped on BLE, so it must be

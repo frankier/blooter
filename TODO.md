@@ -61,6 +61,25 @@ Roughly in order of how much risk they carry.
 
 ## To investigate
 
+- **A pairing that lands while the Classic menu is scanning ends up one-sided,
+  and bluez then refuses every retry.** Seen in `tests/twovm`'s D1 row
+  (interactive, Classic), reproducibly: the host re-pairs while blooter's host
+  picker is mid-inquiry, blooter's side completes SSP and stores a link key
+  (`new_link_key_callback` on dev) while the host's controller reports
+  `Simple Pairing Complete: Authentication Failure (0x05)`. From there it cannot
+  recover on its own — dev now believes the device is paired, so bluez's
+  `JustWorksRepairing = never` (the default) rejects the next Just Works
+  confirmation without even asking the agent (`device_confirm_passkey`,
+  `src/device.c`), and `bluetoothctl pair` reports neither success nor failure
+  until it times out. Closing the menu with `[q]` first makes the same re-pair
+  succeed every time. Two things to establish before fixing: whether the
+  asymmetric SSP outcome is real or an artifact of btvirt's emulated controller
+  (a BR/EDR inquiry does interfere with page scan, but a real radio may be more
+  forgiving), and, if real, whether blooter should stop scanning while a pairing
+  is in progress — its agent knows one is — or scan once rather than once per
+  `wait_connected` cycle (CONNECTION.md §6.2). The D1 row documents the
+  workaround it uses meanwhile.
+
 - **`test_ble_unsubscribe_ends_session` is flaky, and fails outright in
   isolation.** Running `tests/btvirt/run.sh ble_unsubscribe` on its own fails
   every time — blooter never logs "host disconnected" within the 10 s window —
@@ -130,8 +149,12 @@ Roughly in order of how much risk they carry.
   change} × {automatic on reconnect, explicit `[f]`}. Where a host ignores it,
   the fallback is the manual re-pair blooter already prints — `[u]` to drop the
   bond here, then remove blooter from that host's Bluetooth settings. Note the
-  matrix now needs the host *connected* for `[f]` to do anything at all, since
-  blooter cannot bring the link up itself (CONNECTION.md §4).
+  matrix needs the host *connected* for `[f]` to do anything at all, since
+  blooter cannot bring the link up itself (CONNECTION.md §4) — which is what
+  `drop_connection` is for on BLE: it mutes the host rather than disconnecting
+  it, so the menu opens over a link that is still up (§6.2). `tests/twovm`
+  exercises exactly that path now; what is still unestablished is which *other*
+  hosts act on the indication.
 
 ## Done since (kept here for history)
 
